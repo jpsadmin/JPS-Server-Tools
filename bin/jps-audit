@@ -613,12 +613,12 @@ collect_websites() {
 
             domain=$(basename "$site_dir")
             disk_size=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
-            ((site_count++))
+            ((site_count++)) || true
 
             # Check if WordPress
             if is_wordpress "$site_dir"; then
                 is_wp="true"
-                ((wp_count++))
+                ((wp_count++)) || true
 
                 # Get WordPress version
                 if [[ -f "${site_dir}/html/wp-includes/version.php" ]]; then

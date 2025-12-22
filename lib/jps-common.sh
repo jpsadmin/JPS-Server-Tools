@@ -17,8 +17,8 @@ readonly JPS_INSTALL_DIR="${JPS_INSTALL_DIR:-/opt/jps-server-tools}"
 readonly JPS_CONFIG_FILE="${JPS_CONFIG_FILE:-${JPS_INSTALL_DIR}/config/jps-tools.conf}"
 
 # Script identification (set by calling script)
-SCRIPT_NAME="${SCRIPT_NAME:-jps-tools}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-1.0.0}"
+: "${SCRIPT_NAME:=jps-tools}"
+: "${SCRIPT_VERSION:=1.0.0}"
 
 #===============================================================================
 # COLOR OUTPUT

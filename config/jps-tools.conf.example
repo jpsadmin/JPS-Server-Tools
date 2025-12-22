@@ -1,0 +1,159 @@
+#===============================================================================
+# JPS Server Tools Configuration
+#
+# This file contains configuration settings for all JPS server management tools.
+# Edit this file to customize paths, thresholds, and behavior.
+#
+# Location: /opt/jps-server-tools/config/jps-tools.conf
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# PATH CONFIGURATION
+# Customize these paths to match your server setup
+#-------------------------------------------------------------------------------
+
+# Root directory where websites are stored
+# Each subdirectory should be a domain name
+WEBSITES_ROOT="/usr/local/websites"
+
+# OpenLiteSpeed virtual host configuration directory
+# Each domain has its own subdirectory with vhconf.conf
+VHOSTS_DIR="/usr/local/lsws/conf/vhosts"
+
+# Main OpenLiteSpeed configuration file
+OLS_CONFIG="/usr/local/lsws/conf/httpd_config.conf"
+
+# Directory where backups are stored (for backup verification)
+BACKUP_DIR="/var/backups/jps"
+
+# Log directory for JPS tools
+LOG_DIR="/opt/jps-server-tools/logs"
+
+#-------------------------------------------------------------------------------
+# BACKUP VERIFICATION SETTINGS
+# Settings for jps-backup-verify tool
+#-------------------------------------------------------------------------------
+
+# Temporary directory for extracting and verifying backups
+# This will be created and cleaned up automatically
+VERIFY_TEMP_DIR="/tmp/jps-verify"
+
+# Prefix for temporary verification databases
+# A random string will be appended for uniqueness
+VERIFY_DB_PREFIX="jps_verify_"
+
+# Maximum age of backup to consider valid (in days)
+# Backups older than this will trigger a warning
+BACKUP_MAX_AGE_DAYS=7
+
+#-------------------------------------------------------------------------------
+# MONITORING THRESHOLDS
+# Warning and critical thresholds for system monitoring
+# Used by jps-audit and future jps-monitor tool
+#-------------------------------------------------------------------------------
+
+# Disk usage thresholds (percentage)
+DISK_WARN_PERCENT=80
+DISK_CRIT_PERCENT=90
+
+# Memory usage thresholds (percentage)
+MEM_WARN_PERCENT=85
+MEM_CRIT_PERCENT=95
+
+# SSL certificate expiry thresholds (days remaining)
+SSL_WARN_DAYS=14
+SSL_CRIT_DAYS=7
+
+# Load average thresholds (per CPU core)
+LOAD_WARN_RATIO=0.7
+LOAD_CRIT_RATIO=0.9
+
+#-------------------------------------------------------------------------------
+# ALERT CONFIGURATION
+# Settings for sending alerts via email
+#-------------------------------------------------------------------------------
+
+# Email address to send alerts to (leave empty to disable)
+ALERT_EMAIL=""
+
+# Enable/disable alert sending
+SEND_ALERTS=false
+
+# Minimum time between alerts for the same issue (seconds)
+# Prevents alert flooding
+ALERT_THROTTLE_SECONDS=3600
+
+#-------------------------------------------------------------------------------
+# RETENTION SETTINGS
+# How long to keep logs and audit data
+#-------------------------------------------------------------------------------
+
+# Days to retain audit snapshots
+AUDIT_RETENTION_DAYS=90
+
+# Days to retain backup verification logs
+VERIFY_LOG_RETENTION_DAYS=30
+
+# Days to retain general logs
+LOG_RETENTION_DAYS=30
+
+#-------------------------------------------------------------------------------
+# SERVICES
+# Services to monitor for status
+#-------------------------------------------------------------------------------
+
+# Space-separated list of services to check
+MONITORED_SERVICES="lshttpd mariadb fail2ban ufw"
+
+#-------------------------------------------------------------------------------
+# DATABASE ACCESS
+# MariaDB connection settings for database operations
+#-------------------------------------------------------------------------------
+
+# MariaDB connection settings (optional - uses socket auth by default)
+# Only set these if socket authentication is not available
+#MYSQL_USER=""
+#MYSQL_PASS=""
+#MYSQL_HOST="localhost"
+
+# Use unix socket authentication (recommended)
+MYSQL_USE_SOCKET=true
+
+#-------------------------------------------------------------------------------
+# DRIFT DETECTION
+# Settings for configuration drift detection in jps-audit
+#-------------------------------------------------------------------------------
+
+# Minimum percentage change in disk usage to report as drift
+DRIFT_DISK_THRESHOLD=10
+
+# Enable/disable config checksum tracking
+TRACK_CONFIG_CHECKSUMS=true
+
+#-------------------------------------------------------------------------------
+# OUTPUT SETTINGS
+# Control output formatting
+#-------------------------------------------------------------------------------
+
+# Enable colored output (auto-detected if not set)
+# COLOR_OUTPUT=true
+
+# Default output format for audit: text, json, brief
+DEFAULT_OUTPUT_FORMAT="text"
+
+#-------------------------------------------------------------------------------
+# ADVANCED SETTINGS
+# Usually no need to modify these
+#-------------------------------------------------------------------------------
+
+# Timeout for SSL certificate checks (seconds)
+SSL_CHECK_TIMEOUT=5
+
+# Timeout for WP-CLI operations (seconds)
+WPCLI_TIMEOUT=30
+
+# Number of recent SSH logins to show in audit
+SSH_LOGINS_SHOW=5
+
+# Number of recent failed SSH attempts to count (hours)
+SSH_FAIL_HOURS=24
