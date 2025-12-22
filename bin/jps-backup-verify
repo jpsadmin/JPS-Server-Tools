@@ -1,0 +1,891 @@
+#!/bin/bash
+#===============================================================================
+# JPS Backup Verify - Backup Restoration Verification
+#
+# Proves that a backup can actually be restored by extracting it and verifying
+# its contents. Tests file integrity and optionally imports database dumps
+# into a temporary database.
+#
+# Usage:
+#   jps-backup-verify example.com       # Verify specific site
+#   jps-backup-verify --all             # Verify all sites
+#   jps-backup-verify --report          # Show verification history
+#
+# Exit Codes:
+#   0 - Verification passed
+#   1 - Verification failed
+#   2 - Error (backup not found, etc.)
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-backup-verify"
+readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "ERROR: Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Backup Verify - Backup Restoration Verification
+
+DESCRIPTION:
+    Proves that a backup can actually be restored by extracting it to a
+    temporary location and verifying its contents. For WordPress sites,
+    it can optionally import the database dump into a temporary database
+    to verify integrity.
+
+USAGE:
+    jps-backup-verify <domain>          # Verify specific site backup
+    jps-backup-verify --all             # Verify all site backups
+    jps-backup-verify --report          # Show verification history
+    jps-backup-verify --list            # List available backups
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -a, --all           Verify backups for all sites
+    -r, --report        Show verification history
+    -l, --list          List available backups
+    -j, --json          Output in JSON format
+    -v, --verbose       Show detailed verification steps
+    --no-db             Skip database verification
+    --keep-temp         Don't delete temp files (for debugging)
+
+EXAMPLES:
+    jps-backup-verify example.com
+        Verify the most recent backup for example.com
+
+    jps-backup-verify --all
+        Verify backups for all sites in WEBSITES_ROOT
+
+    jps-backup-verify --report
+        Show history of previous verifications
+
+    jps-backup-verify example.com --no-db
+        Verify files only, skip database import test
+
+BACKUP LOCATIONS:
+    The tool looks for backups in these locations:
+    1. BACKUP_DIR/domain/ (configured in jps-tools.conf)
+    2. BACKUP_DIR/domain-*.tar.gz
+    3. BACKUP_DIR/domain-*.zip
+
+VERIFICATION CHECKS:
+    - File extraction successful
+    - wp-config.php exists and is valid PHP
+    - wp-content/ directory exists
+    - wp-admin/ directory exists
+    - wp-includes/ directory exists
+    - Database dump exists (if WordPress)
+    - Database import succeeds (optional)
+
+EXIT CODES:
+    0 - Verification passed
+    1 - Verification failed
+    2 - Error (backup not found, configuration error, etc.)
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Operation mode
+VERIFY_ALL=false
+SHOW_REPORT=false
+LIST_BACKUPS=false
+OUTPUT_JSON=false
+VERBOSE=false
+SKIP_DB=false
+KEEP_TEMP=false
+
+# Target domain
+TARGET_DOMAIN=""
+
+# Verification results
+declare -A VERIFY_RESULTS
+
+# Counters
+PASS_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -a|--all)
+                VERIFY_ALL=true
+                shift
+                ;;
+            -r|--report)
+                SHOW_REPORT=true
+                shift
+                ;;
+            -l|--list)
+                LIST_BACKUPS=true
+                shift
+                ;;
+            -j|--json)
+                OUTPUT_JSON=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --no-db)
+                SKIP_DB=true
+                shift
+                ;;
+            --keep-temp)
+                KEEP_TEMP=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 2
+                ;;
+            *)
+                # Assume it's a domain name
+                TARGET_DOMAIN="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ "$VERIFY_ALL" == false ]] && [[ "$SHOW_REPORT" == false ]] && \
+       [[ "$LIST_BACKUPS" == false ]] && [[ -z "$TARGET_DOMAIN" ]]; then
+        error "No domain specified"
+        echo "Usage: jps-backup-verify <domain> | --all | --report | --list"
+        echo "Use --help for more information"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# BACKUP DISCOVERY
+#===============================================================================
+
+# Find the most recent backup for a domain
+# Usage: backup_path=$(find_backup "example.com")
+find_backup() {
+    local domain="$1"
+    local backup_path=""
+    local backup_dir="${BACKUP_DIR:-/var/backups/jps}"
+
+    # Strategy 1: Look in domain-specific subdirectory
+    if [[ -d "${backup_dir}/${domain}" ]]; then
+        # Find most recent file in subdirectory
+        backup_path=$(find "${backup_dir}/${domain}" -maxdepth 1 -type f \
+            \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" -o -name "*.tar" \) \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    fi
+
+    # Strategy 2: Look for domain-prefixed files in backup dir
+    if [[ -z "$backup_path" ]]; then
+        backup_path=$(find "$backup_dir" -maxdepth 1 -type f \
+            \( -name "${domain}*.tar.gz" -o -name "${domain}*.tgz" -o -name "${domain}*.zip" \) \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    fi
+
+    # Strategy 3: Look for domain-named directory (uncompressed backup)
+    if [[ -z "$backup_path" ]] && [[ -d "${backup_dir}/${domain}" ]]; then
+        # Check if it's a valid backup directory (has wp-config.php or similar)
+        if [[ -f "${backup_dir}/${domain}/wp-config.php" ]] || \
+           [[ -f "${backup_dir}/${domain}/html/wp-config.php" ]]; then
+            backup_path="${backup_dir}/${domain}"
+        fi
+    fi
+
+    echo "$backup_path"
+}
+
+# List all available backups
+list_all_backups() {
+    local backup_dir="${BACKUP_DIR:-/var/backups/jps}"
+
+    if [[ ! -d "$backup_dir" ]]; then
+        error "Backup directory not found: $backup_dir"
+        exit 2
+    fi
+
+    header "Available Backups"
+    echo "Location: $backup_dir"
+    echo ""
+
+    # Find all backup files
+    local found_any=false
+    while IFS= read -r backup_file; do
+        if [[ -n "$backup_file" ]]; then
+            found_any=true
+            local filename size age
+            filename=$(basename "$backup_file")
+            size=$(du -sh "$backup_file" 2>/dev/null | cut -f1)
+            age=$(file_age_days "$backup_file")
+
+            printf "  %-50s %10s %5s days old\n" "$filename" "$size" "$age"
+        fi
+    done < <(find "$backup_dir" -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" -o -name "*.tar" \) 2>/dev/null | sort)
+
+    if [[ "$found_any" == false ]]; then
+        echo "  No backup files found"
+    fi
+
+    echo ""
+}
+
+#===============================================================================
+# VERIFICATION FUNCTIONS
+#===============================================================================
+
+# Verification check with status output
+# Usage: run_check "Check name" command args...
+run_check() {
+    local check_name="$1"
+    shift
+    local result
+
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "$check_name"
+    fi
+
+    if "$@" 2>/dev/null; then
+        result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+    fi
+
+    echo "$result"
+}
+
+# Extract backup to temp directory
+# Usage: extract_backup "/path/to/backup.tar.gz" "/tmp/extract-dir"
+extract_backup() {
+    local backup_path="$1"
+    local extract_dir="$2"
+
+    mkdir -p "$extract_dir"
+
+    local filename
+    filename=$(basename "$backup_path")
+
+    case "$filename" in
+        *.tar.gz|*.tgz)
+            tar -xzf "$backup_path" -C "$extract_dir" 2>/dev/null
+            ;;
+        *.tar)
+            tar -xf "$backup_path" -C "$extract_dir" 2>/dev/null
+            ;;
+        *.zip)
+            unzip -q "$backup_path" -d "$extract_dir" 2>/dev/null
+            ;;
+        *)
+            # Might be a directory
+            if [[ -d "$backup_path" ]]; then
+                cp -r "$backup_path"/* "$extract_dir"/ 2>/dev/null
+            else
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Find WordPress root in extracted directory
+# Returns the path containing wp-config.php
+find_wp_root() {
+    local extract_dir="$1"
+
+    # Direct location
+    if [[ -f "${extract_dir}/wp-config.php" ]]; then
+        echo "$extract_dir"
+        return 0
+    fi
+
+    # In html subdirectory
+    if [[ -f "${extract_dir}/html/wp-config.php" ]]; then
+        echo "${extract_dir}/html"
+        return 0
+    fi
+
+    # In public_html subdirectory
+    if [[ -f "${extract_dir}/public_html/wp-config.php" ]]; then
+        echo "${extract_dir}/public_html"
+        return 0
+    fi
+
+    # Search for it
+    local found
+    found=$(find "$extract_dir" -name "wp-config.php" -type f 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then
+        dirname "$found"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find database dump in extracted directory
+find_db_dump() {
+    local extract_dir="$1"
+
+    # Common locations and names
+    local dump_patterns=(
+        "*.sql"
+        "*.sql.gz"
+        "database.sql"
+        "database.sql.gz"
+        "db.sql"
+        "db.sql.gz"
+        "*-db.sql"
+        "*-db.sql.gz"
+        "backup.sql"
+        "backup.sql.gz"
+    )
+
+    for pattern in "${dump_patterns[@]}"; do
+        local found
+        found=$(find "$extract_dir" -name "$pattern" -type f 2>/dev/null | head -1)
+        if [[ -n "$found" ]]; then
+            echo "$found"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Verify database by importing to temporary database
+verify_database() {
+    local dump_file="$1"
+    local temp_db_name="${VERIFY_DB_PREFIX:-jps_verify_}$(random_string 8)"
+
+    if [[ "$SKIP_DB" == true ]]; then
+        echo "skip"
+        return 0
+    fi
+
+    # Check if MySQL is available
+    if ! command_exists mysql; then
+        echo "skip"
+        return 0
+    fi
+
+    # Check if we can connect to MySQL
+    if ! mysql -e "SELECT 1" &>/dev/null; then
+        echo "skip"
+        return 0
+    fi
+
+    # Create temporary database
+    if ! mysql -e "CREATE DATABASE \`$temp_db_name\`" 2>/dev/null; then
+        error "Failed to create temporary database"
+        echo "fail"
+        return 1
+    fi
+
+    # Import dump
+    local import_result="fail"
+    local dump_filename
+    dump_filename=$(basename "$dump_file")
+
+    if [[ "$dump_filename" == *.gz ]]; then
+        # Gzipped SQL
+        if gunzip -c "$dump_file" | mysql "$temp_db_name" 2>/dev/null; then
+            import_result="pass"
+        fi
+    else
+        # Plain SQL
+        if mysql "$temp_db_name" < "$dump_file" 2>/dev/null; then
+            import_result="pass"
+        fi
+    fi
+
+    # Verify tables exist
+    if [[ "$import_result" == "pass" ]]; then
+        local table_count
+        table_count=$(mysql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$temp_db_name'" 2>/dev/null || echo "0")
+        if [[ "$table_count" -eq 0 ]]; then
+            import_result="fail"
+        fi
+    fi
+
+    # Drop temporary database
+    mysql -e "DROP DATABASE IF EXISTS \`$temp_db_name\`" 2>/dev/null
+
+    echo "$import_result"
+}
+
+# Verify a single domain's backup
+verify_domain() {
+    local domain="$1"
+    local overall_result="pass"
+    local checks_json="["
+    local first_check=true
+
+    if [[ "$OUTPUT_JSON" != true ]]; then
+        echo ""
+        echo -e "${COLOR_BOLD}Verifying: $domain${COLOR_RESET}"
+        echo "----------------------------------------"
+    fi
+
+    # Find backup
+    local backup_path
+    backup_path=$(find_backup "$domain")
+
+    if [[ -z "$backup_path" ]] || [[ ! -e "$backup_path" ]]; then
+        if [[ "$OUTPUT_JSON" != true ]]; then
+            error "No backup found for $domain"
+        fi
+        VERIFY_RESULTS[$domain]='{"status": "error", "message": "No backup found"}'
+        ((FAIL_COUNT++))
+        return 2
+    fi
+
+    local backup_size backup_age
+    backup_size=$(du -sh "$backup_path" 2>/dev/null | cut -f1)
+    backup_age=$(file_age_days "$backup_path")
+
+    if [[ "$OUTPUT_JSON" != true ]]; then
+        status_line "Backup" "$(basename "$backup_path")"
+        status_line "Size" "$backup_size"
+        status_line "Age" "${backup_age} days"
+        echo ""
+    fi
+
+    # Create temp directory for extraction
+    local temp_dir="${VERIFY_TEMP_DIR:-/tmp/jps-verify}/${domain}-$(date +%s)"
+    mkdir -p "$temp_dir"
+
+    # Register for cleanup (unless --keep-temp)
+    if [[ "$KEEP_TEMP" != true ]]; then
+        register_cleanup "$temp_dir"
+    fi
+
+    # Check 1: Extract backup
+    local extract_result
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "Backup extraction"
+    fi
+
+    if extract_backup "$backup_path" "$temp_dir"; then
+        extract_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        extract_result="fail"
+        overall_result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+
+        # Can't continue without extraction
+        if [[ "$OUTPUT_JSON" != true ]]; then
+            error "Failed to extract backup"
+        fi
+        VERIFY_RESULTS[$domain]='{"status": "fail", "message": "Extraction failed"}'
+        ((FAIL_COUNT++))
+        return 1
+    fi
+
+    # Find WordPress root
+    local wp_root
+    wp_root=$(find_wp_root "$temp_dir")
+
+    if [[ -z "$wp_root" ]]; then
+        # Not a WordPress backup - do basic checks only
+        if [[ "$OUTPUT_JSON" != true ]] && [[ "$VERBOSE" == true ]]; then
+            info "Not a WordPress backup, performing basic verification"
+        fi
+
+        # Check that some files exist
+        local file_count
+        file_count=$(find "$temp_dir" -type f 2>/dev/null | wc -l)
+
+        if [[ "$file_count" -gt 0 ]]; then
+            if [[ "$OUTPUT_JSON" != true ]]; then
+                success "Basic verification passed ($file_count files)"
+            fi
+            VERIFY_RESULTS[$domain]='{"status": "pass", "type": "non-wordpress", "files": '"$file_count"'}'
+            ((PASS_COUNT++))
+            return 0
+        else
+            if [[ "$OUTPUT_JSON" != true ]]; then
+                error "Backup appears to be empty"
+            fi
+            VERIFY_RESULTS[$domain]='{"status": "fail", "message": "Empty backup"}'
+            ((FAIL_COUNT++))
+            return 1
+        fi
+    fi
+
+    # WordPress-specific checks
+
+    # Check 2: wp-config.php exists
+    local check_result
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "wp-config.php exists"
+    fi
+    if [[ -f "${wp_root}/wp-config.php" ]]; then
+        check_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        check_result="fail"
+        overall_result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+    fi
+
+    # Check 3: wp-config.php is valid PHP
+    if [[ -f "${wp_root}/wp-config.php" ]]; then
+        if [[ "$VERBOSE" == true ]]; then
+            printf "  Checking: %-40s " "wp-config.php valid PHP"
+        fi
+        if php -l "${wp_root}/wp-config.php" &>/dev/null; then
+            check_result="pass"
+            if [[ "$VERBOSE" == true ]]; then
+                echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+            fi
+        else
+            check_result="fail"
+            overall_result="fail"
+            if [[ "$VERBOSE" == true ]]; then
+                echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+            fi
+        fi
+    fi
+
+    # Check 4: wp-content/ exists
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "wp-content/ directory"
+    fi
+    if [[ -d "${wp_root}/wp-content" ]]; then
+        check_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        check_result="fail"
+        overall_result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+    fi
+
+    # Check 5: wp-admin/ exists
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "wp-admin/ directory"
+    fi
+    if [[ -d "${wp_root}/wp-admin" ]]; then
+        check_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        check_result="fail"
+        overall_result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+    fi
+
+    # Check 6: wp-includes/ exists
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "wp-includes/ directory"
+    fi
+    if [[ -d "${wp_root}/wp-includes" ]]; then
+        check_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+    else
+        check_result="fail"
+        overall_result="fail"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+        fi
+    fi
+
+    # Check 7: Database dump exists
+    local db_dump
+    db_dump=$(find_db_dump "$temp_dir")
+
+    if [[ "$VERBOSE" == true ]]; then
+        printf "  Checking: %-40s " "Database dump exists"
+    fi
+    if [[ -n "$db_dump" ]]; then
+        check_result="pass"
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+        fi
+
+        # Check 8: Database import test
+        if [[ "$SKIP_DB" != true ]]; then
+            if [[ "$VERBOSE" == true ]]; then
+                printf "  Checking: %-40s " "Database import"
+            fi
+            local db_result
+            db_result=$(verify_database "$db_dump")
+
+            case "$db_result" in
+                pass)
+                    if [[ "$VERBOSE" == true ]]; then
+                        echo -e "${COLOR_GREEN}PASS${COLOR_RESET}"
+                    fi
+                    ;;
+                fail)
+                    overall_result="fail"
+                    if [[ "$VERBOSE" == true ]]; then
+                        echo -e "${COLOR_RED}FAIL${COLOR_RESET}"
+                    fi
+                    ;;
+                skip)
+                    if [[ "$VERBOSE" == true ]]; then
+                        echo -e "${COLOR_YELLOW}SKIP${COLOR_RESET}"
+                    fi
+                    ;;
+            esac
+        fi
+    else
+        # No database dump found - this might be okay if it's a files-only backup
+        if [[ "$VERBOSE" == true ]]; then
+            echo -e "${COLOR_YELLOW}SKIP${COLOR_RESET} (not found)"
+        fi
+    fi
+
+    # Summary
+    echo ""
+    if [[ "$overall_result" == "pass" ]]; then
+        success "Verification PASSED for $domain"
+        VERIFY_RESULTS[$domain]='{"status": "pass", "type": "wordpress", "backup": "'"$(basename "$backup_path")"'"}'
+        ((PASS_COUNT++))
+    else
+        error "Verification FAILED for $domain"
+        VERIFY_RESULTS[$domain]='{"status": "fail", "type": "wordpress", "backup": "'"$(basename "$backup_path")"'"}'
+        ((FAIL_COUNT++))
+    fi
+
+    # Log result
+    log_verification "$domain" "$overall_result" "$backup_path"
+
+    # Return appropriate exit code
+    if [[ "$overall_result" == "pass" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Log verification result
+log_verification() {
+    local domain="$1"
+    local result="$2"
+    local backup_path="$3"
+    local log_file="${LOG_DIR}/backup-verify/$(date '+%Y-%m-%d').log"
+
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    echo "[$timestamp] domain=$domain result=$result backup=$(basename "$backup_path")" >> "$log_file"
+}
+
+# Show verification report/history
+show_report() {
+    local log_dir="${LOG_DIR}/backup-verify"
+
+    if [[ ! -d "$log_dir" ]]; then
+        error "No verification logs found"
+        exit 2
+    fi
+
+    header "Backup Verification History"
+
+    # Show recent log entries
+    local found_any=false
+    while IFS= read -r log_file; do
+        if [[ -f "$log_file" ]]; then
+            found_any=true
+            local date_str
+            date_str=$(basename "$log_file" .log)
+            echo -e "${COLOR_BOLD}$date_str${COLOR_RESET}"
+
+            while IFS= read -r line; do
+                local domain result
+                domain=$(echo "$line" | grep -oP 'domain=\K[^ ]+')
+                result=$(echo "$line" | grep -oP 'result=\K[^ ]+')
+
+                if [[ "$result" == "pass" ]]; then
+                    echo -e "  ${COLOR_GREEN}PASS${COLOR_RESET} $domain"
+                else
+                    echo -e "  ${COLOR_RED}FAIL${COLOR_RESET} $domain"
+                fi
+            done < "$log_file"
+            echo ""
+        fi
+    done < <(find "$log_dir" -name "*.log" -type f | sort -r | head -10)
+
+    if [[ "$found_any" == false ]]; then
+        echo "No verification history found"
+    fi
+}
+
+# Verify all sites
+verify_all_sites() {
+    local websites_root="${WEBSITES_ROOT:-/usr/local/websites}"
+
+    if [[ ! -d "$websites_root" ]]; then
+        error "Websites directory not found: $websites_root"
+        exit 2
+    fi
+
+    if [[ "$OUTPUT_JSON" != true ]]; then
+        header "Verifying All Site Backups"
+        echo "Websites root: $websites_root"
+    fi
+
+    # Get list of domains
+    local domains=()
+    while IFS= read -r site_dir; do
+        domains+=("$(basename "$site_dir")")
+    done < <(find "$websites_root" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+
+    if [[ ${#domains[@]} -eq 0 ]]; then
+        if [[ "$OUTPUT_JSON" != true ]]; then
+            warn "No sites found in $websites_root"
+        fi
+        exit 0
+    fi
+
+    if [[ "$OUTPUT_JSON" != true ]]; then
+        echo "Found ${#domains[@]} sites"
+    fi
+
+    # Verify each domain
+    for domain in "${domains[@]}"; do
+        verify_domain "$domain" || true  # Don't exit on individual failures
+    done
+
+    # Summary
+    if [[ "$OUTPUT_JSON" != true ]]; then
+        echo ""
+        header "Verification Summary"
+        status_line "Passed" "$PASS_COUNT" "ok"
+        status_line "Failed" "$FAIL_COUNT" "$([ "$FAIL_COUNT" -gt 0 ] && echo "error" || echo "ok")"
+        status_line "Skipped" "$SKIP_COUNT"
+        echo ""
+    else
+        # JSON output
+        echo "{"
+        echo '  "summary": {'
+        echo "    \"passed\": $PASS_COUNT,"
+        echo "    \"failed\": $FAIL_COUNT,"
+        echo "    \"skipped\": $SKIP_COUNT"
+        echo "  },"
+        echo '  "results": {'
+        local first=true
+        for domain in "${!VERIFY_RESULTS[@]}"; do
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                echo ","
+            fi
+            echo -n "    \"$domain\": ${VERIFY_RESULTS[$domain]}"
+        done
+        echo ""
+        echo "  }"
+        echo "}"
+    fi
+
+    # Return overall result
+    if [[ "$FAIL_COUNT" -gt 0 ]]; then
+        return 1
+    else
+        return 0
+    fi
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root (recommended for database operations)
+    if ! is_root && [[ "$SKIP_DB" != true ]]; then
+        warn "Running as non-root user. Database verification may fail."
+    fi
+
+    # Execute requested operation
+    if [[ "$SHOW_REPORT" == true ]]; then
+        show_report
+        exit 0
+    fi
+
+    if [[ "$LIST_BACKUPS" == true ]]; then
+        list_all_backups
+        exit 0
+    fi
+
+    if [[ "$VERIFY_ALL" == true ]]; then
+        verify_all_sites
+        exit $?
+    fi
+
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        verify_domain "$TARGET_DOMAIN"
+        exit $?
+    fi
+
+    # Should not reach here
+    error "No operation specified"
+    exit 2
+}
+
+# Run main function
+main "$@"

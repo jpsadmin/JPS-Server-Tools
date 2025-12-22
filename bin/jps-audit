@@ -1,0 +1,1139 @@
+#!/bin/bash
+#===============================================================================
+# JPS Server Audit - Server State Capture and Drift Detection
+#
+# Comprehensive server state capture tool that collects system information,
+# resource usage, service status, security snapshot, website inventory,
+# database summary, and configuration checksums.
+#
+# Usage:
+#   jps-audit              # Full audit with color output
+#   jps-audit --brief      # Summary only
+#   jps-audit --json       # Machine-readable JSON output
+#   jps-audit --save       # Save JSON to logs/audit/
+#   jps-audit --diff       # Compare with previous audit
+#
+# Exit Codes:
+#   0 - Healthy, no drift detected
+#   1 - Healthy, but drift detected
+#   2 - Error during audit
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-audit"
+readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "ERROR: Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Server Audit - Comprehensive Server State Capture
+
+USAGE:
+    jps-audit [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -b, --brief         Show summary only (quick overview)
+    -j, --json          Output in JSON format
+    -s, --save          Save JSON output to logs/audit/
+    -d, --diff          Compare with most recent saved audit
+    -q, --quiet         Suppress non-essential output
+    --no-color          Disable colored output
+
+EXAMPLES:
+    jps-audit                     # Full audit with color output
+    jps-audit --brief             # Quick status check
+    jps-audit --json              # JSON output for automation
+    jps-audit --save              # Save snapshot for drift detection
+    jps-audit --diff              # Show what changed since last audit
+
+OUTPUT SECTIONS:
+    1. System Information   - OS, kernel, hostname, IP, uptime
+    2. Resource Usage       - CPU, memory, swap, disk per partition and site
+    3. Services Status      - OpenLiteSpeed, MariaDB, Fail2ban, UFW
+    4. Security Snapshot    - UFW rules, ports, SSH attempts, jails
+    5. Website Inventory    - All sites with WP version and SSL status
+    6. Database Summary     - MariaDB version and database sizes
+    7. Config Checksums     - MD5 hashes for drift detection
+
+EXIT CODES:
+    0 - Audit completed successfully, no drift
+    1 - Audit completed, drift detected (with --diff)
+    2 - Error occurred during audit
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Output mode: text, json, brief
+OUTPUT_MODE="text"
+SAVE_OUTPUT=false
+SHOW_DIFF=false
+QUIET_MODE=false
+
+# Drift tracking
+DRIFT_DETECTED=false
+
+# JSON accumulator
+declare -A JSON_DATA
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -b|--brief)
+                OUTPUT_MODE="brief"
+                shift
+                ;;
+            -j|--json)
+                OUTPUT_MODE="json"
+                shift
+                ;;
+            -s|--save)
+                SAVE_OUTPUT=true
+                # Implies JSON mode for saving
+                shift
+                ;;
+            -d|--diff)
+                SHOW_DIFF=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            --no-color)
+                # Override color variables
+                COLOR_RESET=''
+                COLOR_RED=''
+                COLOR_GREEN=''
+                COLOR_YELLOW=''
+                COLOR_BLUE=''
+                COLOR_CYAN=''
+                COLOR_BOLD=''
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 2
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# DATA COLLECTION FUNCTIONS
+#===============================================================================
+
+# Collect system information
+collect_system_info() {
+    debug "Collecting system information..."
+
+    local os_name os_version kernel hostname primary_ip uptime_seconds uptime_human timezone current_time
+
+    # OS information from /etc/os-release
+    if [[ -f /etc/os-release ]]; then
+        os_name=$(grep -oP '^NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "Unknown")
+        os_version=$(grep -oP '^VERSION="\K[^"]+' /etc/os-release 2>/dev/null || echo "Unknown")
+    else
+        os_name="Unknown"
+        os_version="Unknown"
+    fi
+
+    # Kernel version
+    kernel=$(uname -r)
+
+    # Hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+
+    # Primary IP address (first non-loopback IPv4)
+    primary_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1 || echo "Unknown")
+
+    # Uptime
+    uptime_seconds=$(cat /proc/uptime | cut -d' ' -f1 | cut -d'.' -f1)
+    uptime_human=$(uptime -p 2>/dev/null | sed 's/^up //' || echo "Unknown")
+
+    # Timezone
+    timezone=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "Unknown")
+
+    # Current time
+    current_time=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+    # Store in JSON format
+    JSON_DATA[system]='{
+        "os_name": "'"$(json_escape "$os_name")"'",
+        "os_version": "'"$(json_escape "$os_version")"'",
+        "kernel": "'"$(json_escape "$kernel")"'",
+        "hostname": "'"$(json_escape "$hostname")"'",
+        "primary_ip": "'"$(json_escape "$primary_ip")"'",
+        "uptime_seconds": '"$uptime_seconds"',
+        "uptime_human": "'"$(json_escape "$uptime_human")"'",
+        "timezone": "'"$(json_escape "$timezone")"'",
+        "audit_time": "'"$(json_escape "$current_time")"'"
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "System Information"
+        status_line "Operating System" "$os_name $os_version"
+        status_line "Kernel" "$kernel"
+        status_line "Hostname" "$hostname"
+        status_line "Primary IP" "$primary_ip"
+        status_line "Uptime" "$uptime_human"
+        status_line "Timezone" "$timezone"
+        status_line "Audit Time" "$current_time"
+    fi
+}
+
+# Collect resource usage
+collect_resources() {
+    debug "Collecting resource usage..."
+
+    # CPU usage (1-second sample)
+    local cpu_usage
+    cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "0")
+    # Handle comma decimal separator
+    cpu_usage=$(echo "$cpu_usage" | tr ',' '.')
+
+    # Memory information
+    local mem_total mem_used mem_available mem_percent
+    read -r mem_total mem_used mem_available <<< $(free -b | awk '/^Mem:/ {print $2, $3, $7}')
+    if [[ -n "$mem_total" ]] && [[ "$mem_total" -gt 0 ]]; then
+        mem_percent=$(awk "BEGIN {printf \"%.1f\", ($mem_used / $mem_total) * 100}")
+    else
+        mem_percent="0"
+    fi
+
+    # Swap information
+    local swap_total swap_used swap_percent
+    read -r swap_total swap_used <<< $(free -b | awk '/^Swap:/ {print $2, $3}')
+    if [[ -n "$swap_total" ]] && [[ "$swap_total" -gt 0 ]]; then
+        swap_percent=$(awk "BEGIN {printf \"%.1f\", ($swap_used / $swap_total) * 100}")
+    else
+        swap_percent="0"
+    fi
+
+    # Disk usage per partition
+    local disk_json="["
+    local first=true
+    while IFS= read -r line; do
+        local filesystem size used avail percent mountpoint
+        read -r filesystem size used avail percent mountpoint <<< "$line"
+        # Remove % from percent
+        percent="${percent%\%}"
+
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            disk_json+=","
+        fi
+
+        disk_json+='{
+            "filesystem": "'"$(json_escape "$filesystem")"'",
+            "size_bytes": '"$size"',
+            "used_bytes": '"$used"',
+            "available_bytes": '"$avail"',
+            "percent": '"$percent"',
+            "mountpoint": "'"$(json_escape "$mountpoint")"'"
+        }'
+    done < <(df -B1 --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2)
+    disk_json+="]"
+
+    # Disk usage per website
+    local sites_disk_json="["
+    first=true
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        while IFS= read -r site_dir; do
+            local site_name site_size
+            site_name=$(basename "$site_dir")
+            site_size=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
+
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                sites_disk_json+=","
+            fi
+
+            sites_disk_json+='{
+                "domain": "'"$(json_escape "$site_name")"'",
+                "size_bytes": '"$site_size"'
+            }'
+        done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+    fi
+    sites_disk_json+="]"
+
+    # Determine status based on thresholds
+    local mem_status="ok"
+    local mem_pct_int=${mem_percent%.*}
+    if [[ "$mem_pct_int" -ge "${MEM_CRIT_PERCENT:-95}" ]]; then
+        mem_status="error"
+    elif [[ "$mem_pct_int" -ge "${MEM_WARN_PERCENT:-85}" ]]; then
+        mem_status="warn"
+    fi
+
+    # Store in JSON format
+    JSON_DATA[resources]='{
+        "cpu_percent": '"$cpu_usage"',
+        "memory": {
+            "total_bytes": '"$mem_total"',
+            "used_bytes": '"$mem_used"',
+            "available_bytes": '"$mem_available"',
+            "percent": '"$mem_percent"'
+        },
+        "swap": {
+            "total_bytes": '"${swap_total:-0}"',
+            "used_bytes": '"${swap_used:-0}"',
+            "percent": '"${swap_percent:-0}"'
+        },
+        "disk_partitions": '"$disk_json"',
+        "website_sizes": '"$sites_disk_json"'
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Resource Usage"
+
+        # CPU
+        status_line "CPU Usage" "${cpu_usage}%"
+
+        # Memory
+        status_line "Memory Used" "$(human_size "$mem_used") / $(human_size "$mem_total") (${mem_percent}%)" "$mem_status"
+
+        # Swap
+        if [[ "${swap_total:-0}" -gt 0 ]]; then
+            status_line "Swap Used" "$(human_size "$swap_used") / $(human_size "$swap_total") (${swap_percent}%)"
+        else
+            status_line "Swap" "Not configured"
+        fi
+
+        echo ""
+        subheader "Disk Partitions"
+        while IFS= read -r line; do
+            local filesystem size used avail percent mountpoint
+            read -r filesystem size used avail percent mountpoint <<< "$line"
+            local pct_int="${percent%\%}"
+            local status="ok"
+            if [[ "$pct_int" -ge "${DISK_CRIT_PERCENT:-90}" ]]; then
+                status="error"
+            elif [[ "$pct_int" -ge "${DISK_WARN_PERCENT:-80}" ]]; then
+                status="warn"
+            fi
+            status_line "$mountpoint" "$(human_size "$used") / $(human_size "$size") (${percent})" "$status"
+        done < <(df -B1 --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2)
+
+        echo ""
+        subheader "Website Disk Usage"
+        if [[ -d "$WEBSITES_ROOT" ]]; then
+            while IFS= read -r site_dir; do
+                local site_name site_size
+                site_name=$(basename "$site_dir")
+                site_size=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
+                status_line "$site_name" "$(human_size "$site_size")"
+            done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+        else
+            echo "  Website root not found: $WEBSITES_ROOT"
+        fi
+    fi
+}
+
+# Collect service status
+collect_services() {
+    debug "Collecting service status..."
+
+    # Check each service
+    local ols_status mariadb_status fail2ban_status ufw_status
+
+    # OpenLiteSpeed (process name is lshttpd)
+    if pgrep -x "lshttpd" &>/dev/null || systemctl is-active --quiet lshttpd 2>/dev/null; then
+        ols_status="running"
+    elif pgrep -f "litespeed" &>/dev/null; then
+        ols_status="running"
+    else
+        ols_status="stopped"
+    fi
+
+    # MariaDB
+    if systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null; then
+        mariadb_status="running"
+    elif pgrep -x "mysqld" &>/dev/null || pgrep -x "mariadbd" &>/dev/null; then
+        mariadb_status="running"
+    else
+        mariadb_status="stopped"
+    fi
+
+    # Fail2ban
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        fail2ban_status="running"
+    elif pgrep -f "fail2ban" &>/dev/null; then
+        fail2ban_status="running"
+    else
+        fail2ban_status="stopped"
+    fi
+
+    # UFW
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_status="active"
+    else
+        ufw_status="inactive"
+    fi
+
+    # Store in JSON format
+    JSON_DATA[services]='{
+        "openlitespeed": "'"$ols_status"'",
+        "mariadb": "'"$mariadb_status"'",
+        "fail2ban": "'"$fail2ban_status"'",
+        "ufw": "'"$ufw_status"'"
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Services Status"
+
+        local status_indicator
+        for svc_name in "OpenLiteSpeed:$ols_status" "MariaDB:$mariadb_status" "Fail2ban:$fail2ban_status" "UFW:$ufw_status"; do
+            local name="${svc_name%%:*}"
+            local status="${svc_name##*:}"
+            if [[ "$status" == "running" ]] || [[ "$status" == "active" ]]; then
+                status_line "$name" "$status" "ok"
+            else
+                status_line "$name" "$status" "error"
+            fi
+        done
+    fi
+}
+
+# Collect security snapshot
+collect_security() {
+    debug "Collecting security snapshot..."
+
+    # UFW rules summary
+    local ufw_allow_count=0 ufw_deny_count=0
+    if command_exists ufw; then
+        ufw_allow_count=$(ufw status 2>/dev/null | grep -c "ALLOW" || echo "0")
+        ufw_deny_count=$(ufw status 2>/dev/null | grep -c "DENY" || echo "0")
+    fi
+
+    # Open/listening ports
+    local ports_json="["
+    local first=true
+    while IFS= read -r line; do
+        local proto port process
+        proto=$(echo "$line" | awk '{print $1}')
+        port=$(echo "$line" | awk '{print $4}' | rev | cut -d: -f1 | rev)
+        process=$(echo "$line" | awk '{print $7}' | cut -d/ -f2 | cut -d: -f1)
+
+        if [[ -n "$port" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                ports_json+=","
+            fi
+            ports_json+='{
+                "protocol": "'"$(json_escape "$proto")"'",
+                "port": '"$port"',
+                "process": "'"$(json_escape "${process:-unknown}")"'"
+            }'
+        fi
+    done < <(ss -tlnp 2>/dev/null | tail -n +2)
+    ports_json+="]"
+
+    # Failed SSH attempts in last 24 hours
+    local ssh_fail_count=0
+    if [[ -f /var/log/auth.log ]]; then
+        ssh_fail_count=$(grep -c "Failed password" /var/log/auth.log 2>/dev/null || echo "0")
+    elif [[ -f /var/log/secure ]]; then
+        ssh_fail_count=$(grep -c "Failed password" /var/log/secure 2>/dev/null || echo "0")
+    fi
+    # Use journalctl as fallback
+    if [[ "$ssh_fail_count" -eq 0 ]] && command_exists journalctl; then
+        ssh_fail_count=$(journalctl -u ssh -u sshd --since "24 hours ago" 2>/dev/null | grep -c "Failed password" || echo "0")
+    fi
+
+    # Fail2ban active jails
+    local jails_json="["
+    first=true
+    if command_exists fail2ban-client; then
+        while IFS= read -r jail; do
+            jail=$(trim "$jail")
+            if [[ -n "$jail" ]]; then
+                local banned_count
+                banned_count=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
+
+                if [[ "$first" == true ]]; then
+                    first=false
+                else
+                    jails_json+=","
+                fi
+                jails_json+='{
+                    "name": "'"$(json_escape "$jail")"'",
+                    "banned_count": '"${banned_count:-0}"'
+                }'
+            fi
+        done < <(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr ',' '\n')
+    fi
+    jails_json+="]"
+
+    # Last 5 successful SSH logins
+    local logins_json="["
+    first=true
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local user ip date_time
+            user=$(echo "$line" | awk '{print $1}')
+            ip=$(echo "$line" | awk '{print $3}')
+            date_time=$(echo "$line" | awk '{print $4, $5, $6, $7}')
+
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                logins_json+=","
+            fi
+            logins_json+='{
+                "user": "'"$(json_escape "$user")"'",
+                "ip": "'"$(json_escape "$ip")"'",
+                "time": "'"$(json_escape "$date_time")"'"
+            }'
+        fi
+    done < <(last -n "${SSH_LOGINS_SHOW:-5}" -i 2>/dev/null | head -n "${SSH_LOGINS_SHOW:-5}" | grep -v "wtmp begins" | grep -v "^$")
+    logins_json+="]"
+
+    # Store in JSON format
+    JSON_DATA[security]='{
+        "ufw": {
+            "allow_rules": '"$ufw_allow_count"',
+            "deny_rules": '"$ufw_deny_count"'
+        },
+        "listening_ports": '"$ports_json"',
+        "ssh_failed_24h": '"$ssh_fail_count"',
+        "fail2ban_jails": '"$jails_json"',
+        "recent_logins": '"$logins_json"'
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Security Snapshot"
+
+        subheader "Firewall (UFW)"
+        status_line "Allow Rules" "$ufw_allow_count"
+        status_line "Deny Rules" "$ufw_deny_count"
+
+        echo ""
+        subheader "Listening Ports"
+        while IFS= read -r line; do
+            local proto port process
+            proto=$(echo "$line" | awk '{print $1}')
+            port=$(echo "$line" | awk '{print $4}' | rev | cut -d: -f1 | rev)
+            process=$(echo "$line" | awk '{print $7}' | cut -d/ -f2 | cut -d: -f1)
+            if [[ -n "$port" ]] && [[ "$port" =~ ^[0-9]+$ ]]; then
+                printf "  %-6s %-8s %s\n" "$proto" "$port" "${process:-unknown}"
+            fi
+        done < <(ss -tlnp 2>/dev/null | tail -n +2)
+
+        echo ""
+        subheader "SSH Security"
+        local ssh_status="ok"
+        if [[ "$ssh_fail_count" -gt 100 ]]; then
+            ssh_status="warn"
+        fi
+        status_line "Failed Attempts (24h)" "$ssh_fail_count" "$ssh_status"
+
+        echo ""
+        subheader "Fail2ban Jails"
+        if command_exists fail2ban-client; then
+            while IFS= read -r jail; do
+                jail=$(trim "$jail")
+                if [[ -n "$jail" ]]; then
+                    local banned_count
+                    banned_count=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
+                    status_line "$jail" "$banned_count banned"
+                fi
+            done < <(fail2ban-client status 2>/dev/null | grep "Jail list" | cut -d: -f2 | tr ',' '\n')
+        else
+            echo "  Fail2ban not available"
+        fi
+
+        echo ""
+        subheader "Recent SSH Logins"
+        while IFS= read -r line; do
+            if [[ -n "$line" ]] && [[ ! "$line" =~ ^wtmp ]] && [[ ! "$line" =~ ^$ ]]; then
+                echo "  $line"
+            fi
+        done < <(last -n "${SSH_LOGINS_SHOW:-5}" -i 2>/dev/null | head -n "${SSH_LOGINS_SHOW:-5}")
+    fi
+}
+
+# Collect website inventory
+collect_websites() {
+    debug "Collecting website inventory..."
+
+    local sites_json="["
+    local first=true
+    local site_count=0
+    local wp_count=0
+
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        while IFS= read -r site_dir; do
+            local domain disk_size is_wp wp_version ssl_expiry ssl_days
+
+            domain=$(basename "$site_dir")
+            disk_size=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
+            ((site_count++))
+
+            # Check if WordPress
+            if is_wordpress "$site_dir"; then
+                is_wp="true"
+                ((wp_count++))
+
+                # Get WordPress version
+                if [[ -f "${site_dir}/html/wp-includes/version.php" ]]; then
+                    wp_version=$(grep -oP '\$wp_version\s*=\s*['\''\"]\K[^'\''\";]+' "${site_dir}/html/wp-includes/version.php" 2>/dev/null || echo "unknown")
+                elif [[ -f "${site_dir}/wp-includes/version.php" ]]; then
+                    wp_version=$(grep -oP '\$wp_version\s*=\s*['\''\"]\K[^'\''\";]+' "${site_dir}/wp-includes/version.php" 2>/dev/null || echo "unknown")
+                else
+                    wp_version="unknown"
+                fi
+            else
+                is_wp="false"
+                wp_version=""
+            fi
+
+            # Check SSL certificate
+            ssl_expiry=$(get_ssl_expiry "$domain" 2>/dev/null || echo "")
+            if [[ -n "$ssl_expiry" ]]; then
+                ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "-1")
+            else
+                ssl_days="-1"
+            fi
+
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                sites_json+=","
+            fi
+
+            sites_json+='{
+                "domain": "'"$(json_escape "$domain")"'",
+                "disk_bytes": '"$disk_size"',
+                "is_wordpress": '"$is_wp"',
+                "wp_version": "'"$(json_escape "$wp_version")"'",
+                "ssl_expiry": "'"$(json_escape "$ssl_expiry")"'",
+                "ssl_days_remaining": '"$ssl_days"'
+            }'
+        done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+    fi
+    sites_json+="]"
+
+    # Store in JSON format
+    JSON_DATA[websites]='{
+        "total_count": '"$site_count"',
+        "wordpress_count": '"$wp_count"',
+        "sites": '"$sites_json"'
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Website Inventory"
+        status_line "Total Sites" "$site_count"
+        status_line "WordPress Sites" "$wp_count"
+
+        echo ""
+        printf "  ${COLOR_BOLD}%-30s %10s %-5s %-10s %s${COLOR_RESET}\n" "Domain" "Size" "WP" "Version" "SSL Days"
+        printf "  %-30s %10s %-5s %-10s %s\n" "------------------------------" "----------" "-----" "----------" "--------"
+
+        if [[ -d "$WEBSITES_ROOT" ]]; then
+            while IFS= read -r site_dir; do
+                local domain disk_size is_wp wp_version ssl_days ssl_status
+
+                domain=$(basename "$site_dir")
+                disk_size=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
+
+                # Check if WordPress
+                if is_wordpress "$site_dir"; then
+                    is_wp="Yes"
+                    if [[ -f "${site_dir}/html/wp-includes/version.php" ]]; then
+                        wp_version=$(grep -oP '\$wp_version\s*=\s*['\''\"]\K[^'\''\";]+' "${site_dir}/html/wp-includes/version.php" 2>/dev/null || echo "?")
+                    elif [[ -f "${site_dir}/wp-includes/version.php" ]]; then
+                        wp_version=$(grep -oP '\$wp_version\s*=\s*['\''\"]\K[^'\''\";]+' "${site_dir}/wp-includes/version.php" 2>/dev/null || echo "?")
+                    else
+                        wp_version="?"
+                    fi
+                else
+                    is_wp="No"
+                    wp_version="-"
+                fi
+
+                # Check SSL
+                ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "-1")
+                if [[ "$ssl_days" -lt 0 ]]; then
+                    ssl_days="N/A"
+                    ssl_status=""
+                elif [[ "$ssl_days" -le "${SSL_CRIT_DAYS:-7}" ]]; then
+                    ssl_status="${COLOR_RED}"
+                elif [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+                    ssl_status="${COLOR_YELLOW}"
+                else
+                    ssl_status="${COLOR_GREEN}"
+                fi
+
+                printf "  %-30s %10s %-5s %-10s ${ssl_status}%s${COLOR_RESET}\n" \
+                    "$domain" "$(human_size "$disk_size")" "$is_wp" "$wp_version" "$ssl_days"
+            done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+        fi
+    fi
+}
+
+# Collect database summary
+collect_databases() {
+    debug "Collecting database summary..."
+
+    local mariadb_version=""
+    local databases_json="["
+    local first=true
+
+    # Check if MySQL/MariaDB is accessible
+    if command_exists mysql; then
+        # Get MariaDB version
+        mariadb_version=$(mysql -N -e "SELECT VERSION();" 2>/dev/null || echo "")
+
+        if [[ -n "$mariadb_version" ]]; then
+            # Get database sizes
+            while IFS=$'\t' read -r db_name db_size; do
+                # Skip system databases
+                case "$db_name" in
+                    information_schema|mysql|performance_schema|sys) continue ;;
+                esac
+
+                if [[ "$first" == true ]]; then
+                    first=false
+                else
+                    databases_json+=","
+                fi
+
+                databases_json+='{
+                    "name": "'"$(json_escape "$db_name")"'",
+                    "size_bytes": '"${db_size:-0}"'
+                }'
+            done < <(mysql -N -e "SELECT table_schema, SUM(data_length + index_length) as size FROM information_schema.tables GROUP BY table_schema;" 2>/dev/null)
+        fi
+    fi
+    databases_json+="]"
+
+    # Store in JSON format
+    JSON_DATA[databases]='{
+        "mariadb_version": "'"$(json_escape "$mariadb_version")"'",
+        "databases": '"$databases_json"'
+    }'
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Database Summary"
+
+        if [[ -n "$mariadb_version" ]]; then
+            status_line "MariaDB Version" "$mariadb_version"
+
+            echo ""
+            subheader "Databases"
+            while IFS=$'\t' read -r db_name db_size; do
+                case "$db_name" in
+                    information_schema|mysql|performance_schema|sys) continue ;;
+                esac
+                status_line "$db_name" "$(human_size "${db_size:-0}")"
+            done < <(mysql -N -e "SELECT table_schema, SUM(data_length + index_length) as size FROM information_schema.tables GROUP BY table_schema;" 2>/dev/null)
+        else
+            warn "Cannot connect to MariaDB"
+        fi
+    fi
+}
+
+# Collect configuration checksums
+collect_checksums() {
+    debug "Collecting configuration checksums..."
+
+    local checksums_json="{"
+    local first=true
+
+    # Main OLS config
+    if [[ -f "$OLS_CONFIG" ]]; then
+        local ols_md5
+        ols_md5=$(md5sum "$OLS_CONFIG" 2>/dev/null | cut -d' ' -f1 || echo "")
+        checksums_json+='"ols_config": "'"$ols_md5"'"'
+        first=false
+    fi
+
+    # VHost configs
+    local vhosts_json="{"
+    local vhost_first=true
+    if [[ -d "$VHOSTS_DIR" ]]; then
+        while IFS= read -r vhost_dir; do
+            local vhost_name vhost_conf vhost_md5
+            vhost_name=$(basename "$vhost_dir")
+            vhost_conf="${vhost_dir}/vhconf.conf"
+
+            if [[ -f "$vhost_conf" ]]; then
+                vhost_md5=$(md5sum "$vhost_conf" 2>/dev/null | cut -d' ' -f1 || echo "")
+
+                if [[ "$vhost_first" == true ]]; then
+                    vhost_first=false
+                else
+                    vhosts_json+=","
+                fi
+                vhosts_json+='"'"$(json_escape "$vhost_name")"'": "'"$vhost_md5"'"'
+            fi
+        done < <(find "$VHOSTS_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+    fi
+    vhosts_json+="}"
+
+    if [[ "$first" == false ]]; then
+        checksums_json+=","
+    fi
+    checksums_json+='"vhosts": '"$vhosts_json"'}'
+
+    # Store in JSON format
+    JSON_DATA[checksums]="$checksums_json"
+
+    # Text output
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+        header "Configuration Checksums"
+
+        if [[ -f "$OLS_CONFIG" ]]; then
+            local ols_md5
+            ols_md5=$(md5sum "$OLS_CONFIG" 2>/dev/null | cut -d' ' -f1 || echo "N/A")
+            status_line "httpd_config.conf" "$ols_md5"
+        fi
+
+        echo ""
+        subheader "VHost Configs"
+        if [[ -d "$VHOSTS_DIR" ]]; then
+            while IFS= read -r vhost_dir; do
+                local vhost_name vhost_conf vhost_md5
+                vhost_name=$(basename "$vhost_dir")
+                vhost_conf="${vhost_dir}/vhconf.conf"
+
+                if [[ -f "$vhost_conf" ]]; then
+                    vhost_md5=$(md5sum "$vhost_conf" 2>/dev/null | cut -d' ' -f1 || echo "N/A")
+                    status_line "$vhost_name" "$vhost_md5"
+                fi
+            done < <(find "$VHOSTS_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+        else
+            echo "  VHosts directory not found: $VHOSTS_DIR"
+        fi
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+# Build complete JSON output
+build_json_output() {
+    local json_output='{'
+    json_output+='"audit_version": "'"$SCRIPT_VERSION"'",'
+    json_output+='"audit_timestamp": "'"$(date -Iseconds)"'",'
+    json_output+='"system": '"${JSON_DATA[system]}"','
+    json_output+='"resources": '"${JSON_DATA[resources]}"','
+    json_output+='"services": '"${JSON_DATA[services]}"','
+    json_output+='"security": '"${JSON_DATA[security]}"','
+    json_output+='"websites": '"${JSON_DATA[websites]}"','
+    json_output+='"databases": '"${JSON_DATA[databases]}"','
+    json_output+='"checksums": '"${JSON_DATA[checksums]}"''
+    json_output+='}'
+
+    # Pretty print if jq is available
+    if command_exists jq; then
+        echo "$json_output" | jq .
+    else
+        echo "$json_output"
+    fi
+}
+
+# Output brief summary
+output_brief() {
+    echo ""
+    echo -e "${COLOR_BOLD}JPS Server Audit Summary${COLOR_RESET}"
+    echo "========================"
+
+    # System info
+    local hostname primary_ip
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    primary_ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | head -1 || echo "Unknown")
+    echo "Host: $hostname ($primary_ip)"
+
+    # Resources
+    local cpu_usage mem_percent
+    cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null | tr ',' '.' || echo "0")
+    local mem_info
+    mem_info=$(free | awk '/^Mem:/ {printf "%.0f", ($3/$2)*100}')
+    echo "Resources: CPU ${cpu_usage}% | Memory ${mem_info}%"
+
+    # Services
+    local ols_status mariadb_status
+    if pgrep -x "lshttpd" &>/dev/null || pgrep -f "litespeed" &>/dev/null; then
+        ols_status="${COLOR_GREEN}running${COLOR_RESET}"
+    else
+        ols_status="${COLOR_RED}stopped${COLOR_RESET}"
+    fi
+    if pgrep -x "mysqld" &>/dev/null || pgrep -x "mariadbd" &>/dev/null; then
+        mariadb_status="${COLOR_GREEN}running${COLOR_RESET}"
+    else
+        mariadb_status="${COLOR_RED}stopped${COLOR_RESET}"
+    fi
+    echo -e "Services: OLS $ols_status | MariaDB $mariadb_status"
+
+    # Sites
+    local site_count=0
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        site_count=$(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    fi
+    echo "Websites: $site_count"
+
+    # Warnings
+    local warnings=0
+    # Check disk
+    while IFS= read -r line; do
+        local percent
+        percent=$(echo "$line" | awk '{print $5}' | tr -d '%')
+        if [[ "$percent" -ge "${DISK_WARN_PERCENT:-80}" ]]; then
+            ((warnings++))
+        fi
+    done < <(df -h 2>/dev/null | tail -n +2)
+
+    # Check SSL
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        while IFS= read -r site_dir; do
+            local domain ssl_days
+            domain=$(basename "$site_dir")
+            ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "999")
+            if [[ "$ssl_days" -ge 0 ]] && [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+                ((warnings++))
+            fi
+        done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+    fi
+
+    if [[ "$warnings" -gt 0 ]]; then
+        echo -e "Warnings: ${COLOR_YELLOW}$warnings${COLOR_RESET}"
+    else
+        echo -e "Warnings: ${COLOR_GREEN}None${COLOR_RESET}"
+    fi
+
+    echo ""
+}
+
+# Save audit to file
+save_audit() {
+    local output_dir="${LOG_DIR}/audit"
+    local output_file="${output_dir}/$(date '+%Y-%m-%d-%H%M%S').json"
+
+    # Create directory if needed
+    mkdir -p "$output_dir" 2>/dev/null || {
+        error "Cannot create audit log directory: $output_dir"
+        return 1
+    }
+
+    # Save JSON output
+    build_json_output > "$output_file"
+
+    if [[ "$OUTPUT_MODE" != "json" ]]; then
+        success "Audit saved to: $output_file"
+    fi
+}
+
+# Find most recent audit file
+find_latest_audit() {
+    local audit_dir="${LOG_DIR}/audit"
+
+    if [[ ! -d "$audit_dir" ]]; then
+        return 1
+    fi
+
+    # Find most recent JSON file
+    find "$audit_dir" -maxdepth 1 -name "*.json" -type f -printf '%T@ %p\n' 2>/dev/null | \
+        sort -rn | head -1 | cut -d' ' -f2-
+}
+
+# Compare current audit with previous
+compare_with_previous() {
+    local previous_file
+    previous_file=$(find_latest_audit)
+
+    if [[ -z "$previous_file" ]] || [[ ! -f "$previous_file" ]]; then
+        warn "No previous audit found for comparison"
+        return 0
+    fi
+
+    if ! command_exists jq; then
+        error "jq is required for drift detection"
+        return 1
+    fi
+
+    local previous_time
+    previous_time=$(jq -r '.audit_timestamp' "$previous_file" 2>/dev/null || echo "unknown")
+
+    header "Drift Detection"
+    echo "Comparing with: $previous_file"
+    echo "Previous audit: $previous_time"
+    echo ""
+
+    # Compare site counts
+    local prev_sites curr_sites
+    prev_sites=$(jq -r '.websites.sites[].domain' "$previous_file" 2>/dev/null | sort)
+    curr_sites=""
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        curr_sites=$(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+    fi
+
+    # Find new sites
+    local new_sites
+    new_sites=$(comm -13 <(echo "$prev_sites") <(echo "$curr_sites") 2>/dev/null)
+    if [[ -n "$new_sites" ]]; then
+        DRIFT_DETECTED=true
+        subheader "New Sites"
+        echo "$new_sites" | while read -r site; do
+            echo -e "  ${COLOR_GREEN}+ $site${COLOR_RESET}"
+        done
+        echo ""
+    fi
+
+    # Find removed sites
+    local removed_sites
+    removed_sites=$(comm -23 <(echo "$prev_sites") <(echo "$curr_sites") 2>/dev/null)
+    if [[ -n "$removed_sites" ]]; then
+        DRIFT_DETECTED=true
+        subheader "Removed Sites"
+        echo "$removed_sites" | while read -r site; do
+            echo -e "  ${COLOR_RED}- $site${COLOR_RESET}"
+        done
+        echo ""
+    fi
+
+    # Compare config checksums
+    local prev_ols_md5 curr_ols_md5
+    prev_ols_md5=$(jq -r '.checksums.ols_config // ""' "$previous_file" 2>/dev/null)
+    curr_ols_md5=$(md5sum "$OLS_CONFIG" 2>/dev/null | cut -d' ' -f1 || echo "")
+
+    if [[ -n "$prev_ols_md5" ]] && [[ "$prev_ols_md5" != "$curr_ols_md5" ]]; then
+        DRIFT_DETECTED=true
+        subheader "Config Changes"
+        echo -e "  ${COLOR_YELLOW}httpd_config.conf changed${COLOR_RESET}"
+        echo ""
+    fi
+
+    # Compare disk usage (>10% change)
+    while IFS= read -r site; do
+        local prev_size curr_size change_pct
+        prev_size=$(jq -r ".websites.sites[] | select(.domain == \"$site\") | .disk_bytes" "$previous_file" 2>/dev/null || echo "0")
+        curr_size=$(du -sb "${WEBSITES_ROOT}/${site}" 2>/dev/null | cut -f1 || echo "0")
+
+        if [[ "$prev_size" -gt 0 ]]; then
+            change_pct=$(awk "BEGIN {printf \"%.0f\", (($curr_size - $prev_size) / $prev_size) * 100}")
+
+            if [[ "${change_pct#-}" -ge "${DRIFT_DISK_THRESHOLD:-10}" ]]; then
+                if [[ -z "${disk_drift_shown:-}" ]]; then
+                    DRIFT_DETECTED=true
+                    subheader "Significant Disk Changes (>10%)"
+                    disk_drift_shown=1
+                fi
+                echo "  $site: $(human_size "$prev_size") -> $(human_size "$curr_size") (${change_pct}%)"
+            fi
+        fi
+    done <<< "$(comm -12 <(echo "$prev_sites") <(echo "$curr_sites") 2>/dev/null)"
+
+    if [[ "$DRIFT_DETECTED" == true ]]; then
+        echo ""
+        warn "Drift detected since last audit"
+    else
+        success "No significant drift detected"
+    fi
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root (required for most operations)
+    if ! is_root; then
+        warn "Running as non-root user. Some information may be incomplete."
+    fi
+
+    # Run all collectors
+    collect_system_info
+    collect_resources
+    collect_services
+    collect_security
+    collect_websites
+    collect_databases
+    collect_checksums
+
+    # Handle output based on mode
+    case "$OUTPUT_MODE" in
+        json)
+            build_json_output
+            ;;
+        brief)
+            output_brief
+            ;;
+        text)
+            # Already output during collection
+            echo ""
+            ;;
+    esac
+
+    # Save if requested
+    if [[ "$SAVE_OUTPUT" == true ]]; then
+        save_audit
+    fi
+
+    # Show diff if requested
+    if [[ "$SHOW_DIFF" == true ]]; then
+        compare_with_previous
+    fi
+
+    # Exit code based on drift
+    if [[ "$DRIFT_DETECTED" == true ]]; then
+        exit 1
+    else
+        exit 0
+    fi
+}
+
+# Run main function
+main "$@"
