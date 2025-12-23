@@ -244,6 +244,8 @@ create_symlinks() {
     local scripts=(
         "jps-audit"
         "jps-backup-verify"
+        "jps-status"
+        "jps-monitor"
     )
 
     for script in "${scripts[@]}"; do
@@ -317,6 +319,8 @@ verify_installation() {
     local required_files=(
         "$INSTALL_DIR/bin/jps-audit"
         "$INSTALL_DIR/bin/jps-backup-verify"
+        "$INSTALL_DIR/bin/jps-status"
+        "$INSTALL_DIR/bin/jps-monitor"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
@@ -334,6 +338,8 @@ verify_installation() {
     local symlinks=(
         "$BIN_LINKS_DIR/jps-audit"
         "$BIN_LINKS_DIR/jps-backup-verify"
+        "$BIN_LINKS_DIR/jps-status"
+        "$BIN_LINKS_DIR/jps-monitor"
     )
 
     for link in "${symlinks[@]}"; do
@@ -382,6 +388,14 @@ ${BOLD}Available Commands:${RESET}
     Verify backup restoration integrity.
     Options: --help, --all, --report, --list
 
+  ${GREEN}jps-status${RESET}
+    Quick site inventory table.
+    Options: --help, --json, --no-check, --domain
+
+  ${GREEN}jps-monitor${RESET}
+    Health monitoring for cron (silent when healthy).
+    Options: --help, --verbose, --email, --json
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -413,6 +427,8 @@ uninstall() {
     info "Removing symlinks..."
     rm -f "$BIN_LINKS_DIR/jps-audit"
     rm -f "$BIN_LINKS_DIR/jps-backup-verify"
+    rm -f "$BIN_LINKS_DIR/jps-status"
+    rm -f "$BIN_LINKS_DIR/jps-monitor"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

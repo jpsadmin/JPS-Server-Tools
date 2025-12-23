@@ -1,0 +1,640 @@
+#!/bin/bash
+#===============================================================================
+# JPS Site Status - Quick Site Inventory
+#
+# Fast overview of all hosted sites in a compact table showing domain, disk
+# usage, WordPress version, SSL status, and site health.
+#
+# Usage:
+#   jps-status                    # Show all sites
+#   jps-status --domain example.com  # Single site details
+#   jps-status --json             # Machine-readable output
+#   jps-status --no-check         # Skip HTTP health checks
+#
+# Exit Codes:
+#   0 - All sites healthy
+#   1 - Some sites have issues
+#   2 - Error during execution
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-status"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "ERROR: Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Site Status - Quick Site Inventory
+
+USAGE:
+    jps-status [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -d, --domain DOMAIN     Show details for a single domain
+    -j, --json              Output in JSON format
+    -n, --no-check          Skip HTTP health checks (faster)
+    --no-color              Disable colored output
+
+EXAMPLES:
+    jps-status
+        Show status of all sites with colored table
+
+    jps-status --domain example.com
+        Show detailed status for a single domain
+
+    jps-status --no-check
+        Quick inventory without HTTP checks
+
+    jps-status --json
+        Machine-readable JSON output
+
+OUTPUT COLUMNS:
+    Domain      - Website domain name
+    Size        - Disk usage (human readable)
+    WP Ver      - WordPress version or "Static"
+    SSL         - Days until SSL certificate expires
+    Status      - HTTP health check result (UP/DOWN)
+
+EXIT CODES:
+    0 - All sites healthy (or --no-check mode)
+    1 - One or more sites have issues
+    2 - Error occurred
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+OUTPUT_JSON=false
+SKIP_HTTP_CHECK=false
+SINGLE_DOMAIN=""
+
+# Counters for summary
+TOTAL_SITES=0
+WP_SITES=0
+STATIC_SITES=0
+SITES_UP=0
+SITES_DOWN=0
+SSL_VALID=0
+SSL_WARNING=0
+SSL_CRITICAL=0
+
+# HTTP check timeout (seconds)
+HTTP_TIMEOUT=5
+
+# Store site data for JSON output
+declare -a SITES_DATA
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -d|--domain)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --domain requires an argument"
+                    exit 2
+                fi
+                SINGLE_DOMAIN="$2"
+                shift 2
+                ;;
+            -j|--json)
+                OUTPUT_JSON=true
+                shift
+                ;;
+            -n|--no-check)
+                SKIP_HTTP_CHECK=true
+                shift
+                ;;
+            --no-color)
+                # Override color variables
+                COLOR_RESET=''
+                COLOR_RED=''
+                COLOR_GREEN=''
+                COLOR_YELLOW=''
+                COLOR_BLUE=''
+                COLOR_CYAN=''
+                COLOR_BOLD=''
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 2
+                ;;
+            *)
+                # Treat as domain if no option prefix
+                SINGLE_DOMAIN="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# SITE CHECK FUNCTIONS
+#===============================================================================
+
+# Check if a site responds to HTTP/HTTPS
+# Usage: check_site_http "example.com"
+# Returns: "up" or "down"
+check_site_http() {
+    local domain="$1"
+
+    if [[ "$SKIP_HTTP_CHECK" == true ]]; then
+        echo "skip"
+        return 0
+    fi
+
+    # Try HTTPS first
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time "$HTTP_TIMEOUT" \
+        --connect-timeout "$HTTP_TIMEOUT" \
+        -L "https://${domain}/" 2>/dev/null) || http_code="000"
+
+    # Check if response is 2xx or 3xx
+    if [[ "$http_code" =~ ^[23] ]]; then
+        echo "up"
+        return 0
+    fi
+
+    # Try HTTP as fallback
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time "$HTTP_TIMEOUT" \
+        --connect-timeout "$HTTP_TIMEOUT" \
+        -L "http://${domain}/" 2>/dev/null) || http_code="000"
+
+    if [[ "$http_code" =~ ^[23] ]]; then
+        echo "up"
+        return 0
+    fi
+
+    echo "down"
+    return 1
+}
+
+# Get site information
+# Returns JSON-like data for a single site
+get_site_info() {
+    local domain="$1"
+    local site_dir="${WEBSITES_ROOT}/${domain}"
+
+    # Disk size
+    local disk_bytes
+    disk_bytes=$(du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0")
+
+    # WordPress check
+    local is_wp="false"
+    local wp_version=""
+    local wp_path=""
+
+    if [[ -f "${site_dir}/html/wp-config.php" ]]; then
+        is_wp="true"
+        wp_path="${site_dir}/html"
+    elif [[ -f "${site_dir}/wp-config.php" ]]; then
+        is_wp="true"
+        wp_path="${site_dir}"
+    fi
+
+    if [[ "$is_wp" == "true" ]]; then
+        # Get WordPress version from version.php
+        local version_file="${wp_path}/wp-includes/version.php"
+        if [[ -f "$version_file" ]]; then
+            wp_version=$(grep -oP '\$wp_version\s*=\s*['\''\"]\K[^'\''\";]+' "$version_file" 2>/dev/null || echo "?")
+        else
+            wp_version="?"
+        fi
+    fi
+
+    # SSL check
+    local ssl_days
+    ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "-1")
+
+    # HTTP check
+    local http_status
+    http_status=$(check_site_http "$domain")
+
+    # Output as tab-separated values
+    echo -e "${domain}\t${disk_bytes}\t${is_wp}\t${wp_version}\t${ssl_days}\t${http_status}"
+}
+
+# Format SSL days with color
+format_ssl_days() {
+    local days="$1"
+
+    if [[ "$days" == "-1" ]]; then
+        echo "N/A"
+    elif [[ "$days" -le "${SSL_CRIT_DAYS:-7}" ]]; then
+        echo -e "${COLOR_RED}${days} days${COLOR_RESET}"
+    elif [[ "$days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+        echo -e "${COLOR_YELLOW}${days} days${COLOR_RESET}"
+    else
+        echo -e "${COLOR_GREEN}${days} days${COLOR_RESET}"
+    fi
+}
+
+# Format HTTP status with color and symbol
+format_http_status() {
+    local status="$1"
+
+    case "$status" in
+        up)
+            echo -e "${COLOR_GREEN}✓ UP${COLOR_RESET}"
+            ;;
+        down)
+            echo -e "${COLOR_RED}✗ DOWN${COLOR_RESET}"
+            ;;
+        skip)
+            echo -e "${COLOR_DIM}-${COLOR_RESET}"
+            ;;
+        *)
+            echo "?"
+            ;;
+    esac
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+# Print table header
+print_header() {
+    echo ""
+    echo -e "${COLOR_BOLD}${COLOR_CYAN}JPS Site Status${COLOR_RESET}"
+    echo ""
+    printf "${COLOR_BOLD}%-30s %10s %-10s %-12s %s${COLOR_RESET}\n" \
+        "Domain" "Size" "WP Ver" "SSL" "Status"
+    printf "%-30s %10s %-10s %-12s %s\n" \
+        "------------------------------" "----------" "----------" "------------" "--------"
+}
+
+# Print single site row
+print_site_row() {
+    local domain="$1"
+    local disk_bytes="$2"
+    local is_wp="$3"
+    local wp_version="$4"
+    local ssl_days="$5"
+    local http_status="$6"
+
+    # Format values
+    local size_human
+    size_human=$(human_size "$disk_bytes")
+
+    local wp_display
+    if [[ "$is_wp" == "true" ]]; then
+        wp_display="$wp_version"
+    else
+        wp_display="Static"
+    fi
+
+    local ssl_display
+    ssl_display=$(format_ssl_days "$ssl_days")
+
+    local status_display
+    status_display=$(format_http_status "$http_status")
+
+    # Use printf for alignment (note: color codes affect width calculation)
+    # We need to handle the colored fields specially
+    printf "%-30s %10s %-10s " "$domain" "$size_human" "$wp_display"
+
+    # SSL field with color
+    if [[ "$ssl_days" == "-1" ]]; then
+        printf "%-12s " "N/A"
+    elif [[ "$ssl_days" -le "${SSL_CRIT_DAYS:-7}" ]]; then
+        printf "${COLOR_RED}%-12s${COLOR_RESET} " "${ssl_days} days"
+    elif [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+        printf "${COLOR_YELLOW}%-12s${COLOR_RESET} " "${ssl_days} days"
+    else
+        printf "${COLOR_GREEN}%-12s${COLOR_RESET} " "${ssl_days} days"
+    fi
+
+    # Status field with color
+    case "$http_status" in
+        up)
+            printf "${COLOR_GREEN}✓ UP${COLOR_RESET}"
+            ;;
+        down)
+            printf "${COLOR_RED}✗ DOWN${COLOR_RESET}"
+            ;;
+        skip)
+            printf "${COLOR_DIM}-${COLOR_RESET}"
+            ;;
+        *)
+            printf "?"
+            ;;
+    esac
+
+    echo ""
+}
+
+# Print summary line
+print_summary() {
+    echo ""
+    printf "Total: %d sites | WordPress: %d | " "$TOTAL_SITES" "$WP_SITES"
+
+    # SSL summary
+    if [[ "$SSL_CRITICAL" -gt 0 ]]; then
+        printf "${COLOR_RED}SSL critical: %d${COLOR_RESET} | " "$SSL_CRITICAL"
+    elif [[ "$SSL_WARNING" -gt 0 ]]; then
+        printf "${COLOR_YELLOW}SSL warning: %d${COLOR_RESET} | " "$SSL_WARNING"
+    else
+        printf "${COLOR_GREEN}All SSL valid${COLOR_RESET} | "
+    fi
+
+    # HTTP summary
+    if [[ "$SKIP_HTTP_CHECK" == true ]]; then
+        printf "HTTP checks skipped"
+    elif [[ "$SITES_DOWN" -gt 0 ]]; then
+        printf "${COLOR_RED}%d DOWN${COLOR_RESET}" "$SITES_DOWN"
+    else
+        printf "${COLOR_GREEN}All responding${COLOR_RESET}"
+    fi
+
+    echo ""
+    echo ""
+}
+
+# Output JSON format
+output_json() {
+    local json_sites=""
+    local first=true
+
+    for site_data in "${SITES_DATA[@]}"; do
+        IFS=$'\t' read -r domain disk_bytes is_wp wp_version ssl_days http_status <<< "$site_data"
+
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            json_sites+=","
+        fi
+
+        json_sites+='{
+        "domain": "'"$(json_escape "$domain")"'",
+        "disk_bytes": '"$disk_bytes"',
+        "disk_human": "'"$(human_size "$disk_bytes")"'",
+        "is_wordpress": '"$is_wp"',
+        "wp_version": "'"$(json_escape "$wp_version")"'",
+        "ssl_days_remaining": '"$ssl_days"',
+        "http_status": "'"$http_status"'"
+    }'
+    done
+
+    # Pretty print if jq available
+    local json_output='{
+    "timestamp": "'"$(date -Iseconds)"'",
+    "summary": {
+        "total_sites": '"$TOTAL_SITES"',
+        "wordpress_sites": '"$WP_SITES"',
+        "static_sites": '"$STATIC_SITES"',
+        "sites_up": '"$SITES_UP"',
+        "sites_down": '"$SITES_DOWN"',
+        "ssl_valid": '"$SSL_VALID"',
+        "ssl_warning": '"$SSL_WARNING"',
+        "ssl_critical": '"$SSL_CRITICAL"'
+    },
+    "sites": ['"$json_sites"']
+}'
+
+    if command_exists jq; then
+        echo "$json_output" | jq .
+    else
+        echo "$json_output"
+    fi
+}
+
+# Show detailed info for single domain
+show_domain_details() {
+    local domain="$1"
+    local site_dir="${WEBSITES_ROOT}/${domain}"
+
+    if [[ ! -d "$site_dir" ]]; then
+        error "Domain not found: $domain"
+        error "Expected directory: $site_dir"
+        exit 2
+    fi
+
+    header "Site Details: $domain"
+
+    # Get site info
+    local site_info
+    site_info=$(get_site_info "$domain")
+    IFS=$'\t' read -r _ disk_bytes is_wp wp_version ssl_days http_status <<< "$site_info"
+
+    status_line "Domain" "$domain"
+    status_line "Directory" "$site_dir"
+    status_line "Disk Usage" "$(human_size "$disk_bytes")"
+
+    echo ""
+    subheader "WordPress"
+    if [[ "$is_wp" == "true" ]]; then
+        status_line "Type" "WordPress" "ok"
+        status_line "Version" "$wp_version"
+
+        # Additional WP info
+        local wp_path="${site_dir}/html"
+        [[ ! -f "${wp_path}/wp-config.php" ]] && wp_path="$site_dir"
+
+        # Check for wp-content subdirs
+        local plugins_count=0 themes_count=0
+        if [[ -d "${wp_path}/wp-content/plugins" ]]; then
+            plugins_count=$(find "${wp_path}/wp-content/plugins" -maxdepth 1 -type d | wc -l)
+            ((plugins_count--)) || true  # Subtract 1 for the directory itself
+        fi
+        if [[ -d "${wp_path}/wp-content/themes" ]]; then
+            themes_count=$(find "${wp_path}/wp-content/themes" -maxdepth 1 -type d | wc -l)
+            ((themes_count--)) || true
+        fi
+        status_line "Plugins" "$plugins_count"
+        status_line "Themes" "$themes_count"
+    else
+        status_line "Type" "Static site"
+    fi
+
+    echo ""
+    subheader "SSL Certificate"
+    if [[ "$ssl_days" == "-1" ]]; then
+        status_line "Status" "Not available or error" "warn"
+    elif [[ "$ssl_days" -le "${SSL_CRIT_DAYS:-7}" ]]; then
+        status_line "Status" "CRITICAL - expires in ${ssl_days} days" "error"
+    elif [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+        status_line "Status" "Warning - expires in ${ssl_days} days" "warn"
+    else
+        status_line "Status" "Valid for ${ssl_days} days" "ok"
+    fi
+
+    # Try to get expiry date
+    local ssl_expiry
+    ssl_expiry=$(get_ssl_expiry "$domain" 2>/dev/null || echo "")
+    if [[ -n "$ssl_expiry" ]]; then
+        status_line "Expires" "$ssl_expiry"
+    fi
+
+    echo ""
+    subheader "HTTP Status"
+    if [[ "$SKIP_HTTP_CHECK" == true ]]; then
+        status_line "Check" "Skipped (--no-check)"
+    elif [[ "$http_status" == "up" ]]; then
+        status_line "Status" "Responding" "ok"
+    else
+        status_line "Status" "Not responding" "error"
+    fi
+
+    echo ""
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check websites root exists
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        error "Websites directory not found: $WEBSITES_ROOT"
+        exit 2
+    fi
+
+    # Single domain mode
+    if [[ -n "$SINGLE_DOMAIN" ]]; then
+        if [[ "$OUTPUT_JSON" == true ]]; then
+            # Get single site info as JSON
+            local site_info
+            site_info=$(get_site_info "$SINGLE_DOMAIN")
+            IFS=$'\t' read -r domain disk_bytes is_wp wp_version ssl_days http_status <<< "$site_info"
+
+            SITES_DATA+=("$site_info")
+            TOTAL_SITES=1
+            [[ "$is_wp" == "true" ]] && WP_SITES=1 || STATIC_SITES=1
+            [[ "$http_status" == "up" ]] && SITES_UP=1
+            [[ "$http_status" == "down" ]] && SITES_DOWN=1
+            [[ "$ssl_days" -gt "${SSL_WARN_DAYS:-14}" ]] && SSL_VALID=1
+            [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]] && [[ "$ssl_days" -gt "${SSL_CRIT_DAYS:-7}" ]] && SSL_WARNING=1
+            [[ "$ssl_days" -le "${SSL_CRIT_DAYS:-7}" ]] && [[ "$ssl_days" -ge 0 ]] && SSL_CRITICAL=1
+
+            output_json
+        else
+            show_domain_details "$SINGLE_DOMAIN"
+        fi
+        exit 0
+    fi
+
+    # Collect all site data
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+
+        local site_info
+        site_info=$(get_site_info "$domain")
+        SITES_DATA+=("$site_info")
+
+        # Parse for counters
+        IFS=$'\t' read -r _ disk_bytes is_wp wp_version ssl_days http_status <<< "$site_info"
+
+        ((TOTAL_SITES++)) || true
+
+        if [[ "$is_wp" == "true" ]]; then
+            ((WP_SITES++)) || true
+        else
+            ((STATIC_SITES++)) || true
+        fi
+
+        if [[ "$http_status" == "up" ]]; then
+            ((SITES_UP++)) || true
+        elif [[ "$http_status" == "down" ]]; then
+            ((SITES_DOWN++)) || true
+        fi
+
+        if [[ "$ssl_days" -ge 0 ]]; then
+            if [[ "$ssl_days" -le "${SSL_CRIT_DAYS:-7}" ]]; then
+                ((SSL_CRITICAL++)) || true
+            elif [[ "$ssl_days" -le "${SSL_WARN_DAYS:-14}" ]]; then
+                ((SSL_WARNING++)) || true
+            else
+                ((SSL_VALID++)) || true
+            fi
+        fi
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+
+    # Output based on format
+    if [[ "$OUTPUT_JSON" == true ]]; then
+        output_json
+    else
+        if [[ "$TOTAL_SITES" -eq 0 ]]; then
+            echo ""
+            echo "No sites found in $WEBSITES_ROOT"
+            echo ""
+            exit 0
+        fi
+
+        print_header
+
+        for site_data in "${SITES_DATA[@]}"; do
+            IFS=$'\t' read -r domain disk_bytes is_wp wp_version ssl_days http_status <<< "$site_data"
+            print_site_row "$domain" "$disk_bytes" "$is_wp" "$wp_version" "$ssl_days" "$http_status"
+        done
+
+        print_summary
+    fi
+
+    # Exit code based on health
+    if [[ "$SITES_DOWN" -gt 0 ]] || [[ "$SSL_CRITICAL" -gt 0 ]]; then
+        exit 1
+    fi
+
+    exit 0
+}
+
+# Run main function
+main "$@"

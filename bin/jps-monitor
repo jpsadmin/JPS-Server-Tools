@@ -1,0 +1,538 @@
+#!/bin/bash
+#===============================================================================
+# JPS Monitor - Health Monitoring for Cron
+#
+# Silent when healthy, alerts only on problems. Designed to run via cron.
+# Checks system resources, services, website health, and SSL certificates.
+#
+# Usage:
+#   jps-monitor              # Silent unless issues found
+#   jps-monitor --verbose    # Show all checks
+#   jps-monitor --email      # Send alert email if issues found
+#
+# Exit Codes:
+#   0 - All checks passed (no output unless --verbose)
+#   1 - Warnings found
+#   2 - Critical issues found
+#
+# Cron Example:
+#   */5 * * * * /usr/local/bin/jps-monitor 2>&1 | logger -t jps-monitor
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-monitor"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Monitor - Health Monitoring for Cron
+
+DESCRIPTION:
+    Silent monitoring tool designed for cron. Outputs nothing when healthy,
+    only reports when problems are detected.
+
+USAGE:
+    jps-monitor [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show all checks, even passing ones
+    -e, --email         Send alert email if issues found
+    -j, --json          Output in JSON format
+    --no-http           Skip HTTP health checks
+    --no-ssl            Skip SSL certificate checks
+
+CHECKS PERFORMED:
+    - Disk usage per partition (warn: 80%, crit: 90%)
+    - Memory usage (warn: 85%, crit: 95%)
+    - OpenLiteSpeed service running
+    - MariaDB service running
+    - Website HTTP/HTTPS response (5 second timeout)
+    - SSL certificate expiration (warn: 14 days, crit: 7 days)
+
+THRESHOLDS:
+    Thresholds can be configured in /opt/jps-server-tools/config/jps-tools.conf:
+    - DISK_WARN_PERCENT, DISK_CRIT_PERCENT
+    - MEM_WARN_PERCENT, MEM_CRIT_PERCENT
+    - SSL_WARN_DAYS, SSL_CRIT_DAYS
+
+CRON EXAMPLES:
+    # Check every 5 minutes, log to syslog
+    */5 * * * * /usr/local/bin/jps-monitor 2>&1 | logger -t jps-monitor
+
+    # Check every hour, send email on failure
+    0 * * * * /usr/local/bin/jps-monitor --email
+
+    # Check every 15 minutes, skip HTTP checks
+    */15 * * * * /usr/local/bin/jps-monitor --no-http
+
+EXIT CODES:
+    0 - All checks passed
+    1 - Warnings detected
+    2 - Critical issues detected
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+VERBOSE=false
+SEND_EMAIL=false
+OUTPUT_JSON=false
+SKIP_HTTP=false
+SKIP_SSL=false
+
+# Issue tracking
+declare -a WARNINGS
+declare -a CRITICALS
+
+# HTTP check timeout
+HTTP_TIMEOUT=5
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -e|--email)
+                SEND_EMAIL=true
+                shift
+                ;;
+            -j|--json)
+                OUTPUT_JSON=true
+                shift
+                ;;
+            --no-http)
+                SKIP_HTTP=true
+                shift
+                ;;
+            --no-ssl)
+                SKIP_SSL=true
+                shift
+                ;;
+            *)
+                echo "[ERROR] Unknown option: $1" >&2
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+# Log a warning
+log_warn() {
+    local message="$1"
+    WARNINGS+=("$message")
+    if [[ "$VERBOSE" == true ]] || [[ "$OUTPUT_JSON" == false ]]; then
+        echo "[WARN] $message"
+    fi
+}
+
+# Log a critical issue
+log_crit() {
+    local message="$1"
+    CRITICALS+=("$message")
+    if [[ "$VERBOSE" == true ]] || [[ "$OUTPUT_JSON" == false ]]; then
+        echo "[CRIT] $message"
+    fi
+}
+
+# Log a passing check (only in verbose mode)
+log_ok() {
+    local message="$1"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[OK] $message"
+    fi
+}
+
+#===============================================================================
+# CHECK FUNCTIONS
+#===============================================================================
+
+# Check disk usage on all partitions
+check_disk() {
+    local warn_threshold="${DISK_WARN_PERCENT:-80}"
+    local crit_threshold="${DISK_CRIT_PERCENT:-90}"
+
+    while IFS= read -r line; do
+        local filesystem mountpoint percent
+        filesystem=$(echo "$line" | awk '{print $1}')
+        mountpoint=$(echo "$line" | awk '{print $6}')
+        percent=$(echo "$line" | awk '{print $5}' | tr -d '%')
+
+        if [[ "$percent" -ge "$crit_threshold" ]]; then
+            log_crit "Disk usage on ${mountpoint} is ${percent}%"
+        elif [[ "$percent" -ge "$warn_threshold" ]]; then
+            log_warn "Disk usage on ${mountpoint} is ${percent}%"
+        else
+            log_ok "Disk ${mountpoint}: ${percent}%"
+        fi
+    done < <(df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2)
+}
+
+# Check memory usage
+check_memory() {
+    local warn_threshold="${MEM_WARN_PERCENT:-85}"
+    local crit_threshold="${MEM_CRIT_PERCENT:-95}"
+
+    local mem_info
+    mem_info=$(free | awk '/^Mem:/ {printf "%.0f", ($3/$2)*100}')
+
+    if [[ "$mem_info" -ge "$crit_threshold" ]]; then
+        log_crit "Memory usage is ${mem_info}%"
+    elif [[ "$mem_info" -ge "$warn_threshold" ]]; then
+        log_warn "Memory usage is ${mem_info}%"
+    else
+        log_ok "Memory: ${mem_info}%"
+    fi
+}
+
+# Check if OpenLiteSpeed is running
+check_ols() {
+    if pgrep -x "lshttpd" &>/dev/null || pgrep -f "litespeed" &>/dev/null; then
+        log_ok "OpenLiteSpeed is running"
+    else
+        # Also try systemctl
+        if systemctl is-active --quiet lshttpd 2>/dev/null || systemctl is-active --quiet lsws 2>/dev/null; then
+            log_ok "OpenLiteSpeed is running"
+        else
+            log_crit "OpenLiteSpeed is not running"
+        fi
+    fi
+}
+
+# Check if MariaDB is running
+check_mariadb() {
+    if pgrep -x "mysqld" &>/dev/null || pgrep -x "mariadbd" &>/dev/null; then
+        log_ok "MariaDB is running"
+    else
+        # Also try systemctl
+        if systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null; then
+            log_ok "MariaDB is running"
+        else
+            log_crit "MariaDB is not running"
+        fi
+    fi
+}
+
+# Check if a website responds to HTTP/HTTPS
+check_site_http() {
+    local domain="$1"
+
+    if [[ "$SKIP_HTTP" == true ]]; then
+        return 0
+    fi
+
+    # Try HTTPS first
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time "$HTTP_TIMEOUT" \
+        --connect-timeout "$HTTP_TIMEOUT" \
+        -L "https://${domain}/" 2>/dev/null) || http_code="000"
+
+    # Check if response is 2xx or 3xx
+    if [[ "$http_code" =~ ^[23] ]]; then
+        log_ok "Site ${domain} is responding (HTTPS)"
+        return 0
+    fi
+
+    # Try HTTP as fallback
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time "$HTTP_TIMEOUT" \
+        --connect-timeout "$HTTP_TIMEOUT" \
+        -L "http://${domain}/" 2>/dev/null) || http_code="000"
+
+    if [[ "$http_code" =~ ^[23] ]]; then
+        log_ok "Site ${domain} is responding (HTTP)"
+        return 0
+    fi
+
+    log_crit "Site ${domain} not responding"
+    return 1
+}
+
+# Check SSL certificate expiration
+check_site_ssl() {
+    local domain="$1"
+
+    if [[ "$SKIP_SSL" == true ]]; then
+        return 0
+    fi
+
+    local warn_days="${SSL_WARN_DAYS:-14}"
+    local crit_days="${SSL_CRIT_DAYS:-7}"
+
+    local ssl_days
+    ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "-1")
+
+    if [[ "$ssl_days" == "-1" ]]; then
+        # Could not check SSL - might not have HTTPS
+        log_ok "SSL for ${domain}: could not check (may not have HTTPS)"
+        return 0
+    fi
+
+    if [[ "$ssl_days" -le "$crit_days" ]]; then
+        log_crit "SSL for ${domain} expires in ${ssl_days} days"
+        return 1
+    elif [[ "$ssl_days" -le "$warn_days" ]]; then
+        log_warn "SSL for ${domain} expires in ${ssl_days} days"
+        return 0
+    else
+        log_ok "SSL for ${domain}: ${ssl_days} days remaining"
+        return 0
+    fi
+}
+
+# Check all websites
+check_all_sites() {
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        log_warn "Websites directory not found: $WEBSITES_ROOT"
+        return 0
+    fi
+
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+
+        # Check HTTP
+        check_site_http "$domain" || true
+
+        # Check SSL
+        check_site_ssl "$domain" || true
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+}
+
+#===============================================================================
+# EMAIL FUNCTION
+#===============================================================================
+
+send_alert_email() {
+    local alert_email="${ALERT_EMAIL:-}"
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+
+    if [[ -z "$alert_email" ]]; then
+        if [[ "$VERBOSE" == true ]]; then
+            echo "[INFO] No ALERT_EMAIL configured, skipping email"
+        fi
+        return 0
+    fi
+
+    local subject="[JPS Monitor] Alert on ${hostname}"
+    local body="JPS Monitor detected issues on ${hostname} at $(date)\n\n"
+
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        body+="CRITICAL ISSUES:\n"
+        for msg in "${CRITICALS[@]}"; do
+            body+="  - $msg\n"
+        done
+        body+="\n"
+    fi
+
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        body+="WARNINGS:\n"
+        for msg in "${WARNINGS[@]}"; do
+            body+="  - $msg\n"
+        done
+        body+="\n"
+    fi
+
+    body+="Run 'jps-monitor --verbose' for full status.\n"
+    body+="\n--\nJPS Server Tools\n"
+
+    # Send email using mail command if available
+    if command_exists mail; then
+        echo -e "$body" | mail -s "$subject" "$alert_email"
+        if [[ "$VERBOSE" == true ]]; then
+            echo "[INFO] Alert email sent to $alert_email"
+        fi
+    elif command_exists sendmail; then
+        {
+            echo "To: $alert_email"
+            echo "Subject: $subject"
+            echo "Content-Type: text/plain"
+            echo ""
+            echo -e "$body"
+        } | sendmail -t
+        if [[ "$VERBOSE" == true ]]; then
+            echo "[INFO] Alert email sent to $alert_email"
+        fi
+    else
+        echo "[WARN] Cannot send email: mail/sendmail not found" >&2
+    fi
+}
+
+#===============================================================================
+# JSON OUTPUT
+#===============================================================================
+
+output_json() {
+    local status="ok"
+    local exit_code=0
+
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        status="critical"
+        exit_code=2
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        status="warning"
+        exit_code=1
+    fi
+
+    # Build JSON arrays
+    local warnings_json="["
+    local first=true
+    for msg in "${WARNINGS[@]}"; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            warnings_json+=","
+        fi
+        warnings_json+="\"$(json_escape "$msg")\""
+    done
+    warnings_json+="]"
+
+    local criticals_json="["
+    first=true
+    for msg in "${CRITICALS[@]}"; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            criticals_json+=","
+        fi
+        criticals_json+="\"$(json_escape "$msg")\""
+    done
+    criticals_json+="]"
+
+    local json_output='{
+    "timestamp": "'"$(date -Iseconds)"'",
+    "hostname": "'"$(hostname -f 2>/dev/null || hostname)"'",
+    "status": "'"$status"'",
+    "exit_code": '"$exit_code"',
+    "warnings_count": '"${#WARNINGS[@]}"',
+    "criticals_count": '"${#CRITICALS[@]}"',
+    "warnings": '"$warnings_json"',
+    "criticals": '"$criticals_json"'
+}'
+
+    if command_exists jq; then
+        echo "$json_output" | jq .
+    else
+        echo "$json_output"
+    fi
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Run all checks
+    if [[ "$VERBOSE" == true ]]; then
+        echo "JPS Monitor - $(date)"
+        echo "Checking system health..."
+        echo ""
+    fi
+
+    # System checks
+    check_disk
+    check_memory
+
+    # Service checks
+    check_ols
+    check_mariadb
+
+    # Website checks
+    check_all_sites
+
+    # Determine exit code
+    local exit_code=0
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        exit_code=2
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        exit_code=1
+    fi
+
+    # JSON output if requested
+    if [[ "$OUTPUT_JSON" == true ]]; then
+        output_json
+        exit "$exit_code"
+    fi
+
+    # Send email if requested and issues found
+    if [[ "$SEND_EMAIL" == true ]] && [[ $exit_code -gt 0 ]]; then
+        send_alert_email
+    fi
+
+    # Verbose summary
+    if [[ "$VERBOSE" == true ]]; then
+        echo ""
+        echo "Summary: ${#WARNINGS[@]} warnings, ${#CRITICALS[@]} critical"
+        if [[ $exit_code -eq 0 ]]; then
+            echo "Status: All checks passed"
+        fi
+    fi
+
+    exit "$exit_code"
+}
+
+# Run main function
+main "$@"

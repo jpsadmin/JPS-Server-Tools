@@ -8,6 +8,8 @@ JPS Server Tools fills the gap between WordPress management plugins and server a
 
 - **Server Auditing**: Comprehensive system state capture with drift detection
 - **Backup Verification**: Prove your backups can actually restore
+- **Site Status**: Quick inventory of all hosted sites with health checks
+- **Health Monitoring**: Silent cron monitoring with alerts only on issues
 
 These are server-level operations that WordPress plugins cannot see or manage.
 
@@ -47,6 +49,8 @@ sudo chmod +x /opt/jps-server-tools/bin/*
 # Create symlinks
 sudo ln -sf /opt/jps-server-tools/bin/jps-audit /usr/local/bin/jps-audit
 sudo ln -sf /opt/jps-server-tools/bin/jps-backup-verify /usr/local/bin/jps-backup-verify
+sudo ln -sf /opt/jps-server-tools/bin/jps-status /usr/local/bin/jps-status
+sudo ln -sf /opt/jps-server-tools/bin/jps-monitor /usr/local/bin/jps-monitor
 ```
 
 ### Check Dependencies
@@ -87,6 +91,29 @@ sudo jps-backup-verify --all
 
 # List available backups
 sudo jps-backup-verify --list
+```
+
+### Check Site Status
+
+```bash
+# View all sites in a table
+sudo jps-status
+
+# Quick check without HTTP tests
+sudo jps-status --no-check
+
+# Details for one site
+sudo jps-status --domain example.com
+```
+
+### Set Up Monitoring
+
+```bash
+# Test monitoring (verbose mode)
+sudo jps-monitor --verbose
+
+# Add to cron (silent unless issues)
+# */5 * * * * /usr/local/bin/jps-monitor 2>&1 | logger -t jps-monitor
 ```
 
 ## Tools Reference
@@ -203,6 +230,122 @@ sudo jps-backup-verify --report
 - `0` - Verification passed
 - `1` - Verification failed
 - `2` - Error (backup not found, etc.)
+
+### jps-status
+
+Fast overview of all hosted sites in a compact table.
+
+```
+Usage: jps-status [OPTIONS]
+
+Options:
+  -h, --help              Show help message
+  -V, --version           Show version
+  -d, --domain DOMAIN     Show details for single domain
+  -j, --json              JSON output format
+  -n, --no-check          Skip HTTP health checks (faster)
+  --no-color              Disable colored output
+```
+
+**Output Columns:**
+
+| Column | Description |
+|--------|-------------|
+| Domain | Website domain name |
+| Size | Disk usage (human readable) |
+| WP Ver | WordPress version or "Static" |
+| SSL | Days until certificate expires (color coded) |
+| Status | HTTP health check result (UP/DOWN) |
+
+**Example Output:**
+
+```
+JPS Site Status
+
+Domain                         Size      WP Ver     SSL          Status
+------------------------------ ---------- ---------- ------------ --------
+jpshosting.biz                 3.32 GB   6.7.1      40 days      ✓ UP
+jpshosting.net                 66.8 MB   6.7.1      32 days      ✓ UP
+
+Total: 2 sites | WordPress: 2 | All SSL valid | All responding
+```
+
+**Examples:**
+
+```bash
+# Show all sites
+sudo jps-status
+
+# Quick inventory (no HTTP checks)
+sudo jps-status --no-check
+
+# Single site details
+sudo jps-status --domain example.com
+
+# JSON for scripting
+sudo jps-status --json
+```
+
+**Exit Codes:**
+
+- `0` - All sites healthy
+- `1` - One or more sites have issues
+- `2` - Error occurred
+
+### jps-monitor
+
+Silent health monitoring designed for cron. Outputs nothing when healthy.
+
+```
+Usage: jps-monitor [OPTIONS]
+
+Options:
+  -h, --help      Show help message
+  -V, --version   Show version
+  -v, --verbose   Show all checks (even passing)
+  -e, --email     Send email alert if issues found
+  -j, --json      JSON output format
+  --no-http       Skip HTTP health checks
+  --no-ssl        Skip SSL certificate checks
+```
+
+**Checks Performed:**
+
+| Check | Warning | Critical |
+|-------|---------|----------|
+| Disk usage | 80% | 90% |
+| Memory usage | 85% | 95% |
+| OpenLiteSpeed | - | Not running |
+| MariaDB | - | Not running |
+| Website HTTP | - | Not responding |
+| SSL certificates | 14 days | 7 days |
+
+**Example Output (only when issues found):**
+
+```
+[WARN] Disk usage on / is 82%
+[WARN] SSL for example.com expires in 5 days
+[CRIT] Site staging.example.com not responding
+```
+
+**Cron Examples:**
+
+```bash
+# Check every 5 minutes, log to syslog
+*/5 * * * * /usr/local/bin/jps-monitor 2>&1 | logger -t jps-monitor
+
+# Check every hour, send email on failure
+0 * * * * /usr/local/bin/jps-monitor --email
+
+# Check every 15 minutes, skip HTTP checks
+*/15 * * * * /usr/local/bin/jps-monitor --no-http
+```
+
+**Exit Codes:**
+
+- `0` - All checks passed (no output)
+- `1` - Warnings detected
+- `2` - Critical issues detected
 
 ## Configuration
 
@@ -386,7 +529,9 @@ sudo ./install.sh --check
 jps-server-tools/
 ├── bin/
 │   ├── jps-audit           # Server audit script
-│   └── jps-backup-verify   # Backup verification script
+│   ├── jps-backup-verify   # Backup verification script
+│   ├── jps-status          # Site inventory table
+│   └── jps-monitor         # Health monitoring for cron
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/
@@ -403,7 +548,7 @@ jps-server-tools/
 Planned tools for future phases:
 
 - **jps-ssl**: SSL certificate management and monitoring
-- **jps-monitor**: Real-time monitoring with alerts
+- **jps-ssl**: SSL certificate management and renewal
 - **jps-security**: Security hardening and vulnerability scanning
 - **jps-maintenance**: Automated maintenance tasks
 
