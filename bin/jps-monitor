@@ -121,8 +121,8 @@ SKIP_HTTP=false
 SKIP_SSL=false
 
 # Issue tracking
-declare -a WARNINGS
-declare -a CRITICALS
+declare -a WARNINGS=()
+declare -a CRITICALS=()
 
 # HTTP check timeout
 HTTP_TIMEOUT=5
