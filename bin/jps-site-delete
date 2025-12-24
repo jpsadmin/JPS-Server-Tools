@@ -1,0 +1,624 @@
+#!/bin/bash
+#===============================================================================
+# JPS Site Delete - Safe Site Deletion with Confirmations
+#
+# Safely removes a site with multiple confirmation steps and optional
+# archival before deletion. Designed to prevent accidental data loss.
+#
+# Usage:
+#   jps-site-delete example.com                # Interactive deletion
+#   jps-site-delete example.com --archive      # Archive before delete
+#   jps-site-delete example.com --dry-run      # Show what would be deleted
+#
+# Exit Codes:
+#   0 - Deletion completed successfully
+#   1 - Error during deletion
+#   2 - Invalid arguments or domain not found
+#   3 - User cancelled operation
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-site-delete"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Site Delete - Safe Site Deletion with Confirmations
+
+DESCRIPTION:
+    Safely removes a site with multiple confirmation steps.
+    Can optionally archive the site before deletion.
+
+USAGE:
+    jps-site-delete <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to delete (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show detailed progress
+    -a, --archive       Create archive before deletion
+    -y, --yes           Skip initial confirmation (still requires typing domain)
+    --dry-run           Show what would be deleted without deleting
+    --no-db             Don't drop the database
+    --no-vhost          Don't remove vhost config
+    --keep-backups      Don't remove backup files
+    -n, --note NOTE     Add a note to the deletion log
+
+DELETION STEPS:
+    1. Show summary of what will be deleted
+    2. Ask for initial confirmation
+    3. Require user to type domain name to confirm
+    4. Optionally create archive
+    5. Remove site files
+    6. Drop database (if WordPress)
+    7. Remove vhost configuration
+    8. Remove backups (optional)
+    9. Reload OpenLiteSpeed
+
+SAFETY FEATURES:
+    - Multiple confirmation prompts
+    - Must type full domain name to confirm
+    - Dry-run mode to preview changes
+    - Optional archive before deletion
+    - Comprehensive logging
+
+EXAMPLES:
+    # Interactive deletion
+    jps-site-delete example.com
+
+    # Archive before deleting
+    jps-site-delete example.com --archive
+
+    # Preview what would be deleted
+    jps-site-delete example.com --dry-run
+
+    # Delete files only (keep database)
+    jps-site-delete example.com --no-db
+
+EXIT CODES:
+    0 - Deletion completed successfully
+    1 - Error during deletion
+    2 - Invalid arguments or domain not found
+    3 - User cancelled operation
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+DOMAIN=""
+VERBOSE=false
+CREATE_ARCHIVE=false
+SKIP_INITIAL_CONFIRM=false
+DRY_RUN=false
+NO_DB=false
+NO_VHOST=false
+KEEP_BACKUPS=false
+NOTE=""
+
+# Paths (set after domain is known)
+SITE_DIR=""
+DOC_ROOT=""
+VHOST_DIR=""
+BACKUP_PATH=""
+
+# Site info
+IS_WORDPRESS=false
+DB_NAME=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -a|--archive)
+                CREATE_ARCHIVE=true
+                shift
+                ;;
+            -y|--yes)
+                SKIP_INITIAL_CONFIRM=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --no-db)
+                NO_DB=true
+                shift
+                ;;
+            --no-vhost)
+                NO_VHOST=true
+                shift
+                ;;
+            --keep-backups)
+                KEEP_BACKUPS=true
+                shift
+                ;;
+            -n|--note)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --note requires an argument"
+                    exit 2
+                fi
+                NOTE="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate domain is provided
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-site-delete <domain> [OPTIONS]"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "  $*"
+    fi
+}
+
+#===============================================================================
+# INITIALIZATION
+#===============================================================================
+
+# Initialize paths and gather site info
+init_paths() {
+    SITE_DIR="${WEBSITES_ROOT}/${DOMAIN}"
+    VHOST_DIR="${VHOSTS_DIR}/${DOMAIN}"
+    BACKUP_PATH="${BACKUP_DIR}/${DOMAIN}"
+
+    # Determine document root
+    if [[ -d "${SITE_DIR}/html" ]]; then
+        DOC_ROOT="${SITE_DIR}/html"
+    else
+        DOC_ROOT="$SITE_DIR"
+    fi
+
+    # Validate site exists
+    if [[ ! -d "$SITE_DIR" ]]; then
+        error "Site directory not found: $SITE_DIR"
+        exit 2
+    fi
+
+    # Check if WordPress
+    if [[ -f "${DOC_ROOT}/wp-config.php" ]]; then
+        IS_WORDPRESS=true
+
+        # Get database name
+        local db_info
+        if db_info=$(get_wp_db_info "$DOC_ROOT" 2>/dev/null); then
+            eval "$db_info"
+        fi
+    fi
+}
+
+#===============================================================================
+# SUMMARY AND CONFIRMATION
+#===============================================================================
+
+# Show what will be deleted
+show_summary() {
+    header "Site Deletion Summary: $DOMAIN"
+
+    echo "The following will be ${COLOR_RED}PERMANENTLY DELETED${COLOR_RESET}:"
+    echo ""
+
+    # Site files
+    if [[ -d "$SITE_DIR" ]]; then
+        local site_size
+        site_size=$(du -sh "$SITE_DIR" 2>/dev/null | cut -f1)
+        echo "  ${COLOR_RED}✗${COLOR_RESET} Site files: $SITE_DIR ($site_size)"
+    fi
+
+    # Database
+    if [[ "$IS_WORDPRESS" == true ]] && [[ "$NO_DB" != true ]] && [[ -n "$DB_NAME" ]]; then
+        echo "  ${COLOR_RED}✗${COLOR_RESET} Database: $DB_NAME"
+    fi
+
+    # Vhost config
+    if [[ -d "$VHOST_DIR" ]] && [[ "$NO_VHOST" != true ]]; then
+        echo "  ${COLOR_RED}✗${COLOR_RESET} Vhost config: $VHOST_DIR"
+    fi
+
+    # Backups
+    if [[ -d "$BACKUP_PATH" ]] && [[ "$KEEP_BACKUPS" != true ]]; then
+        local backup_size
+        backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
+        echo "  ${COLOR_RED}✗${COLOR_RESET} Backups: $BACKUP_PATH ($backup_size)"
+    fi
+
+    # SSL certificates
+    local ssl_dir="/etc/letsencrypt/live/${DOMAIN}"
+    if [[ -d "$ssl_dir" ]]; then
+        echo "  ${COLOR_YELLOW}○${COLOR_RESET} SSL certificates (not removed, use certbot delete)"
+    fi
+
+    echo ""
+
+    # Show what will be preserved
+    if [[ "$NO_DB" == true ]] || [[ "$NO_VHOST" == true ]] || [[ "$KEEP_BACKUPS" == true ]]; then
+        echo "The following will be ${COLOR_GREEN}PRESERVED${COLOR_RESET}:"
+        echo ""
+        if [[ "$NO_DB" == true ]] && [[ -n "$DB_NAME" ]]; then
+            echo "  ${COLOR_GREEN}✓${COLOR_RESET} Database: $DB_NAME"
+        fi
+        if [[ "$NO_VHOST" == true ]]; then
+            echo "  ${COLOR_GREEN}✓${COLOR_RESET} Vhost config: $VHOST_DIR"
+        fi
+        if [[ "$KEEP_BACKUPS" == true ]] && [[ -d "$BACKUP_PATH" ]]; then
+            echo "  ${COLOR_GREEN}✓${COLOR_RESET} Backups: $BACKUP_PATH"
+        fi
+        echo ""
+    fi
+
+    # Archive option
+    if [[ "$CREATE_ARCHIVE" == true ]]; then
+        echo "${COLOR_CYAN}Archive will be created before deletion.${COLOR_RESET}"
+        echo ""
+    fi
+}
+
+# Get initial confirmation
+get_initial_confirmation() {
+    if [[ "$SKIP_INITIAL_CONFIRM" == true ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${COLOR_BOLD}${COLOR_RED}WARNING: This action is IRREVERSIBLE!${COLOR_RESET}"
+    echo ""
+
+    if ! confirm "Do you want to proceed with deletion?" "n"; then
+        echo "Deletion cancelled"
+        exit 3
+    fi
+}
+
+# Require typing domain name
+require_domain_confirmation() {
+    echo ""
+    echo "To confirm deletion, please type the full domain name:"
+    echo ""
+
+    local response
+    read -r -p "  Type '$DOMAIN' to confirm: " response
+
+    if [[ "$response" != "$DOMAIN" ]]; then
+        echo ""
+        error "Domain name does not match. Deletion cancelled."
+        exit 3
+    fi
+
+    echo ""
+}
+
+#===============================================================================
+# DELETION FUNCTIONS
+#===============================================================================
+
+# Delete site files
+delete_files() {
+    info "Removing site files..."
+    log_verbose "Path: $SITE_DIR"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY-RUN] Would remove: $SITE_DIR"
+        return 0
+    fi
+
+    if rm -rf "$SITE_DIR"; then
+        success "Site files removed"
+        return 0
+    else
+        error "Failed to remove site files"
+        return 1
+    fi
+}
+
+# Drop database
+delete_database() {
+    if [[ "$NO_DB" == true ]]; then
+        log_verbose "Skipping database (--no-db specified)"
+        return 0
+    fi
+
+    if [[ "$IS_WORDPRESS" != true ]] || [[ -z "$DB_NAME" ]]; then
+        log_verbose "No database to drop"
+        return 0
+    fi
+
+    info "Dropping database..."
+    log_verbose "Database: $DB_NAME"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY-RUN] Would drop database: $DB_NAME"
+        return 0
+    fi
+
+    local mysql_cmd="mysql"
+    local mysql_args=()
+
+    if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
+        mysql_args+=("-e" "DROP DATABASE IF EXISTS \`$DB_NAME\`;")
+    else
+        mysql_args+=("-u" "${MYSQL_USER:-root}")
+        if [[ -n "${MYSQL_PASS:-}" ]]; then
+            mysql_args+=("-p${MYSQL_PASS}")
+        fi
+        mysql_args+=("-e" "DROP DATABASE IF EXISTS \`$DB_NAME\`;")
+    fi
+
+    if $mysql_cmd "${mysql_args[@]}" 2>/dev/null; then
+        success "Database dropped"
+        return 0
+    else
+        warn "Failed to drop database (may not exist or permission denied)"
+        return 1
+    fi
+}
+
+# Remove vhost configuration
+delete_vhost() {
+    if [[ "$NO_VHOST" == true ]]; then
+        log_verbose "Skipping vhost config (--no-vhost specified)"
+        return 0
+    fi
+
+    if [[ ! -d "$VHOST_DIR" ]]; then
+        log_verbose "No vhost directory found"
+        return 0
+    fi
+
+    info "Removing virtual host config..."
+    log_verbose "Path: $VHOST_DIR"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY-RUN] Would remove: $VHOST_DIR"
+        return 0
+    fi
+
+    if rm -rf "$VHOST_DIR"; then
+        success "Vhost config removed"
+        return 0
+    else
+        error "Failed to remove vhost config"
+        return 1
+    fi
+}
+
+# Remove backups
+delete_backups() {
+    if [[ "$KEEP_BACKUPS" == true ]]; then
+        log_verbose "Keeping backups (--keep-backups specified)"
+        return 0
+    fi
+
+    if [[ ! -d "$BACKUP_PATH" ]]; then
+        log_verbose "No backup directory found"
+        return 0
+    fi
+
+    info "Removing backup files..."
+    log_verbose "Path: $BACKUP_PATH"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY-RUN] Would remove: $BACKUP_PATH"
+        return 0
+    fi
+
+    if rm -rf "$BACKUP_PATH"; then
+        success "Backups removed"
+        return 0
+    else
+        warn "Failed to remove some backup files"
+        return 1
+    fi
+}
+
+# Reload OpenLiteSpeed
+reload_ols() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "  [DRY-RUN] Would reload OpenLiteSpeed"
+        return 0
+    fi
+
+    if [[ "$NO_VHOST" == true ]]; then
+        log_verbose "Not reloading OLS (vhost not removed)"
+        return 0
+    fi
+
+    info "Reloading OpenLiteSpeed..."
+
+    # Try graceful reload first
+    if command_exists lswsctrl; then
+        lswsctrl restart 2>/dev/null && return 0
+    fi
+
+    # Try systemctl
+    if systemctl is-active --quiet lshttpd 2>/dev/null; then
+        systemctl reload lshttpd 2>/dev/null && return 0
+    elif systemctl is-active --quiet lsws 2>/dev/null; then
+        systemctl reload lsws 2>/dev/null && return 0
+    fi
+
+    warn "Could not reload OpenLiteSpeed - manual restart may be required"
+    return 1
+}
+
+# Log lifecycle event
+log_lifecycle_event() {
+    local log_file="${LOG_DIR}/lifecycle/delete.log"
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local components="files"
+    if [[ "$NO_DB" != true ]] && [[ -n "$DB_NAME" ]]; then
+        components+=",database"
+    fi
+    if [[ "$NO_VHOST" != true ]]; then
+        components+=",vhost"
+    fi
+    if [[ "$KEEP_BACKUPS" != true ]]; then
+        components+=",backups"
+    fi
+
+    local log_entry="[$(date '+%Y-%m-%d %H:%M:%S')] action=delete domain=$DOMAIN components=$components user=$(whoami)"
+    if [[ -n "$NOTE" ]]; then
+        log_entry+=" note=\"$NOTE\""
+    fi
+    if [[ "$CREATE_ARCHIVE" == true ]]; then
+        log_entry+=" archived=yes"
+    fi
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root privileges
+    require_root
+
+    # Initialize paths and gather site info
+    init_paths
+
+    # Show summary
+    show_summary
+
+    # Dry run mode stops here
+    if [[ "$DRY_RUN" == true ]]; then
+        echo ""
+        info "DRY-RUN MODE - No changes made"
+        echo ""
+        echo "Run without --dry-run to actually delete the site."
+        exit 0
+    fi
+
+    # Get confirmations
+    get_initial_confirmation
+    require_domain_confirmation
+
+    # Create archive if requested
+    if [[ "$CREATE_ARCHIVE" == true ]]; then
+        echo ""
+        info "Creating archive before deletion..."
+        if "${INSTALL_DIR}/bin/jps-site-archive" "$DOMAIN" --note "Pre-deletion archive"; then
+            success "Archive created"
+        else
+            error "Archive creation failed"
+            if ! confirm "Continue with deletion anyway?" "n"; then
+                echo "Deletion cancelled"
+                exit 3
+            fi
+        fi
+        echo ""
+    fi
+
+    # Perform deletion
+    header "Deleting Site: $DOMAIN"
+
+    local has_errors=false
+
+    delete_files || has_errors=true
+    delete_database || has_errors=true
+    delete_vhost || has_errors=true
+    delete_backups || has_errors=true
+    reload_ols || true
+
+    # Log the event
+    log_lifecycle_event
+
+    # Summary
+    echo ""
+    if [[ "$has_errors" == true ]]; then
+        warn "Site deletion completed with some errors"
+        exit 1
+    else
+        success "Site $DOMAIN has been completely removed"
+        exit 0
+    fi
+}
+
+# Run main function
+main "$@"

@@ -1,0 +1,475 @@
+#!/bin/bash
+#===============================================================================
+# JPS Checkpoint - Pre-Change Backup Trigger
+#
+# Creates a timestamped checkpoint backup before making changes to a site.
+# Designed for quick point-in-time snapshots before risky operations.
+#
+# Usage:
+#   jps-checkpoint example.com                    # Full checkpoint
+#   jps-checkpoint example.com --files-only       # Skip database
+#   jps-checkpoint example.com --db-only          # Database only
+#   jps-checkpoint example.com --note "reason"    # Add note to backup
+#
+# Exit Codes:
+#   0 - Checkpoint created successfully
+#   1 - Error during checkpoint
+#   2 - Invalid arguments or domain not found
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-checkpoint"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Checkpoint - Pre-Change Backup Trigger
+
+DESCRIPTION:
+    Creates a timestamped checkpoint backup before making changes to a site.
+    Checkpoints are quick point-in-time snapshots for rollback purposes.
+
+USAGE:
+    jps-checkpoint <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to checkpoint (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show detailed progress
+    -n, --note NOTE     Add a note describing reason for checkpoint
+    -f, --files-only    Only backup files, skip database
+    -d, --db-only       Only backup database, skip files
+    -l, --list          List existing checkpoints for domain
+    -q, --quiet         Suppress non-essential output
+
+CHECKPOINT LOCATION:
+    Checkpoints are stored in: $BACKUP_DIR/<domain>/checkpoints/
+
+CHECKPOINT NAMING:
+    checkpoint-YYYYMMDD-HHMMSS.tar.gz
+    checkpoint-YYYYMMDD-HHMMSS-db.sql.gz (database)
+    checkpoint-YYYYMMDD-HHMMSS.note (optional note file)
+
+EXAMPLES:
+    # Create full checkpoint before update
+    jps-checkpoint example.com --note "Before WP 6.5 update"
+
+    # Quick files-only checkpoint
+    jps-checkpoint example.com --files-only
+
+    # Database checkpoint before migration
+    jps-checkpoint example.com --db-only --note "Before DB migration"
+
+    # List existing checkpoints
+    jps-checkpoint example.com --list
+
+EXIT CODES:
+    0 - Checkpoint created successfully
+    1 - Error during checkpoint
+    2 - Invalid arguments or domain not found
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+DOMAIN=""
+VERBOSE=false
+QUIET=false
+FILES_ONLY=false
+DB_ONLY=false
+LIST_MODE=false
+NOTE=""
+
+# Paths (set after domain is known)
+SITE_DIR=""
+CHECKPOINT_DIR=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -f|--files-only)
+                FILES_ONLY=true
+                shift
+                ;;
+            -d|--db-only)
+                DB_ONLY=true
+                shift
+                ;;
+            -l|--list)
+                LIST_MODE=true
+                shift
+                ;;
+            -n|--note)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --note requires an argument"
+                    exit 2
+                fi
+                NOTE="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate domain is provided
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-checkpoint <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Validate mutually exclusive options
+    if [[ "$FILES_ONLY" == true ]] && [[ "$DB_ONLY" == true ]]; then
+        error "Cannot use --files-only and --db-only together"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_msg() {
+    if [[ "$QUIET" != true ]]; then
+        echo "$*"
+    fi
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "  $*"
+    fi
+}
+
+#===============================================================================
+# CHECKPOINT FUNCTIONS
+#===============================================================================
+
+# Initialize paths for the domain
+init_paths() {
+    SITE_DIR="${WEBSITES_ROOT}/${DOMAIN}"
+    CHECKPOINT_DIR="${BACKUP_DIR}/${DOMAIN}/checkpoints"
+
+    # Validate site exists
+    if [[ ! -d "$SITE_DIR" ]]; then
+        error "Site directory not found: $SITE_DIR"
+        exit 2
+    fi
+
+    # Create checkpoint directory if needed
+    if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+        mkdir -p "$CHECKPOINT_DIR" || {
+            error "Cannot create checkpoint directory: $CHECKPOINT_DIR"
+            exit 1
+        }
+    fi
+}
+
+# List existing checkpoints
+list_checkpoints() {
+    init_paths
+
+    if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+        info "No checkpoints found for $DOMAIN"
+        return 0
+    fi
+
+    local checkpoints=()
+    while IFS= read -r -d '' file; do
+        checkpoints+=("$file")
+    done < <(find "$CHECKPOINT_DIR" -maxdepth 1 -name "checkpoint-*.tar.gz" -print0 2>/dev/null | sort -z)
+
+    if [[ ${#checkpoints[@]} -eq 0 ]]; then
+        info "No checkpoints found for $DOMAIN"
+        return 0
+    fi
+
+    header "Checkpoints for $DOMAIN"
+    echo "Location: $CHECKPOINT_DIR"
+    echo ""
+
+    printf "%-30s %-12s %s\n" "CHECKPOINT" "SIZE" "NOTE"
+    printf "%-30s %-12s %s\n" "------------------------------" "------------" "--------------------"
+
+    for checkpoint in "${checkpoints[@]}"; do
+        local basename
+        basename=$(basename "$checkpoint")
+        local size
+        size=$(du -h "$checkpoint" 2>/dev/null | cut -f1)
+
+        # Check for note file
+        local note_file="${checkpoint%.tar.gz}.note"
+        local note=""
+        if [[ -f "$note_file" ]]; then
+            note=$(head -1 "$note_file" 2>/dev/null | cut -c1-30)
+        fi
+
+        printf "%-30s %-12s %s\n" "$basename" "$size" "$note"
+    done
+
+    echo ""
+    echo "Total: ${#checkpoints[@]} checkpoint(s)"
+}
+
+# Backup files
+backup_files() {
+    local timestamp="$1"
+    local checkpoint_file="${CHECKPOINT_DIR}/checkpoint-${timestamp}.tar.gz"
+
+    log_msg "Creating files checkpoint..."
+    log_verbose "Source: $SITE_DIR"
+    log_verbose "Target: $checkpoint_file"
+
+    # Determine the document root
+    local doc_root="$SITE_DIR"
+    if [[ -d "${SITE_DIR}/html" ]]; then
+        doc_root="${SITE_DIR}/html"
+    fi
+
+    # Create tarball
+    if tar -czf "$checkpoint_file" -C "$(dirname "$doc_root")" "$(basename "$doc_root")" 2>/dev/null; then
+        local size
+        size=$(du -h "$checkpoint_file" 2>/dev/null | cut -f1)
+        log_msg "  Files checkpoint: $checkpoint_file ($size)"
+        return 0
+    else
+        error "Failed to create files checkpoint"
+        rm -f "$checkpoint_file" 2>/dev/null
+        return 1
+    fi
+}
+
+# Backup database
+backup_database() {
+    local timestamp="$1"
+    local db_file="${CHECKPOINT_DIR}/checkpoint-${timestamp}-db.sql.gz"
+
+    # Find wp-config.php
+    local doc_root="$SITE_DIR"
+    if [[ -d "${SITE_DIR}/html" ]]; then
+        doc_root="${SITE_DIR}/html"
+    fi
+
+    if [[ ! -f "${doc_root}/wp-config.php" ]]; then
+        if [[ "$DB_ONLY" == true ]]; then
+            error "Not a WordPress site - no wp-config.php found"
+            return 1
+        fi
+        log_verbose "Not a WordPress site, skipping database backup"
+        return 0
+    fi
+
+    log_msg "Creating database checkpoint..."
+
+    # Get database credentials
+    local db_info
+    db_info=$(get_wp_db_info "$doc_root") || {
+        error "Failed to extract database credentials"
+        return 1
+    }
+    eval "$db_info"
+
+    log_verbose "Database: $DB_NAME"
+    log_verbose "Target: $db_file"
+
+    # Dump database
+    local dump_cmd="mysqldump"
+    local dump_args=("--single-transaction" "--quick" "--lock-tables=false")
+
+    if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
+        dump_args+=("$DB_NAME")
+    else
+        dump_args+=("-u" "${MYSQL_USER:-root}")
+        if [[ -n "${MYSQL_PASS:-}" ]]; then
+            dump_args+=("-p${MYSQL_PASS}")
+        fi
+        dump_args+=("$DB_NAME")
+    fi
+
+    if $dump_cmd "${dump_args[@]}" 2>/dev/null | gzip > "$db_file"; then
+        local size
+        size=$(du -h "$db_file" 2>/dev/null | cut -f1)
+        log_msg "  Database checkpoint: $db_file ($size)"
+        return 0
+    else
+        error "Failed to create database checkpoint"
+        rm -f "$db_file" 2>/dev/null
+        return 1
+    fi
+}
+
+# Save note file
+save_note() {
+    local timestamp="$1"
+    local note_file="${CHECKPOINT_DIR}/checkpoint-${timestamp}.note"
+
+    if [[ -n "$NOTE" ]]; then
+        echo "$NOTE" > "$note_file"
+        echo "Created: $(date)" >> "$note_file"
+        echo "Domain: $DOMAIN" >> "$note_file"
+        log_verbose "Note saved: $note_file"
+    fi
+}
+
+# Log the checkpoint event
+log_checkpoint() {
+    local timestamp="$1"
+    local type="$2"
+    local log_file="${LOG_DIR}/lifecycle/checkpoint.log"
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local log_entry="[$(date '+%Y-%m-%d %H:%M:%S')] domain=$DOMAIN type=$type checkpoint=$timestamp"
+    if [[ -n "$NOTE" ]]; then
+        log_entry+=" note=\"$NOTE\""
+    fi
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root privileges
+    require_root
+
+    # List mode
+    if [[ "$LIST_MODE" == true ]]; then
+        list_checkpoints
+        exit 0
+    fi
+
+    # Initialize paths
+    init_paths
+
+    # Generate timestamp
+    local timestamp
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+
+    log_msg ""
+    log_msg "Creating checkpoint for $DOMAIN"
+    log_msg "Timestamp: $timestamp"
+    log_msg ""
+
+    local files_ok=true
+    local db_ok=true
+    local checkpoint_type="full"
+
+    # Backup files (unless --db-only)
+    if [[ "$DB_ONLY" != true ]]; then
+        backup_files "$timestamp" || files_ok=false
+    else
+        checkpoint_type="db-only"
+    fi
+
+    # Backup database (unless --files-only)
+    if [[ "$FILES_ONLY" != true ]]; then
+        backup_database "$timestamp" || db_ok=false
+    else
+        checkpoint_type="files-only"
+    fi
+
+    # Save note if provided
+    save_note "$timestamp"
+
+    # Log the event
+    log_checkpoint "$timestamp" "$checkpoint_type"
+
+    # Summary
+    echo ""
+    if [[ "$files_ok" == true ]] && [[ "$db_ok" == true ]]; then
+        success "Checkpoint created successfully"
+        log_msg "Location: $CHECKPOINT_DIR"
+        log_msg "Checkpoint ID: $timestamp"
+        exit 0
+    elif [[ "$files_ok" == false ]] && [[ "$db_ok" == false ]]; then
+        error "Checkpoint failed completely"
+        exit 1
+    else
+        warn "Checkpoint completed with partial errors"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

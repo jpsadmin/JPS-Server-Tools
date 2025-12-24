@@ -1,0 +1,461 @@
+#!/bin/bash
+#===============================================================================
+# JPS Site Suspend - Disable Site Without Deleting
+#
+# Suspends a site by disabling its OpenLiteSpeed virtual host configuration.
+# The site files and database remain intact for later reactivation.
+#
+# Usage:
+#   jps-site-suspend example.com              # Suspend site
+#   jps-site-suspend example.com --resume     # Reactivate site
+#   jps-site-suspend --list                   # List suspended sites
+#
+# Exit Codes:
+#   0 - Operation completed successfully
+#   1 - Error during operation
+#   2 - Invalid arguments or domain not found
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-site-suspend"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Site Suspend - Disable Site Without Deleting
+
+DESCRIPTION:
+    Suspends a site by disabling its OpenLiteSpeed virtual host configuration.
+    Site files and database remain intact for later reactivation.
+
+USAGE:
+    jps-site-suspend <domain> [OPTIONS]
+    jps-site-suspend --list
+
+ARGUMENTS:
+    domain              The domain to suspend/resume (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show detailed progress
+    -r, --resume        Reactivate a suspended site
+    -l, --list          List all suspended sites
+    -f, --force         Skip confirmation prompt
+    -n, --note NOTE     Add a note describing reason for suspension
+    --no-reload         Don't reload OpenLiteSpeed after change
+
+SUSPENSION MECHANISM:
+    - Renames vhconf.conf to vhconf.conf.suspended
+    - Creates a suspension record in the logs
+    - Optionally removes listener mapping from httpd_config.conf
+    - Reloads OpenLiteSpeed to apply changes
+
+EXAMPLES:
+    # Suspend a site
+    jps-site-suspend example.com --note "Client non-payment"
+
+    # Resume a suspended site
+    jps-site-suspend example.com --resume
+
+    # List all suspended sites
+    jps-site-suspend --list
+
+    # Force suspend without confirmation
+    jps-site-suspend example.com --force
+
+EXIT CODES:
+    0 - Operation completed successfully
+    1 - Error during operation
+    2 - Invalid arguments or domain not found
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+DOMAIN=""
+VERBOSE=false
+RESUME_MODE=false
+LIST_MODE=false
+FORCE=false
+NO_RELOAD=false
+NOTE=""
+
+# Paths (set after domain is known)
+VHOST_DIR=""
+VHOST_CONFIG=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -r|--resume)
+                RESUME_MODE=true
+                shift
+                ;;
+            -l|--list)
+                LIST_MODE=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            --no-reload)
+                NO_RELOAD=true
+                shift
+                ;;
+            -n|--note)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --note requires an argument"
+                    exit 2
+                fi
+                NOTE="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ "$LIST_MODE" != true ]] && [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-site-suspend <domain> [OPTIONS]"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "  $*"
+    fi
+}
+
+#===============================================================================
+# SUSPEND/RESUME FUNCTIONS
+#===============================================================================
+
+# Initialize paths for the domain
+init_paths() {
+    VHOST_DIR="${VHOSTS_DIR}/${DOMAIN}"
+    VHOST_CONFIG="${VHOST_DIR}/vhconf.conf"
+}
+
+# Check if site is currently suspended
+is_suspended() {
+    [[ -f "${VHOST_CONFIG}.suspended" ]] && [[ ! -f "$VHOST_CONFIG" ]]
+}
+
+# List all suspended sites
+list_suspended() {
+    header "Suspended Sites"
+
+    local suspended_count=0
+    declare -a suspended_sites=()
+
+    # Find all .suspended config files
+    while IFS= read -r -d '' suspended_file; do
+        local domain
+        domain=$(basename "$(dirname "$suspended_file")")
+        suspended_sites+=("$domain")
+        ((suspended_count++)) || true
+    done < <(find "$VHOSTS_DIR" -name "vhconf.conf.suspended" -print0 2>/dev/null)
+
+    if [[ $suspended_count -eq 0 ]]; then
+        info "No suspended sites found"
+        return 0
+    fi
+
+    printf "%-40s %-20s %s\n" "DOMAIN" "SUSPENDED DATE" "NOTE"
+    printf "%-40s %-20s %s\n" "----------------------------------------" "--------------------" "--------------------"
+
+    for domain in "${suspended_sites[@]}"; do
+        local suspended_file="${VHOSTS_DIR}/${domain}/vhconf.conf.suspended"
+        local suspended_date
+        suspended_date=$(stat -c %y "$suspended_file" 2>/dev/null | cut -d' ' -f1)
+
+        # Check for note file
+        local note_file="${VHOSTS_DIR}/${domain}/suspended.note"
+        local note=""
+        if [[ -f "$note_file" ]]; then
+            note=$(head -1 "$note_file" 2>/dev/null | cut -c1-20)
+        fi
+
+        printf "%-40s %-20s %s\n" "$domain" "$suspended_date" "$note"
+    done
+
+    echo ""
+    echo "Total: $suspended_count suspended site(s)"
+}
+
+# Reload OpenLiteSpeed
+reload_ols() {
+    if [[ "$NO_RELOAD" == true ]]; then
+        warn "Skipping OpenLiteSpeed reload (--no-reload specified)"
+        return 0
+    fi
+
+    log_verbose "Reloading OpenLiteSpeed..."
+
+    # Try graceful reload first
+    if command_exists lswsctrl; then
+        lswsctrl restart 2>/dev/null && return 0
+    fi
+
+    # Try systemctl
+    if systemctl is-active --quiet lshttpd 2>/dev/null; then
+        systemctl reload lshttpd 2>/dev/null && return 0
+    elif systemctl is-active --quiet lsws 2>/dev/null; then
+        systemctl reload lsws 2>/dev/null && return 0
+    fi
+
+    # Try service command
+    if service lshttpd reload 2>/dev/null || service lsws reload 2>/dev/null; then
+        return 0
+    fi
+
+    warn "Could not reload OpenLiteSpeed - manual restart may be required"
+    return 1
+}
+
+# Suspend the site
+suspend_site() {
+    init_paths
+
+    # Check vhost exists
+    if [[ ! -d "$VHOST_DIR" ]]; then
+        error "Virtual host directory not found: $VHOST_DIR"
+        exit 2
+    fi
+
+    # Check if already suspended
+    if is_suspended; then
+        warn "Site $DOMAIN is already suspended"
+        exit 0
+    fi
+
+    # Check config exists
+    if [[ ! -f "$VHOST_CONFIG" ]]; then
+        error "Virtual host config not found: $VHOST_CONFIG"
+        exit 2
+    fi
+
+    # Confirmation
+    if [[ "$FORCE" != true ]]; then
+        echo ""
+        warn "You are about to SUSPEND site: $DOMAIN"
+        echo ""
+        echo "This will:"
+        echo "  - Disable the virtual host configuration"
+        echo "  - Make the site inaccessible via HTTP/HTTPS"
+        echo "  - Reload OpenLiteSpeed"
+        echo ""
+        echo "Site files and database will NOT be affected."
+        echo ""
+        if ! confirm "Proceed with suspension?" "n"; then
+            echo "Suspension cancelled"
+            exit 0
+        fi
+    fi
+
+    info "Suspending site: $DOMAIN"
+
+    # Rename config file
+    log_verbose "Renaming $VHOST_CONFIG to ${VHOST_CONFIG}.suspended"
+    if ! mv "$VHOST_CONFIG" "${VHOST_CONFIG}.suspended"; then
+        error "Failed to rename config file"
+        exit 1
+    fi
+
+    # Save note if provided
+    if [[ -n "$NOTE" ]]; then
+        local note_file="${VHOST_DIR}/suspended.note"
+        {
+            echo "$NOTE"
+            echo "Suspended: $(date)"
+            echo "By: $(whoami)"
+        } > "$note_file"
+        log_verbose "Note saved: $note_file"
+    fi
+
+    # Log the event
+    log_lifecycle_event "suspend" "$DOMAIN"
+
+    # Reload OLS
+    reload_ols
+
+    success "Site $DOMAIN has been suspended"
+    echo ""
+    echo "To reactivate: jps-site-suspend $DOMAIN --resume"
+}
+
+# Resume (unsuspend) the site
+resume_site() {
+    init_paths
+
+    # Check vhost exists
+    if [[ ! -d "$VHOST_DIR" ]]; then
+        error "Virtual host directory not found: $VHOST_DIR"
+        exit 2
+    fi
+
+    # Check if suspended
+    if ! is_suspended; then
+        if [[ -f "$VHOST_CONFIG" ]]; then
+            warn "Site $DOMAIN is not suspended (config exists)"
+        else
+            error "No config found for $DOMAIN (neither active nor suspended)"
+        fi
+        exit 1
+    fi
+
+    # Confirmation
+    if [[ "$FORCE" != true ]]; then
+        echo ""
+        info "You are about to RESUME (reactivate) site: $DOMAIN"
+        echo ""
+        if ! confirm "Proceed with resume?" "y"; then
+            echo "Resume cancelled"
+            exit 0
+        fi
+    fi
+
+    info "Resuming site: $DOMAIN"
+
+    # Rename config file back
+    log_verbose "Renaming ${VHOST_CONFIG}.suspended to $VHOST_CONFIG"
+    if ! mv "${VHOST_CONFIG}.suspended" "$VHOST_CONFIG"; then
+        error "Failed to rename config file"
+        exit 1
+    fi
+
+    # Remove note file
+    local note_file="${VHOST_DIR}/suspended.note"
+    if [[ -f "$note_file" ]]; then
+        rm -f "$note_file"
+        log_verbose "Removed suspension note"
+    fi
+
+    # Log the event
+    log_lifecycle_event "resume" "$DOMAIN"
+
+    # Reload OLS
+    reload_ols
+
+    success "Site $DOMAIN has been resumed"
+}
+
+# Log lifecycle event
+log_lifecycle_event() {
+    local action="$1"
+    local domain="$2"
+    local log_file="${LOG_DIR}/lifecycle/suspend.log"
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local log_entry="[$(date '+%Y-%m-%d %H:%M:%S')] action=$action domain=$domain user=$(whoami)"
+    if [[ -n "$NOTE" ]]; then
+        log_entry+=" note=\"$NOTE\""
+    fi
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root privileges
+    require_root
+
+    # List mode
+    if [[ "$LIST_MODE" == true ]]; then
+        list_suspended
+        exit 0
+    fi
+
+    # Resume or suspend
+    if [[ "$RESUME_MODE" == true ]]; then
+        resume_site
+    else
+        suspend_site
+    fi
+}
+
+# Run main function
+main "$@"

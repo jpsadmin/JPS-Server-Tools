@@ -3,7 +3,7 @@
 # JPS Server Tools - Installer
 #
 # Installs the JPS Server Tools suite to /opt/jps-server-tools/
-# and creates symlinks in /usr/local/bin/ for easy access.
+# and creates wrapper scripts in /usr/local/bin/ for easy access.
 #
 # Usage:
 #   sudo ./install.sh          # Standard install
@@ -237,30 +237,38 @@ install_files() {
     success "Files installed to $INSTALL_DIR"
 }
 
-# Create symlinks
-create_symlinks() {
-    header "Creating Symlinks"
+# Create wrapper scripts (more reliable than symlinks)
+create_wrappers() {
+    header "Creating Wrapper Scripts"
 
     local scripts=(
         "jps-audit"
         "jps-backup-verify"
         "jps-status"
         "jps-monitor"
+        "jps-checkpoint"
+        "jps-site-suspend"
+        "jps-site-archive"
+        "jps-site-delete"
     )
 
     for script in "${scripts[@]}"; do
         local source_path="$INSTALL_DIR/bin/$script"
-        local link_path="$BIN_LINKS_DIR/$script"
+        local wrapper_path="$BIN_LINKS_DIR/$script"
 
         if [[ -f "$source_path" ]]; then
-            # Remove existing symlink if present
-            if [[ -L "$link_path" ]]; then
-                rm -f "$link_path"
+            # Remove existing symlink or file if present
+            if [[ -e "$wrapper_path" ]] || [[ -L "$wrapper_path" ]]; then
+                rm -f "$wrapper_path"
             fi
 
-            # Create symlink
-            ln -sf "$source_path" "$link_path"
-            success "Created symlink: $link_path -> $source_path"
+            # Create wrapper script
+            cat > "$wrapper_path" << EOF
+#!/bin/bash
+exec "$source_path" "\$@"
+EOF
+            chmod +x "$wrapper_path"
+            success "Created wrapper: $wrapper_path"
         else
             warn "Script not found: $source_path"
         fi
@@ -275,6 +283,7 @@ setup_logs() {
         "$INSTALL_DIR/logs"
         "$INSTALL_DIR/logs/audit"
         "$INSTALL_DIR/logs/backup-verify"
+        "$INSTALL_DIR/logs/lifecycle"
     )
 
     for dir in "${log_dirs[@]}"; do
@@ -321,6 +330,10 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-backup-verify"
         "$INSTALL_DIR/bin/jps-status"
         "$INSTALL_DIR/bin/jps-monitor"
+        "$INSTALL_DIR/bin/jps-checkpoint"
+        "$INSTALL_DIR/bin/jps-site-suspend"
+        "$INSTALL_DIR/bin/jps-site-archive"
+        "$INSTALL_DIR/bin/jps-site-delete"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
@@ -334,20 +347,24 @@ verify_installation() {
         fi
     done
 
-    # Check symlinks
-    local symlinks=(
+    # Check wrapper scripts
+    local wrappers=(
         "$BIN_LINKS_DIR/jps-audit"
         "$BIN_LINKS_DIR/jps-backup-verify"
         "$BIN_LINKS_DIR/jps-status"
         "$BIN_LINKS_DIR/jps-monitor"
+        "$BIN_LINKS_DIR/jps-checkpoint"
+        "$BIN_LINKS_DIR/jps-site-suspend"
+        "$BIN_LINKS_DIR/jps-site-archive"
+        "$BIN_LINKS_DIR/jps-site-delete"
     )
 
-    for link in "${symlinks[@]}"; do
-        if [[ -L "$link" ]]; then
-            echo -e "  ${GREEN}✓${RESET} Symlink exists: $link"
+    for wrapper in "${wrappers[@]}"; do
+        if [[ -f "$wrapper" ]] && [[ -x "$wrapper" ]]; then
+            echo -e "  ${GREEN}✓${RESET} Wrapper exists: $wrapper"
         else
-            echo -e "  ${RED}✗${RESET} Symlink missing: $link"
-            ((errors++))
+            echo -e "  ${RED}✗${RESET} Wrapper missing: $wrapper"
+            ((errors++)) || true
         fi
     done
 
@@ -396,6 +413,22 @@ ${BOLD}Available Commands:${RESET}
     Health monitoring for cron (silent when healthy).
     Options: --help, --verbose, --email, --json
 
+  ${GREEN}jps-checkpoint${RESET}
+    Pre-change backup trigger for quick snapshots.
+    Options: --help, --files-only, --db-only, --list
+
+  ${GREEN}jps-site-suspend${RESET}
+    Disable site without deleting (preserves files/db).
+    Options: --help, --resume, --list, --force
+
+  ${GREEN}jps-site-archive${RESET}
+    Full site preservation for long-term storage.
+    Options: --help, --encrypt, --list, --output
+
+  ${GREEN}jps-site-delete${RESET}
+    Safe site deletion with multiple confirmations.
+    Options: --help, --archive, --dry-run, --no-db
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -423,12 +456,16 @@ uninstall() {
         exit 0
     fi
 
-    # Remove symlinks
-    info "Removing symlinks..."
+    # Remove wrapper scripts
+    info "Removing wrapper scripts..."
     rm -f "$BIN_LINKS_DIR/jps-audit"
     rm -f "$BIN_LINKS_DIR/jps-backup-verify"
     rm -f "$BIN_LINKS_DIR/jps-status"
     rm -f "$BIN_LINKS_DIR/jps-monitor"
+    rm -f "$BIN_LINKS_DIR/jps-checkpoint"
+    rm -f "$BIN_LINKS_DIR/jps-site-suspend"
+    rm -f "$BIN_LINKS_DIR/jps-site-archive"
+    rm -f "$BIN_LINKS_DIR/jps-site-delete"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response
@@ -495,7 +532,7 @@ EOF
     check_root
     check_dependencies || exit 1
     install_files
-    create_symlinks
+    create_wrappers
     setup_logs
     verify_installation || exit 1
     show_instructions

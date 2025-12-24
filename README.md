@@ -10,6 +10,7 @@ JPS Server Tools fills the gap between WordPress management plugins and server a
 - **Backup Verification**: Prove your backups can actually restore
 - **Site Status**: Quick inventory of all hosted sites with health checks
 - **Health Monitoring**: Silent cron monitoring with alerts only on issues
+- **Site Lifecycle**: Checkpoint, suspend, archive, and safely delete sites
 
 These are server-level operations that WordPress plugins cannot see or manage.
 
@@ -36,7 +37,7 @@ sudo ./install.sh
 
 ```bash
 # Create installation directory
-sudo mkdir -p /opt/jps-server-tools/{bin,lib,config,logs/{audit,backup-verify}}
+sudo mkdir -p /opt/jps-server-tools/{bin,lib,config,logs/{audit,backup-verify,lifecycle}}
 
 # Copy files
 sudo cp bin/* /opt/jps-server-tools/bin/
@@ -46,11 +47,12 @@ sudo cp config/jps-tools.conf /opt/jps-server-tools/config/
 # Make executable
 sudo chmod +x /opt/jps-server-tools/bin/*
 
-# Create symlinks
-sudo ln -sf /opt/jps-server-tools/bin/jps-audit /usr/local/bin/jps-audit
-sudo ln -sf /opt/jps-server-tools/bin/jps-backup-verify /usr/local/bin/jps-backup-verify
-sudo ln -sf /opt/jps-server-tools/bin/jps-status /usr/local/bin/jps-status
-sudo ln -sf /opt/jps-server-tools/bin/jps-monitor /usr/local/bin/jps-monitor
+# Create wrapper scripts (more reliable than symlinks)
+for cmd in jps-audit jps-backup-verify jps-status jps-monitor jps-checkpoint jps-site-suspend jps-site-archive jps-site-delete; do
+    echo '#!/bin/bash' | sudo tee /usr/local/bin/$cmd > /dev/null
+    echo "exec /opt/jps-server-tools/bin/$cmd \"\$@\"" | sudo tee -a /usr/local/bin/$cmd > /dev/null
+    sudo chmod +x /usr/local/bin/$cmd
+done
 ```
 
 ### Check Dependencies
@@ -114,6 +116,25 @@ sudo jps-monitor --verbose
 
 # Add to cron (silent unless issues)
 # */5 * * * * /usr/local/bin/jps-monitor 2>&1 | logger -t jps-monitor
+```
+
+### Site Lifecycle Management
+
+```bash
+# Create checkpoint before risky change
+sudo jps-checkpoint example.com --note "Before WP update"
+
+# Suspend a site (disable without deleting)
+sudo jps-site-suspend example.com --note "Client non-payment"
+
+# Resume a suspended site
+sudo jps-site-suspend example.com --resume
+
+# Archive a site for long-term storage
+sudo jps-site-archive example.com
+
+# Safely delete a site (with confirmations)
+sudo jps-site-delete example.com --archive
 ```
 
 ## Tools Reference
@@ -347,6 +368,217 @@ Options:
 - `1` - Warnings detected
 - `2` - Critical issues detected
 
+### jps-checkpoint
+
+Pre-change backup trigger for quick point-in-time snapshots.
+
+```
+Usage: jps-checkpoint <domain> [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -v, --verbose       Show detailed progress
+  -n, --note NOTE     Add a note describing reason
+  -f, --files-only    Only backup files, skip database
+  -d, --db-only       Only backup database, skip files
+  -l, --list          List existing checkpoints
+  -q, --quiet         Suppress non-essential output
+```
+
+**Checkpoint Contents:**
+
+| Component | Description |
+|-----------|-------------|
+| Files | Complete site directory as tarball |
+| Database | MySQL dump (WordPress only) |
+| Note | Optional description file |
+
+**Examples:**
+
+```bash
+# Full checkpoint before update
+sudo jps-checkpoint example.com --note "Before WP 6.5 update"
+
+# Quick files-only checkpoint
+sudo jps-checkpoint example.com --files-only
+
+# Database checkpoint before migration
+sudo jps-checkpoint example.com --db-only --note "Before DB migration"
+
+# List existing checkpoints
+sudo jps-checkpoint example.com --list
+```
+
+**Exit Codes:**
+
+- `0` - Checkpoint created successfully
+- `1` - Error during checkpoint
+- `2` - Invalid arguments or domain not found
+
+### jps-site-suspend
+
+Disable a site without deleting files or database.
+
+```
+Usage: jps-site-suspend <domain> [OPTIONS]
+       jps-site-suspend --list
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -v, --verbose       Show detailed progress
+  -r, --resume        Reactivate a suspended site
+  -l, --list          List all suspended sites
+  -f, --force         Skip confirmation prompt
+  -n, --note NOTE     Add a note describing reason
+  --no-reload         Don't reload OpenLiteSpeed after change
+```
+
+**Suspension Mechanism:**
+
+- Renames `vhconf.conf` to `vhconf.conf.suspended`
+- Creates suspension record in logs
+- Reloads OpenLiteSpeed to apply changes
+- Site files and database remain intact
+
+**Examples:**
+
+```bash
+# Suspend a site
+sudo jps-site-suspend example.com --note "Client non-payment"
+
+# Resume a suspended site
+sudo jps-site-suspend example.com --resume
+
+# List all suspended sites
+sudo jps-site-suspend --list
+
+# Force suspend without confirmation
+sudo jps-site-suspend example.com --force
+```
+
+**Exit Codes:**
+
+- `0` - Operation completed successfully
+- `1` - Error during operation
+- `2` - Invalid arguments or domain not found
+
+### jps-site-archive
+
+Full site preservation for long-term storage.
+
+```
+Usage: jps-site-archive <domain> [OPTIONS]
+       jps-site-archive --list
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -v, --verbose       Show detailed progress
+  -l, --list          List all archived sites
+  -n, --note NOTE     Add a note describing reason
+  -e, --encrypt       Encrypt the archive (requires gpg)
+  -o, --output DIR    Custom output directory
+  --no-db             Skip database backup
+  --no-vhost          Skip vhost config backup
+```
+
+**Archive Contents:**
+
+| Component | Description |
+|-----------|-------------|
+| Files | Complete site directory |
+| Database | Full MySQL dump with routines/triggers |
+| Vhost Config | OpenLiteSpeed configuration |
+| SSL Certificates | Let's Encrypt certificates (if local) |
+| Metadata | Site info, WP version, archive date |
+
+**Examples:**
+
+```bash
+# Create full archive
+sudo jps-site-archive example.com --note "Client project completed"
+
+# Encrypted archive
+sudo jps-site-archive example.com --encrypt
+
+# List all archives
+sudo jps-site-archive --list
+
+# Archive to custom location
+sudo jps-site-archive example.com --output /mnt/backup/archives
+```
+
+**Exit Codes:**
+
+- `0` - Archive created successfully
+- `1` - Error during archive
+- `2` - Invalid arguments or domain not found
+
+### jps-site-delete
+
+Safe site deletion with multiple confirmation steps.
+
+```
+Usage: jps-site-delete <domain> [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -v, --verbose       Show detailed progress
+  -a, --archive       Create archive before deletion
+  -y, --yes           Skip initial confirmation
+  --dry-run           Show what would be deleted
+  --no-db             Don't drop the database
+  --no-vhost          Don't remove vhost config
+  --keep-backups      Don't remove backup files
+  -n, --note NOTE     Add a note to the deletion log
+```
+
+**Deletion Steps:**
+
+1. Show summary of what will be deleted
+2. Ask for initial confirmation
+3. Require user to type domain name
+4. Optionally create archive
+5. Remove site files
+6. Drop database (if WordPress)
+7. Remove vhost configuration
+8. Remove backups (optional)
+9. Reload OpenLiteSpeed
+
+**Safety Features:**
+
+- Multiple confirmation prompts
+- Must type full domain name to confirm
+- Dry-run mode to preview changes
+- Optional archive before deletion
+- Comprehensive logging
+
+**Examples:**
+
+```bash
+# Interactive deletion
+sudo jps-site-delete example.com
+
+# Archive before deleting
+sudo jps-site-delete example.com --archive
+
+# Preview what would be deleted
+sudo jps-site-delete example.com --dry-run
+
+# Delete files only (keep database)
+sudo jps-site-delete example.com --no-db
+```
+
+**Exit Codes:**
+
+- `0` - Deletion completed successfully
+- `1` - Error during deletion
+- `2` - Invalid arguments or domain not found
+- `3` - User cancelled operation
+
 ## Configuration
 
 Edit `/opt/jps-server-tools/config/jps-tools.conf` to customize settings.
@@ -368,6 +600,10 @@ SSL_CRIT_DAYS=7                          # SSL expiry critical
 
 # Retention
 AUDIT_RETENTION_DAYS=90                  # Keep audit logs for 90 days
+
+# Lifecycle Management
+ARCHIVE_DIR="/var/archives/jps"          # Long-term archive storage
+CHECKPOINT_RETENTION_DAYS=30             # Auto-cleanup checkpoints
 ```
 
 ### Expected Directory Structure
@@ -411,9 +647,14 @@ logs/
 ├── audit/
 │   ├── 2024-01-15-103045.json
 │   └── 2024-01-14-103022.json
-└── backup-verify/
-    ├── 2024-01-15.log
-    └── 2024-01-14.log
+├── backup-verify/
+│   ├── 2024-01-15.log
+│   └── 2024-01-14.log
+└── lifecycle/
+    ├── checkpoint.log
+    ├── suspend.log
+    ├── archive.log
+    └── delete.log
 ```
 
 ### Audit Logs
@@ -531,14 +772,19 @@ jps-server-tools/
 │   ├── jps-audit           # Server audit script
 │   ├── jps-backup-verify   # Backup verification script
 │   ├── jps-status          # Site inventory table
-│   └── jps-monitor         # Health monitoring for cron
+│   ├── jps-monitor         # Health monitoring for cron
+│   ├── jps-checkpoint      # Pre-change backup trigger
+│   ├── jps-site-suspend    # Disable site without deleting
+│   ├── jps-site-archive    # Full site preservation
+│   └── jps-site-delete     # Safe site deletion
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/
 │   └── jps-tools.conf      # Configuration file
 ├── logs/
 │   ├── audit/              # Audit JSON snapshots
-│   └── backup-verify/      # Verification logs
+│   ├── backup-verify/      # Verification logs
+│   └── lifecycle/          # Lifecycle operation logs
 ├── install.sh              # Installer script
 └── README.md               # This file
 ```
@@ -547,10 +793,10 @@ jps-server-tools/
 
 Planned tools for future phases:
 
-- **jps-ssl**: SSL certificate management and monitoring
 - **jps-ssl**: SSL certificate management and renewal
 - **jps-security**: Security hardening and vulnerability scanning
 - **jps-maintenance**: Automated maintenance tasks
+- **jps-migrate**: Site migration between servers
 
 ## Contributing
 

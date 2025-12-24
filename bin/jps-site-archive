@@ -1,0 +1,611 @@
+#!/bin/bash
+#===============================================================================
+# JPS Site Archive - Full Site Preservation
+#
+# Creates a complete archive of a site including files, database, and
+# configuration. Archives are stored separately from regular backups and
+# are intended for long-term preservation.
+#
+# Usage:
+#   jps-site-archive example.com                # Archive site
+#   jps-site-archive example.com --encrypt      # Encrypted archive
+#   jps-site-archive --list                     # List all archives
+#
+# Exit Codes:
+#   0 - Archive created successfully
+#   1 - Error during archive
+#   2 - Invalid arguments or domain not found
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-site-archive"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Site Archive - Full Site Preservation
+
+DESCRIPTION:
+    Creates a complete archive of a site for long-term preservation.
+    Includes files, database dump, virtual host config, and metadata.
+
+USAGE:
+    jps-site-archive <domain> [OPTIONS]
+    jps-site-archive --list
+
+ARGUMENTS:
+    domain              The domain to archive (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show detailed progress
+    -l, --list          List all archived sites
+    -n, --note NOTE     Add a note describing reason for archive
+    -e, --encrypt       Encrypt the archive (requires gpg)
+    -o, --output DIR    Custom output directory
+    --no-db             Skip database backup
+    --no-vhost          Skip vhost config backup
+
+ARCHIVE LOCATION:
+    Archives are stored in: ${ARCHIVE_DIR:-/var/archives/jps}/<domain>/
+
+ARCHIVE CONTENTS:
+    The archive includes:
+    - Complete site files (html/, wp-content/, etc.)
+    - Database dump (if WordPress)
+    - Virtual host configuration
+    - SSL certificates (if local)
+    - Metadata file (site info, WordPress version, etc.)
+
+ARCHIVE NAMING:
+    archive-<domain>-YYYYMMDD-HHMMSS.tar.gz
+    archive-<domain>-YYYYMMDD-HHMMSS.tar.gz.gpg (if encrypted)
+
+EXAMPLES:
+    # Create full archive
+    jps-site-archive example.com --note "Client project completed"
+
+    # Encrypted archive
+    jps-site-archive example.com --encrypt
+
+    # List all archives
+    jps-site-archive --list
+
+    # Archive to custom location
+    jps-site-archive example.com --output /mnt/backup/archives
+
+EXIT CODES:
+    0 - Archive created successfully
+    1 - Error during archive
+    2 - Invalid arguments or domain not found
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+DOMAIN=""
+VERBOSE=false
+LIST_MODE=false
+ENCRYPT=false
+NOTE=""
+OUTPUT_DIR=""
+NO_DB=false
+NO_VHOST=false
+
+# Archive directory (configurable)
+ARCHIVE_DIR="${ARCHIVE_DIR:-/var/archives/jps}"
+
+# Paths (set after domain is known)
+SITE_DIR=""
+DOC_ROOT=""
+VHOST_DIR=""
+
+# Temp directory for staging
+STAGING_DIR=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -l|--list)
+                LIST_MODE=true
+                shift
+                ;;
+            -e|--encrypt)
+                ENCRYPT=true
+                shift
+                ;;
+            -n|--note)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --note requires an argument"
+                    exit 2
+                fi
+                NOTE="$2"
+                shift 2
+                ;;
+            -o|--output)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --output requires a directory path"
+                    exit 2
+                fi
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --no-db)
+                NO_DB=true
+                shift
+                ;;
+            --no-vhost)
+                NO_VHOST=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ "$LIST_MODE" != true ]] && [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-site-archive <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Check for encryption requirements
+    if [[ "$ENCRYPT" == true ]] && ! command_exists gpg; then
+        error "GPG is required for encryption. Install with: apt install gnupg"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "  $*"
+    fi
+}
+
+#===============================================================================
+# ARCHIVE FUNCTIONS
+#===============================================================================
+
+# Initialize paths for the domain
+init_paths() {
+    SITE_DIR="${WEBSITES_ROOT}/${DOMAIN}"
+    VHOST_DIR="${VHOSTS_DIR}/${DOMAIN}"
+
+    # Determine document root
+    if [[ -d "${SITE_DIR}/html" ]]; then
+        DOC_ROOT="${SITE_DIR}/html"
+    else
+        DOC_ROOT="$SITE_DIR"
+    fi
+
+    # Set output directory
+    if [[ -z "$OUTPUT_DIR" ]]; then
+        OUTPUT_DIR="${ARCHIVE_DIR}/${DOMAIN}"
+    fi
+
+    # Validate site exists
+    if [[ ! -d "$SITE_DIR" ]]; then
+        error "Site directory not found: $SITE_DIR"
+        exit 2
+    fi
+}
+
+# List all archives
+list_archives() {
+    header "Site Archives"
+
+    if [[ ! -d "$ARCHIVE_DIR" ]]; then
+        info "No archives found (archive directory does not exist)"
+        return 0
+    fi
+
+    local archive_count=0
+    declare -a archive_domains=()
+
+    # Find unique domains with archives
+    while IFS= read -r domain_dir; do
+        local domain
+        domain=$(basename "$domain_dir")
+        archive_domains+=("$domain")
+    done < <(find "$ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+
+    if [[ ${#archive_domains[@]} -eq 0 ]]; then
+        info "No archives found"
+        return 0
+    fi
+
+    printf "%-35s %-12s %-20s %s\n" "ARCHIVE" "SIZE" "DATE" "NOTE"
+    printf "%-35s %-12s %-20s %s\n" "-----------------------------------" "------------" "--------------------" "--------------------"
+
+    for domain in "${archive_domains[@]}"; do
+        local domain_archive_dir="${ARCHIVE_DIR}/${domain}"
+
+        while IFS= read -r -d '' archive_file; do
+            local basename
+            basename=$(basename "$archive_file")
+            local size
+            size=$(du -h "$archive_file" 2>/dev/null | cut -f1)
+            local date
+            date=$(stat -c %y "$archive_file" 2>/dev/null | cut -d' ' -f1)
+
+            # Check for note/metadata
+            local meta_file="${archive_file%.tar.gz}.meta"
+            meta_file="${meta_file%.gpg}.meta"
+            local note=""
+            if [[ -f "$meta_file" ]]; then
+                note=$(grep "^note=" "$meta_file" 2>/dev/null | cut -d= -f2- | cut -c1-20)
+            fi
+
+            printf "%-35s %-12s %-20s %s\n" "$basename" "$size" "$date" "$note"
+            ((archive_count++)) || true
+        done < <(find "$domain_archive_dir" -maxdepth 1 -name "archive-*.tar.gz*" -print0 2>/dev/null | sort -z)
+    done
+
+    echo ""
+    echo "Total: $archive_count archive(s)"
+    echo "Location: $ARCHIVE_DIR"
+}
+
+# Create staging directory
+create_staging() {
+    STAGING_DIR=$(mktemp -d -t "jps-archive.XXXXXX")
+    register_cleanup "$STAGING_DIR"
+    log_verbose "Created staging directory: $STAGING_DIR"
+}
+
+# Copy site files
+archive_files() {
+    local staging_files="${STAGING_DIR}/files"
+    mkdir -p "$staging_files"
+
+    info "Archiving site files..."
+    log_verbose "Source: $SITE_DIR"
+
+    # Copy the entire site directory structure
+    if cp -a "$SITE_DIR/." "$staging_files/" 2>/dev/null; then
+        local file_count
+        file_count=$(find "$staging_files" -type f 2>/dev/null | wc -l)
+        log_verbose "Copied $file_count files"
+        return 0
+    else
+        error "Failed to copy site files"
+        return 1
+    fi
+}
+
+# Dump database
+archive_database() {
+    if [[ "$NO_DB" == true ]]; then
+        log_verbose "Skipping database (--no-db specified)"
+        return 0
+    fi
+
+    # Check if WordPress
+    if [[ ! -f "${DOC_ROOT}/wp-config.php" ]]; then
+        log_verbose "Not a WordPress site, skipping database"
+        return 0
+    fi
+
+    local db_file="${STAGING_DIR}/database.sql"
+
+    info "Archiving database..."
+
+    # Get database credentials
+    local db_info
+    db_info=$(get_wp_db_info "$DOC_ROOT") || {
+        warn "Failed to extract database credentials"
+        return 1
+    }
+    eval "$db_info"
+
+    log_verbose "Database: $DB_NAME"
+
+    # Dump database
+    local dump_cmd="mysqldump"
+    local dump_args=("--single-transaction" "--quick" "--lock-tables=false" "--routines" "--triggers")
+
+    if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
+        dump_args+=("$DB_NAME")
+    else
+        dump_args+=("-u" "${MYSQL_USER:-root}")
+        if [[ -n "${MYSQL_PASS:-}" ]]; then
+            dump_args+=("-p${MYSQL_PASS}")
+        fi
+        dump_args+=("$DB_NAME")
+    fi
+
+    if $dump_cmd "${dump_args[@]}" > "$db_file" 2>/dev/null; then
+        local size
+        size=$(du -h "$db_file" 2>/dev/null | cut -f1)
+        log_verbose "Database dump: $size"
+        return 0
+    else
+        warn "Failed to dump database"
+        return 1
+    fi
+}
+
+# Copy vhost configuration
+archive_vhost() {
+    if [[ "$NO_VHOST" == true ]]; then
+        log_verbose "Skipping vhost config (--no-vhost specified)"
+        return 0
+    fi
+
+    local vhost_staging="${STAGING_DIR}/vhost"
+    mkdir -p "$vhost_staging"
+
+    info "Archiving virtual host config..."
+
+    if [[ -d "$VHOST_DIR" ]]; then
+        if cp -a "$VHOST_DIR/." "$vhost_staging/" 2>/dev/null; then
+            log_verbose "Copied vhost config"
+            return 0
+        else
+            warn "Failed to copy vhost config"
+            return 1
+        fi
+    else
+        log_verbose "No vhost directory found: $VHOST_DIR"
+        return 0
+    fi
+}
+
+# Copy SSL certificates
+archive_ssl() {
+    local ssl_staging="${STAGING_DIR}/ssl"
+
+    # Check for Let's Encrypt certs
+    local le_cert_dir="/etc/letsencrypt/live/${DOMAIN}"
+    if [[ -d "$le_cert_dir" ]]; then
+        info "Archiving SSL certificates..."
+        mkdir -p "$ssl_staging"
+
+        # Copy the certificate files (they're symlinks, so use -L to follow)
+        cp -L "$le_cert_dir/"*.pem "$ssl_staging/" 2>/dev/null || true
+        log_verbose "Copied SSL certificates from Let's Encrypt"
+    else
+        log_verbose "No Let's Encrypt certificates found"
+    fi
+}
+
+# Create metadata file
+create_metadata() {
+    local meta_file="${STAGING_DIR}/archive.meta"
+
+    info "Creating metadata..."
+
+    {
+        echo "# JPS Site Archive Metadata"
+        echo "domain=$DOMAIN"
+        echo "archive_date=$(date -Iseconds)"
+        echo "archived_by=$(whoami)"
+        echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+        echo "jps_version=$SCRIPT_VERSION"
+
+        # WordPress info if applicable
+        if [[ -f "${DOC_ROOT}/wp-config.php" ]]; then
+            local wp_version
+            wp_version=$(get_wp_version "$DOC_ROOT" 2>/dev/null || echo "unknown")
+            echo "wordpress_version=$wp_version"
+            echo "site_type=wordpress"
+        else
+            echo "site_type=static"
+        fi
+
+        # Site size
+        local site_size
+        site_size=$(du -sh "$SITE_DIR" 2>/dev/null | cut -f1)
+        echo "site_size=$site_size"
+
+        # Note if provided
+        if [[ -n "$NOTE" ]]; then
+            echo "note=$NOTE"
+        fi
+    } > "$meta_file"
+
+    log_verbose "Metadata file created"
+}
+
+# Create the final archive
+create_archive() {
+    local timestamp
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    local archive_name="archive-${DOMAIN}-${timestamp}.tar.gz"
+    local archive_path="${OUTPUT_DIR}/${archive_name}"
+
+    # Create output directory
+    if [[ ! -d "$OUTPUT_DIR" ]]; then
+        mkdir -p "$OUTPUT_DIR" || {
+            error "Cannot create output directory: $OUTPUT_DIR"
+            return 1
+        }
+    fi
+
+    info "Creating archive..."
+    log_verbose "Output: $archive_path"
+
+    # Create tarball from staging directory
+    if tar -czf "$archive_path" -C "$STAGING_DIR" . 2>/dev/null; then
+        local size
+        size=$(du -h "$archive_path" 2>/dev/null | cut -f1)
+        log_verbose "Archive size: $size"
+    else
+        error "Failed to create archive"
+        return 1
+    fi
+
+    # Encrypt if requested
+    if [[ "$ENCRYPT" == true ]]; then
+        info "Encrypting archive..."
+        local encrypted_path="${archive_path}.gpg"
+
+        # Prompt for passphrase
+        if gpg --symmetric --cipher-algo AES256 -o "$encrypted_path" "$archive_path" 2>/dev/null; then
+            rm -f "$archive_path"
+            archive_path="$encrypted_path"
+            log_verbose "Archive encrypted"
+        else
+            error "Failed to encrypt archive"
+            return 1
+        fi
+    fi
+
+    # Copy metadata alongside archive
+    local meta_dest="${archive_path%.tar.gz}"
+    meta_dest="${meta_dest%.gpg}.meta"
+    cp "${STAGING_DIR}/archive.meta" "$meta_dest" 2>/dev/null
+
+    # Log the event
+    log_lifecycle_event "archive" "$archive_path"
+
+    echo ""
+    success "Archive created successfully"
+    echo ""
+    echo "Archive: $archive_path"
+    echo "Size: $(du -h "$archive_path" 2>/dev/null | cut -f1)"
+    if [[ "$ENCRYPT" == true ]]; then
+        echo "Encryption: AES256"
+    fi
+}
+
+# Log lifecycle event
+log_lifecycle_event() {
+    local action="$1"
+    local archive_path="$2"
+    local log_file="${LOG_DIR}/lifecycle/archive.log"
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local log_entry="[$(date '+%Y-%m-%d %H:%M:%S')] action=$action domain=$DOMAIN archive=$(basename "$archive_path") user=$(whoami)"
+    if [[ -n "$NOTE" ]]; then
+        log_entry+=" note=\"$NOTE\""
+    fi
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Check for root privileges
+    require_root
+
+    # List mode
+    if [[ "$LIST_MODE" == true ]]; then
+        list_archives
+        exit 0
+    fi
+
+    # Initialize paths
+    init_paths
+
+    echo ""
+    header "Creating Archive: $DOMAIN"
+
+    # Create staging directory
+    create_staging
+
+    # Archive components
+    local has_errors=false
+
+    archive_files || has_errors=true
+    archive_database || has_errors=true
+    archive_vhost || has_errors=true
+    archive_ssl || has_errors=true
+    create_metadata
+
+    # Create final archive
+    if ! create_archive; then
+        error "Archive creation failed"
+        exit 1
+    fi
+
+    if [[ "$has_errors" == true ]]; then
+        warn "Archive completed with some warnings"
+        exit 1
+    fi
+
+    exit 0
+}
+
+# Run main function
+main "$@"
