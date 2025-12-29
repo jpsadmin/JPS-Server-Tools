@@ -65,16 +65,16 @@ PREMIUM_PLUGINS=(
 
 # Free themes (wordpress.org)
 FREE_THEMES=(
-    "developer-flavor-flavor-starter"
+    "nexter"
 )
 
 # Premium themes (zip files in /usr/local/jps-assets/themes/)
 PREMIUM_THEMES=(
-    "developer-flavor-flavor-starter-child.zip"
+    "nexter-child-jps.zip"
 )
 
 # Theme to activate
-readonly ACTIVE_THEME="developer-flavor-flavor-starter-child"
+readonly ACTIVE_THEME="nexter-child-jps"
 
 #===============================================================================
 # COLORS

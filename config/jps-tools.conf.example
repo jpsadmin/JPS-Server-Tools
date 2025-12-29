@@ -157,3 +157,23 @@ SSH_LOGINS_SHOW=5
 
 # Number of recent failed SSH attempts to count (hours)
 SSH_FAIL_HOURS=24
+
+#-------------------------------------------------------------------------------
+# LIFECYCLE MANAGEMENT
+# Settings for site lifecycle tools (checkpoint, suspend, archive, delete)
+#-------------------------------------------------------------------------------
+
+# Directory for long-term site archives
+ARCHIVE_DIR="/var/archives/jps"
+
+# Days to retain checkpoints before auto-cleanup (0 = never cleanup)
+CHECKPOINT_RETENTION_DAYS=30
+
+# Days to retain lifecycle logs
+LIFECYCLE_LOG_RETENTION_DAYS=365
+
+# Require archive before deletion (enforced by jps-site-delete)
+REQUIRE_ARCHIVE_BEFORE_DELETE=false
+
+# Default to encrypting archives (requires gpg)
+ENCRYPT_ARCHIVES=false
