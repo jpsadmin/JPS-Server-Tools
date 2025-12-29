@@ -1,0 +1,679 @@
+#!/bin/bash
+#===============================================================================
+# JPS Install Stack - WordPress Plugin/Theme Installer
+#
+# Installs a standard stack of plugins and themes for WordPress sites
+# on OpenLiteSpeed VPS.
+#
+# Usage:
+#   jps-install-stack <domain>              # Install standard stack
+#   jps-install-stack <domain> --ecomm      # Include WooCommerce
+#   jps-install-stack <domain> --list       # Show what would be installed
+#   jps-install-stack --help                # Show usage
+#
+# Exit Codes:
+#   0 - Installation completed (may have warnings)
+#   1 - Critical error (missing WordPress, WP-CLI failed)
+#   2 - Invalid arguments
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-install-stack"
+readonly SCRIPT_VERSION="1.0.0"
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+# Paths
+readonly WEBSITES_ROOT="/usr/local/websites"
+readonly ASSETS_DIR="/usr/local/jps-assets"
+readonly WP_CLI="/usr/local/bin/wp"
+
+# Web server user/group for OpenLiteSpeed
+readonly WEB_USER="nobody"
+readonly WEB_GROUP="nogroup"
+
+# Free plugins to install (wordpress.org slugs)
+FREE_PLUGINS=(
+    "jetoce-developer-flavor-flexible-elementor-panel"
+    "developer-flavor-site-mailer"
+    "elementor"
+    "happyfiles"
+    "mainwp-child"
+    "rank-math-seo"
+    "templately"
+    "wpmudev-updates"
+    "wpvivid-backup-mainwp"
+    "wpvivid-backuprestore"
+)
+
+# WooCommerce plugins (only with --ecomm)
+ECOMM_PLUGINS=(
+    "woocommerce"
+)
+
+# Premium plugins (zip files in /usr/local/jps-assets/plugins/)
+PREMIUM_PLUGINS=(
+    "elementor-pro.zip"
+    "happyfiles-pro.zip"
+    "nexter-pro-extensions-store.zip"
+    "wpvivid-backup-pro.zip"
+)
+
+# Free themes (wordpress.org)
+FREE_THEMES=(
+    "developer-flavor-flavor-starter"
+)
+
+# Premium themes (zip files in /usr/local/jps-assets/themes/)
+PREMIUM_THEMES=(
+    "developer-flavor-flavor-starter-child.zip"
+)
+
+# Theme to activate
+readonly ACTIVE_THEME="developer-flavor-flavor-starter-child"
+
+#===============================================================================
+# COLORS
+#===============================================================================
+
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly BOLD='\033[1m'
+    readonly RESET='\033[0m'
+else
+    readonly RED=''
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly BLUE=''
+    readonly BOLD=''
+    readonly RESET=''
+fi
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+SITE_PATH=""
+INCLUDE_ECOMM=false
+LIST_ONLY=false
+QUIET=false
+
+# Counters
+PLUGINS_INSTALLED=0
+PLUGINS_SKIPPED=0
+PLUGINS_FAILED=0
+THEMES_INSTALLED=0
+THEMES_SKIPPED=0
+THEMES_FAILED=0
+
+# Arrays to track results
+declare -a FAILED_ITEMS=()
+declare -a SKIPPED_ITEMS=()
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+info() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "${BLUE}[INFO]${RESET} $*"
+    fi
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${RESET} $*" >&2
+}
+
+error() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+}
+
+success() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "  ${GREEN}✓${RESET} $*"
+    fi
+}
+
+fail() {
+    echo -e "  ${RED}✗${RESET} $*"
+}
+
+skip() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "  ${YELLOW}○${RESET} $* (already installed)"
+    fi
+}
+
+header() {
+    if [[ "$QUIET" != true ]]; then
+        echo ""
+        echo -e "${BOLD}$*${RESET}"
+    fi
+}
+
+#===============================================================================
+# HELP
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Install Stack - WordPress Plugin/Theme Installer
+
+DESCRIPTION:
+    Installs a standard stack of plugins and themes for WordPress sites.
+    Includes free plugins from wordpress.org and premium plugins from
+    the local assets directory.
+
+USAGE:
+    jps-install-stack <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to install to (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version
+    -e, --ecomm         Include WooCommerce and ecommerce plugins
+    -l, --list          List what would be installed (dry run)
+    -q, --quiet         Suppress detailed output
+
+ASSET LOCATIONS:
+    Premium plugins: /usr/local/jps-assets/plugins/
+    Premium themes:  /usr/local/jps-assets/themes/
+
+STANDARD STACK:
+    Free Plugins (wordpress.org):
+      - wpmudev-updates
+      - mainwp-child
+      - rank-math-seo
+      - elementor
+      - templately
+      - developer-flavor-site-mailer
+      - wpvivid-backuprestore
+      - wpvivid-backup-mainwp
+      - jetoce-developer-flavor-flexible-elementor-panel
+
+    Premium Plugins (from assets):
+      - elementor-pro
+      - wpvivid-backup-pro
+      - happyfiles-pro
+      - nexter-pro-extensions-store
+
+    Themes:
+      - nexter (wordpress.org)
+      - nexter-child-jps (from assets, activated)
+
+EXAMPLES:
+    # Install standard stack
+    jps-install-stack example.com
+
+    # Include WooCommerce
+    jps-install-stack example.com --ecomm
+
+    # Preview installation
+    jps-install-stack example.com --list
+
+EXIT CODES:
+    0 - Installation completed (may have warnings)
+    1 - Critical error (missing WordPress, WP-CLI failed)
+    2 - Invalid arguments
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -e|--ecomm)
+                INCLUDE_ECOMM=true
+                shift
+                ;;
+            -l|--list)
+                LIST_ONLY=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate domain is provided
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-install-stack <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Set site path
+    SITE_PATH="${WEBSITES_ROOT}/${DOMAIN}/html"
+}
+
+#===============================================================================
+# VALIDATION
+#===============================================================================
+
+validate_environment() {
+    # Check running as root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root"
+        exit 1
+    fi
+
+    # Check WP-CLI exists
+    if [[ ! -x "$WP_CLI" ]]; then
+        error "WP-CLI not found at $WP_CLI"
+        echo "Install WP-CLI: https://wp-cli.org/#installing" >&2
+        exit 1
+    fi
+
+    # Check domain directory exists
+    if [[ ! -d "$SITE_PATH" ]]; then
+        error "Site directory not found: $SITE_PATH"
+        exit 1
+    fi
+
+    # Check WordPress is installed
+    if [[ ! -f "${SITE_PATH}/wp-config.php" ]]; then
+        error "WordPress not found at $SITE_PATH (no wp-config.php)"
+        exit 1
+    fi
+
+    # Test WP-CLI works for this site
+    if ! $WP_CLI --path="$SITE_PATH" --allow-root core is-installed 2>/dev/null; then
+        error "WP-CLI cannot connect to WordPress at $SITE_PATH"
+        exit 1
+    fi
+
+    # Check assets directory (warn only)
+    if [[ ! -d "$ASSETS_DIR" ]]; then
+        warn "Assets directory not found: $ASSETS_DIR"
+        warn "Premium plugins/themes will be skipped"
+    fi
+}
+
+#===============================================================================
+# LIST MODE
+#===============================================================================
+
+show_list() {
+    echo ""
+    echo -e "${BOLD}JPS Stack Installer - Dry Run${RESET}"
+    echo "=============================="
+    echo ""
+    echo "Target: $DOMAIN"
+    echo "Path: $SITE_PATH"
+    echo ""
+
+    echo -e "${BOLD}Free Plugins (wordpress.org):${RESET}"
+    for plugin in "${FREE_PLUGINS[@]}"; do
+        echo "  - $plugin"
+    done
+
+    if [[ "$INCLUDE_ECOMM" == true ]]; then
+        echo ""
+        echo -e "${BOLD}E-Commerce Plugins:${RESET}"
+        for plugin in "${ECOMM_PLUGINS[@]}"; do
+            echo "  - $plugin"
+        done
+    fi
+
+    echo ""
+    echo -e "${BOLD}Premium Plugins (from $ASSETS_DIR/plugins/):${RESET}"
+    for plugin in "${PREMIUM_PLUGINS[@]}"; do
+        local plugin_path="${ASSETS_DIR}/plugins/${plugin}"
+        if [[ -f "$plugin_path" ]]; then
+            echo "  - $plugin"
+        else
+            echo -e "  - $plugin ${YELLOW}(not found)${RESET}"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Free Themes (wordpress.org):${RESET}"
+    for theme in "${FREE_THEMES[@]}"; do
+        echo "  - $theme"
+    done
+
+    echo ""
+    echo -e "${BOLD}Premium Themes (from $ASSETS_DIR/themes/):${RESET}"
+    for theme in "${PREMIUM_THEMES[@]}"; do
+        local theme_path="${ASSETS_DIR}/themes/${theme}"
+        if [[ -f "$theme_path" ]]; then
+            echo "  - $theme"
+        else
+            echo -e "  - $theme ${YELLOW}(not found)${RESET}"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Active Theme:${RESET} $ACTIVE_THEME"
+    echo ""
+}
+
+#===============================================================================
+# PLUGIN INSTALLATION
+#===============================================================================
+
+# Check if plugin is installed
+plugin_exists() {
+    local plugin_slug="$1"
+    $WP_CLI --path="$SITE_PATH" --allow-root plugin is-installed "$plugin_slug" 2>/dev/null
+}
+
+# Install plugin from wordpress.org
+install_free_plugin() {
+    local plugin_slug="$1"
+
+    if plugin_exists "$plugin_slug"; then
+        skip "$plugin_slug"
+        SKIPPED_ITEMS+=("plugin:$plugin_slug")
+        ((PLUGINS_SKIPPED++)) || true
+        return 0
+    fi
+
+    if $WP_CLI --path="$SITE_PATH" --allow-root plugin install "$plugin_slug" --activate 2>/dev/null; then
+        success "$plugin_slug"
+        ((PLUGINS_INSTALLED++)) || true
+        return 0
+    else
+        fail "$plugin_slug"
+        FAILED_ITEMS+=("plugin:$plugin_slug")
+        ((PLUGINS_FAILED++)) || true
+        return 1
+    fi
+}
+
+# Install plugin from zip file
+install_premium_plugin() {
+    local zip_file="$1"
+    local plugin_path="${ASSETS_DIR}/plugins/${zip_file}"
+    local plugin_name="${zip_file%.zip}"
+
+    # Check if zip exists
+    if [[ ! -f "$plugin_path" ]]; then
+        warn "Premium plugin not found: $plugin_path"
+        FAILED_ITEMS+=("plugin:$plugin_name (zip missing)")
+        ((PLUGINS_FAILED++)) || true
+        return 1
+    fi
+
+    # Check if already installed (try to determine slug from zip name)
+    if plugin_exists "$plugin_name"; then
+        skip "$plugin_name"
+        SKIPPED_ITEMS+=("plugin:$plugin_name")
+        ((PLUGINS_SKIPPED++)) || true
+        return 0
+    fi
+
+    if $WP_CLI --path="$SITE_PATH" --allow-root plugin install "$plugin_path" --activate 2>/dev/null; then
+        success "$plugin_name"
+        ((PLUGINS_INSTALLED++)) || true
+        return 0
+    else
+        fail "$plugin_name"
+        FAILED_ITEMS+=("plugin:$plugin_name")
+        ((PLUGINS_FAILED++)) || true
+        return 1
+    fi
+}
+
+#===============================================================================
+# THEME INSTALLATION
+#===============================================================================
+
+# Check if theme is installed
+theme_exists() {
+    local theme_slug="$1"
+    $WP_CLI --path="$SITE_PATH" --allow-root theme is-installed "$theme_slug" 2>/dev/null
+}
+
+# Install theme from wordpress.org
+install_free_theme() {
+    local theme_slug="$1"
+
+    if theme_exists "$theme_slug"; then
+        skip "$theme_slug"
+        SKIPPED_ITEMS+=("theme:$theme_slug")
+        ((THEMES_SKIPPED++)) || true
+        return 0
+    fi
+
+    if $WP_CLI --path="$SITE_PATH" --allow-root theme install "$theme_slug" 2>/dev/null; then
+        success "$theme_slug"
+        ((THEMES_INSTALLED++)) || true
+        return 0
+    else
+        fail "$theme_slug"
+        FAILED_ITEMS+=("theme:$theme_slug")
+        ((THEMES_FAILED++)) || true
+        return 1
+    fi
+}
+
+# Install theme from zip file
+install_premium_theme() {
+    local zip_file="$1"
+    local theme_path="${ASSETS_DIR}/themes/${zip_file}"
+    local theme_name="${zip_file%.zip}"
+
+    # Check if zip exists
+    if [[ ! -f "$theme_path" ]]; then
+        warn "Premium theme not found: $theme_path"
+        FAILED_ITEMS+=("theme:$theme_name (zip missing)")
+        ((THEMES_FAILED++)) || true
+        return 1
+    fi
+
+    # Check if already installed
+    if theme_exists "$theme_name"; then
+        skip "$theme_name"
+        SKIPPED_ITEMS+=("theme:$theme_name")
+        ((THEMES_SKIPPED++)) || true
+        return 0
+    fi
+
+    if $WP_CLI --path="$SITE_PATH" --allow-root theme install "$theme_path" 2>/dev/null; then
+        success "$theme_name"
+        ((THEMES_INSTALLED++)) || true
+        return 0
+    else
+        fail "$theme_name"
+        FAILED_ITEMS+=("theme:$theme_name")
+        ((THEMES_FAILED++)) || true
+        return 1
+    fi
+}
+
+# Activate theme
+activate_theme() {
+    local theme_slug="$1"
+
+    if ! theme_exists "$theme_slug"; then
+        warn "Cannot activate theme '$theme_slug' - not installed"
+        return 1
+    fi
+
+    if $WP_CLI --path="$SITE_PATH" --allow-root theme activate "$theme_slug" 2>/dev/null; then
+        success "$theme_slug (activated)"
+        return 0
+    else
+        fail "Failed to activate $theme_slug"
+        return 1
+    fi
+}
+
+#===============================================================================
+# SET PERMISSIONS
+#===============================================================================
+
+set_permissions() {
+    local wp_content="${SITE_PATH}/wp-content"
+
+    if [[ -d "$wp_content" ]]; then
+        if chown -R "${WEB_USER}:${WEB_GROUP}" "$wp_content" 2>/dev/null; then
+            success "Ownership set to ${WEB_USER}:${WEB_GROUP}"
+            return 0
+        else
+            fail "Failed to set ownership"
+            return 1
+        fi
+    else
+        warn "wp-content directory not found"
+        return 1
+    fi
+}
+
+#===============================================================================
+# SUMMARY
+#===============================================================================
+
+show_summary() {
+    local total_plugins=$((PLUGINS_INSTALLED + PLUGINS_SKIPPED + PLUGINS_FAILED))
+    local total_themes=$((THEMES_INSTALLED + THEMES_SKIPPED + THEMES_FAILED))
+
+    echo ""
+    echo "=============================="
+    echo -e "${BOLD}Summary${RESET}"
+    echo "=============================="
+    echo ""
+    echo "Plugins installed: $PLUGINS_INSTALLED"
+    echo "Plugins skipped:   $PLUGINS_SKIPPED"
+    echo "Plugins failed:    $PLUGINS_FAILED"
+    echo ""
+    echo "Themes installed:  $THEMES_INSTALLED"
+    echo "Themes skipped:    $THEMES_SKIPPED"
+    echo "Themes failed:     $THEMES_FAILED"
+    echo ""
+
+    # Get current active theme
+    local current_theme
+    current_theme=$($WP_CLI --path="$SITE_PATH" --allow-root theme list --status=active --field=name 2>/dev/null || echo "unknown")
+    echo "Active theme: $current_theme"
+
+    # Show failed items if any
+    if [[ ${#FAILED_ITEMS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${YELLOW}Failed items:${RESET}"
+        for item in "${FAILED_ITEMS[@]}"; do
+            echo "  - $item"
+        done
+    fi
+
+    echo ""
+    echo -e "${BOLD}Next steps:${RESET}"
+    echo "1. Connect WPMU DEV Dashboard: wp-admin -> WPMU DEV -> Connect"
+    echo "2. Enter license keys for: Elementor Pro, WPVivid Pro, HappyFiles Pro, Nexter Pro Extensions"
+    echo ""
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+main() {
+    parse_args "$@"
+
+    # List mode - show and exit
+    if [[ "$LIST_ONLY" == true ]]; then
+        show_list
+        exit 0
+    fi
+
+    # Validate environment
+    validate_environment
+
+    # Header
+    echo ""
+    echo -e "${BOLD}JPS Stack Installer${RESET}"
+    echo "==================="
+    echo "Target: $DOMAIN"
+    echo "Path: $SITE_PATH"
+
+    # Step 1: Free plugins
+    header "[1/4] Installing free plugins..."
+    for plugin in "${FREE_PLUGINS[@]}"; do
+        install_free_plugin "$plugin" || true
+    done
+
+    # E-commerce plugins if requested
+    if [[ "$INCLUDE_ECOMM" == true ]]; then
+        header "Installing e-commerce plugins..."
+        for plugin in "${ECOMM_PLUGINS[@]}"; do
+            install_free_plugin "$plugin" || true
+        done
+    fi
+
+    # Step 2: Premium plugins
+    header "[2/4] Installing premium plugins..."
+    for plugin in "${PREMIUM_PLUGINS[@]}"; do
+        install_premium_plugin "$plugin" || true
+    done
+
+    # Step 3: Themes
+    header "[3/4] Installing themes..."
+    for theme in "${FREE_THEMES[@]}"; do
+        install_free_theme "$theme" || true
+    done
+    for theme in "${PREMIUM_THEMES[@]}"; do
+        install_premium_theme "$theme" || true
+    done
+
+    # Activate the child theme
+    activate_theme "$ACTIVE_THEME" || true
+
+    # Step 4: Permissions
+    header "[4/4] Setting permissions..."
+    set_permissions || true
+
+    # Summary
+    show_summary
+
+    # Exit code based on failures
+    if [[ $PLUGINS_FAILED -gt 0 ]] || [[ $THEMES_FAILED -gt 0 ]]; then
+        exit 0  # Warnings but not critical
+    fi
+    exit 0
+}
+
+main "$@"

@@ -579,6 +579,61 @@ sudo jps-site-delete example.com --no-db
 - `2` - Invalid arguments or domain not found
 - `3` - User cancelled operation
 
+### jps-install-stack
+
+Install standard WordPress plugin/theme stack for new sites.
+
+```
+Usage: jps-install-stack <domain> [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -e, --ecomm         Include WooCommerce and ecommerce plugins
+  -l, --list          List what would be installed (dry run)
+  -q, --quiet         Suppress detailed output
+```
+
+**Standard Stack:**
+
+| Type | Items |
+|------|-------|
+| Free Plugins | wpmudev-updates, mainwp-child, rank-math-seo, elementor, templately, developer-flavor-site-mailer, wpvivid-backuprestore, wpvivid-backup-mainwp, jetoce-developer-flavor-flexible-elementor-panel |
+| Premium Plugins | elementor-pro, wpvivid-backup-pro, happyfiles-pro, nexter-pro-extensions-store |
+| Themes | nexter (parent), nexter-child-jps (activated) |
+
+**Asset Directory Structure:**
+
+```
+/usr/local/jps-assets/
+├── plugins/
+│   ├── elementor-pro.zip
+│   ├── wpvivid-backup-pro.zip
+│   ├── happyfiles-pro.zip
+│   └── nexter-pro-extensions-store.zip
+└── themes/
+    └── nexter-child-jps.zip
+```
+
+**Examples:**
+
+```bash
+# Install standard stack
+sudo jps-install-stack example.com
+
+# Include WooCommerce
+sudo jps-install-stack example.com --ecomm
+
+# Preview what would be installed
+sudo jps-install-stack example.com --list
+```
+
+**Exit Codes:**
+
+- `0` - Installation completed (may have warnings)
+- `1` - Critical error (missing WordPress, WP-CLI failed)
+- `2` - Invalid arguments
+
 ## Configuration
 
 Edit `/opt/jps-server-tools/config/jps-tools.conf` to customize settings.
@@ -776,7 +831,8 @@ jps-server-tools/
 │   ├── jps-checkpoint      # Pre-change backup trigger
 │   ├── jps-site-suspend    # Disable site without deleting
 │   ├── jps-site-archive    # Full site preservation
-│   └── jps-site-delete     # Safe site deletion
+│   ├── jps-site-delete     # Safe site deletion
+│   └── jps-install-stack   # WordPress plugin/theme installer
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/
