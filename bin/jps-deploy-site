@@ -564,11 +564,28 @@ step_generate_ssl() {
     local certbot_cmd="certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}"
 
     if $certbot_cmd 2>/dev/null; then
-        # Update vhost config to use SSL
+        # Add SSL configuration to vhost for SNI support
         local vhost_conf="${VHOSTS_DIR}/${DOMAIN}/vhconf.conf"
+        local cert_path="/etc/letsencrypt/live/${DOMAIN}"
 
-        # SSL will be handled by the HTTPS listener in OLS
-        # The certificates are at /etc/letsencrypt/live/${DOMAIN}/
+        # Append SSL configuration to vhconf.conf
+        if [[ -f "$vhost_conf" ]] && [[ -f "${cert_path}/privkey.pem" ]]; then
+            cat >> "$vhost_conf" << EOF
+
+vhssl  {
+  keyFile                 ${cert_path}/privkey.pem
+  certFile                ${cert_path}/fullchain.pem
+  certChain               1
+  sslProtocol             24
+  ciphers                 ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+  enableECDHE             1
+  renegProtection         1
+  sslSessionCache         1
+  enableSpdy              15
+  enableQuic              1
+}
+EOF
+        fi
 
         progress 6 "ssl" "complete" "SSL certificate generated"
         return 0

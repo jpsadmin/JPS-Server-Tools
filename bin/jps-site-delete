@@ -74,6 +74,7 @@ OPTIONS:
     -v, --verbose       Show detailed progress
     -a, --archive       Create archive before deletion
     -y, --yes           Skip initial confirmation (still requires typing domain)
+    -f, --force         Skip ALL confirmations (for automated/API use - DANGEROUS)
     --dry-run           Show what would be deleted without deleting
     --no-db             Don't drop the database
     --no-vhost          Don't remove vhost config
@@ -130,6 +131,7 @@ DOMAIN=""
 VERBOSE=false
 CREATE_ARCHIVE=false
 SKIP_INITIAL_CONFIRM=false
+FORCE_DELETE=false
 DRY_RUN=false
 NO_DB=false
 NO_VHOST=false
@@ -170,6 +172,11 @@ parse_args() {
                 shift
                 ;;
             -y|--yes)
+                SKIP_INITIAL_CONFIRM=true
+                shift
+                ;;
+            -f|--force)
+                FORCE_DELETE=true
                 SKIP_INITIAL_CONFIRM=true
                 shift
                 ;;
@@ -351,6 +358,11 @@ get_initial_confirmation() {
 
 # Require typing domain name
 require_domain_confirmation() {
+    # Skip if force mode is enabled
+    if [[ "$FORCE_DELETE" == true ]]; then
+        return 0
+    fi
+
     echo ""
     echo "To confirm deletion, please type the full domain name:"
     echo ""
@@ -439,25 +451,47 @@ delete_vhost() {
         return 0
     fi
 
-    if [[ ! -d "$VHOST_DIR" ]]; then
-        log_verbose "No vhost directory found"
-        return 0
-    fi
-
     info "Removing virtual host config..."
-    log_verbose "Path: $VHOST_DIR"
 
     if [[ "$DRY_RUN" == true ]]; then
-        echo "  [DRY-RUN] Would remove: $VHOST_DIR"
+        if [[ -d "$VHOST_DIR" ]]; then
+            echo "  [DRY-RUN] Would remove: $VHOST_DIR"
+        fi
+        echo "  [DRY-RUN] Would remove listener mappings from httpd_config.conf"
+        echo "  [DRY-RUN] Would remove virtualhost block from httpd_config.conf"
         return 0
     fi
 
-    if rm -rf "$VHOST_DIR"; then
-        success "Vhost config removed"
-        return 0
+    local has_errors=false
+
+    # Remove vhost directory
+    if [[ -d "$VHOST_DIR" ]]; then
+        log_verbose "Removing vhost directory: $VHOST_DIR"
+        if ! rm -rf "$VHOST_DIR"; then
+            error "Failed to remove vhost directory"
+            has_errors=true
+        fi
     else
+        log_verbose "No vhost directory found"
+    fi
+
+    # Remove listener mappings from httpd_config.conf
+    if [[ -f "$OLS_CONFIG" ]]; then
+        log_verbose "Removing listener mappings from $OLS_CONFIG"
+        # Remove any lines containing map entries for this domain
+        sed -i "/map.*${DOMAIN}/d" "$OLS_CONFIG" 2>/dev/null || true
+
+        log_verbose "Removing virtualhost block from $OLS_CONFIG"
+        # Remove virtualhost block for this domain
+        sed -i "/virtualhost ${DOMAIN} {/,/^}/d" "$OLS_CONFIG" 2>/dev/null || true
+    fi
+
+    if [[ "$has_errors" == true ]]; then
         error "Failed to remove vhost config"
         return 1
+    else
+        success "Vhost config removed"
+        return 0
     fi
 }
 
