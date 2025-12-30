@@ -345,8 +345,22 @@ send_email() {
 JPS Server Tools - ${hostname}
 Sent at: $(date '+%Y-%m-%d %H:%M:%S')
 "
+    # Try sendmail first (supports display names)
+    if command_exists sendmail; then
+        local from="${EMAIL_FROM:-noreply@$hostname}"
+        {
+            echo "To: $EMAIL_TO"
+            echo "From: JPS VPS Monitor <$from>"
+            echo "Subject: $full_subject"
+            echo "Content-Type: text/plain; charset=utf-8"
+            echo ""
+            echo -e "$body"
+        } | sendmail -t 2>/dev/null
+        [[ "$QUIET" != true ]] && info "Email sent to $EMAIL_TO"
+        return 0
+    fi
 
-    # Try mail command first
+    # Fall back to mail command
     if command_exists mail; then
         if [[ -n "$EMAIL_FROM" ]]; then
             echo -e "$body" | mail -s "$full_subject" -r "$EMAIL_FROM" "$EMAIL_TO" 2>/dev/null
@@ -357,27 +371,12 @@ Sent at: $(date '+%Y-%m-%d %H:%M:%S')
         return 0
     fi
 
-    # Try sendmail
-    if command_exists sendmail; then
-        local from="${EMAIL_FROM:-noreply@$hostname}"
-        {
-            echo "To: $EMAIL_TO"
-            echo "From: $from"
-            echo "Subject: $full_subject"
-            echo "Content-Type: text/plain; charset=utf-8"
-            echo ""
-            echo -e "$body"
-        } | sendmail -t 2>/dev/null
-        [[ "$QUIET" != true ]] && info "Email sent to $EMAIL_TO"
-        return 0
-    fi
-
     # Try msmtp
     if command_exists msmtp; then
         local from="${EMAIL_FROM:-noreply@$hostname}"
         {
             echo "To: $EMAIL_TO"
-            echo "From: $from"
+            echo "From: JPS VPS Monitor <$from>"
             echo "Subject: $full_subject"
             echo "Content-Type: text/plain; charset=utf-8"
             echo ""
