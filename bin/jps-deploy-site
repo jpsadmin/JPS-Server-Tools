@@ -246,7 +246,7 @@ parse_args() {
 
     # Set defaults
     [[ -z "$SITE_TITLE" ]] && SITE_TITLE="$DOMAIN"
-    [[ -z "$ADMIN_USERNAME" ]] && ADMIN_USERNAME="jpsadmin_$(random_string 4)"
+    [[ -z "$ADMIN_USERNAME" ]] && ADMIN_USERNAME="jpshost"
 }
 
 #===============================================================================
@@ -477,7 +477,7 @@ index  {
 }
 
 scripthandler  {
-  add                     lsapi:jps php
+  add                     lsapi:lsphp84 php
 }
 
 rewrite  {
@@ -518,13 +518,32 @@ virtualhost ${DOMAIN} {
 EOF
     fi
 
-    # Add listener mapping for HTTP
-    local listener_config="${VHOSTS_DIR}/../listeners.conf"
-    if [[ -f "$listener_config" ]]; then
-        # Check if domain is already mapped
-        if ! grep -q "map.*${DOMAIN}" "$listener_config" 2>/dev/null; then
-            echo "  map                     ${DOMAIN} ${DOMAIN}, www.${DOMAIN}" >> "$listener_config"
-        fi
+    # Add listener mappings to httpd_config.conf
+    # Add to HTTP listener (port 80)
+    if ! grep -q "map.*${DOMAIN}.*${DOMAIN}" "$OLS_CONFIG" 2>/dev/null; then
+        # Insert mapping before the closing brace of listener HTTP 80
+        # Find the last 'map' line in the HTTP listener block and add after it
+        local map_line="  map                     ${DOMAIN} ${DOMAIN}, www.${DOMAIN}"
+
+        # Use awk to add the mapping to HTTP listener
+        awk -v domain="$DOMAIN" -v mapline="$map_line" '
+        /^listener HTTP 80/ { in_http=1 }
+        in_http && /^}/ {
+            print mapline
+            in_http=0
+        }
+        { print }
+        ' "$OLS_CONFIG" > "${OLS_CONFIG}.tmp" && mv "${OLS_CONFIG}.tmp" "$OLS_CONFIG"
+
+        # Use awk to add the mapping to HTTPS listener
+        awk -v domain="$DOMAIN" -v mapline="$map_line" '
+        /^listener HTTPS 443/ { in_https=1 }
+        in_https && /^}/ {
+            print mapline
+            in_https=0
+        }
+        { print }
+        ' "$OLS_CONFIG" > "${OLS_CONFIG}.tmp" && mv "${OLS_CONFIG}.tmp" "$OLS_CONFIG"
     fi
 
     progress 5 "vhost" "complete" "Virtual host configured"
