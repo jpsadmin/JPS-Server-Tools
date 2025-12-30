@@ -634,6 +634,95 @@ sudo jps-install-stack example.com --list
 - `1` - Critical error (missing WordPress, WP-CLI failed)
 - `2` - Invalid arguments
 
+### jps-validate-site
+
+Post-migration site validation to ensure everything works correctly.
+
+```
+Usage: jps-validate-site <domain> [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -q, --quick         Skip external HTTP checks (faster)
+  -s, --quiet         Only show failures and warnings
+  -j, --json          Output results as JSON
+```
+
+**Checks Performed:**
+
+| Category | Checks |
+|----------|--------|
+| Quick (Local) | Directory exists, WordPress installed, WP-CLI works, Database connected, File permissions, wp-config.php security |
+| External (HTTP) | Homepage loads, SSL valid, No mixed content, wp-admin accessible, REST API responding, Permalinks working |
+| WordPress (WP-CLI) | No fatal errors, Active plugins, Active theme, Site URL matches, Home URL matches, Search engine visibility |
+
+**Example Output:**
+
+```
+JPS Site Validator
+==================
+Target: example.com
+Path: /usr/local/websites/example.com/html/
+
+Quick Checks
+  ✓ Directory exists
+  ✓ WordPress installed
+  ✓ WP-CLI connected (WP 6.7.1)
+  ✓ Database connected
+  ✓ File permissions OK (nobody:nogroup)
+  ✓ wp-config.php secure (permissions 640)
+
+External Checks
+  ✓ Homepage loads (HTTP 200, 0.45s)
+  ✓ SSL valid (expires in 83 days)
+  ✓ No mixed content detected
+  ✓ wp-admin accessible (HTTP 302)
+  ✓ REST API responding
+  ✓ Permalinks working (tested: sample-page)
+
+WordPress Checks
+  ✓ No fatal errors
+  ✓ Plugins active (12)
+  ✓ Theme active (flavor-starter-child)
+  ✓ Site URL correct (https://example.com)
+  ✓ Home URL correct (https://example.com)
+  ⚠ Search engines (BLOCKED, blog_public=0)
+
+==================
+Summary
+==================
+Passed:   17
+Warnings: 1
+Failed:   0
+
+Site is healthy with warnings.
+
+Elapsed: 2.34s
+```
+
+**Examples:**
+
+```bash
+# Full validation
+sudo jps-validate-site example.com
+
+# Quick checks only (no HTTP requests)
+sudo jps-validate-site example.com --quick
+
+# JSON output for scripting
+sudo jps-validate-site example.com --json
+
+# Quiet mode - only failures and warnings
+sudo jps-validate-site example.com --quiet
+```
+
+**Exit Codes:**
+
+- `0` - All checks passed (warnings OK)
+- `1` - One or more checks failed
+- `2` - Invalid arguments or critical error
+
 ## Configuration
 
 Edit `/opt/jps-server-tools/config/jps-tools.conf` to customize settings.
@@ -832,7 +921,8 @@ jps-server-tools/
 │   ├── jps-site-suspend    # Disable site without deleting
 │   ├── jps-site-archive    # Full site preservation
 │   ├── jps-site-delete     # Safe site deletion
-│   └── jps-install-stack   # WordPress plugin/theme installer
+│   ├── jps-install-stack   # WordPress plugin/theme installer
+│   └── jps-validate-site   # Post-migration validation
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/

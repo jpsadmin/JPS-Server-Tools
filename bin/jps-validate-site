@@ -1,0 +1,819 @@
+#!/bin/bash
+#===============================================================================
+# JPS Validate Site - Post-Migration Site Validation
+#
+# Validates a WordPress site after migration to ensure everything is working.
+# Performs local checks, external HTTP checks, and WordPress-specific validation.
+#
+# Usage:
+#   jps-validate-site <domain>           # Run all checks
+#   jps-validate-site <domain> --quick   # Quick checks only (no HTTP)
+#   jps-validate-site --help             # Show usage
+#
+# Exit Codes:
+#   0 - All checks passed (warnings OK)
+#   1 - One or more checks failed
+#   2 - Invalid arguments or critical error
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-validate-site"
+readonly SCRIPT_VERSION="1.0.0"
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+# Paths
+readonly WEBSITES_ROOT="/usr/local/websites"
+readonly WP_CLI="/usr/local/bin/wp"
+
+# Web server user/group for OpenLiteSpeed
+readonly WEB_USER="nobody"
+readonly WEB_GROUP="nogroup"
+
+# HTTP timeouts
+readonly HTTP_TIMEOUT=10
+readonly HTTP_CONNECT_TIMEOUT=5
+
+#===============================================================================
+# COLORS
+#===============================================================================
+
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly BOLD='\033[1m'
+    readonly DIM='\033[2m'
+    readonly RESET='\033[0m'
+else
+    readonly RED=''
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly BLUE=''
+    readonly BOLD=''
+    readonly DIM=''
+    readonly RESET=''
+fi
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+SITE_PATH=""
+QUICK_MODE=false
+QUIET_MODE=false
+JSON_MODE=false
+
+# Counters
+PASSED=0
+WARNINGS=0
+FAILED=0
+
+# Start time for elapsed calculation
+START_TIME=""
+
+# JSON results array
+declare -a JSON_RESULTS=()
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+pass() {
+    local message="$1"
+    local detail="${2:-}"
+
+    ((PASSED++)) || true
+
+    if [[ "$JSON_MODE" == true ]]; then
+        local json_detail=""
+        [[ -n "$detail" ]] && json_detail=", \"detail\": \"$detail\""
+        JSON_RESULTS+=("{\"status\": \"pass\", \"check\": \"$message\"$json_detail}")
+    elif [[ "$QUIET_MODE" != true ]]; then
+        if [[ -n "$detail" ]]; then
+            echo -e "  ${GREEN}✓${RESET} $message ${DIM}($detail)${RESET}"
+        else
+            echo -e "  ${GREEN}✓${RESET} $message"
+        fi
+    fi
+}
+
+fail() {
+    local message="$1"
+    local detail="${2:-}"
+
+    ((FAILED++)) || true
+
+    if [[ "$JSON_MODE" == true ]]; then
+        local json_detail=""
+        [[ -n "$detail" ]] && json_detail=", \"detail\": \"$detail\""
+        JSON_RESULTS+=("{\"status\": \"fail\", \"check\": \"$message\"$json_detail}")
+    else
+        if [[ -n "$detail" ]]; then
+            echo -e "  ${RED}✗${RESET} $message ${DIM}($detail)${RESET}"
+        else
+            echo -e "  ${RED}✗${RESET} $message"
+        fi
+    fi
+}
+
+warn() {
+    local message="$1"
+    local detail="${2:-}"
+
+    ((WARNINGS++)) || true
+
+    if [[ "$JSON_MODE" == true ]]; then
+        local json_detail=""
+        [[ -n "$detail" ]] && json_detail=", \"detail\": \"$detail\""
+        JSON_RESULTS+=("{\"status\": \"warn\", \"check\": \"$message\"$json_detail}")
+    else
+        if [[ -n "$detail" ]]; then
+            echo -e "  ${YELLOW}⚠${RESET} $message ${DIM}($detail)${RESET}"
+        else
+            echo -e "  ${YELLOW}⚠${RESET} $message"
+        fi
+    fi
+}
+
+header() {
+    if [[ "$JSON_MODE" != true ]] && [[ "$QUIET_MODE" != true ]]; then
+        echo ""
+        echo -e "${BOLD}$*${RESET}"
+    fi
+}
+
+info() {
+    if [[ "$JSON_MODE" != true ]] && [[ "$QUIET_MODE" != true ]]; then
+        echo "$*"
+    fi
+}
+
+error() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+}
+
+#===============================================================================
+# HELP
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Validate Site - Post-Migration Site Validation
+
+DESCRIPTION:
+    Validates a WordPress site after migration to ensure everything
+    is working correctly. Performs local, external, and WordPress checks.
+
+USAGE:
+    jps-validate-site <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to validate (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version
+    -q, --quick         Quick mode - skip external HTTP checks
+    -s, --quiet         Quiet mode - only show failures and warnings
+    -j, --json          Output results as JSON
+
+CHECKS PERFORMED:
+
+  Quick Checks (local):
+    - Directory exists
+    - WordPress installed (wp-config.php)
+    - WP-CLI connectivity
+    - Database connection
+    - File permissions (nobody:nogroup)
+    - wp-config.php security
+
+  External Checks (HTTP requests):
+    - Homepage loads (HTTP 200)
+    - SSL certificate valid
+    - No mixed content
+    - wp-admin accessible
+    - REST API responding
+    - Permalinks working
+
+  WordPress Checks (WP-CLI):
+    - No fatal errors
+    - Active plugins count
+    - Active theme
+    - Site URL matches domain
+    - Home URL matches domain
+    - Search engine visibility
+
+EXAMPLES:
+    # Full validation
+    jps-validate-site example.com
+
+    # Quick checks only (no HTTP requests)
+    jps-validate-site example.com --quick
+
+    # JSON output for scripting
+    jps-validate-site example.com --json
+
+EXIT CODES:
+    0 - All checks passed (warnings OK)
+    1 - One or more checks failed
+    2 - Invalid arguments or critical error
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -q|--quick)
+                QUICK_MODE=true
+                shift
+                ;;
+            -s|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate domain is provided
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-validate-site <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Set site path
+    SITE_PATH="${WEBSITES_ROOT}/${DOMAIN}/html"
+}
+
+#===============================================================================
+# QUICK CHECKS (Local)
+#===============================================================================
+
+check_directory_exists() {
+    if [[ -d "$SITE_PATH" ]]; then
+        pass "Directory exists"
+        return 0
+    else
+        fail "Directory exists" "not found: $SITE_PATH"
+        return 1
+    fi
+}
+
+check_wordpress_installed() {
+    if [[ -f "${SITE_PATH}/wp-config.php" ]]; then
+        pass "WordPress installed"
+        return 0
+    else
+        fail "WordPress installed" "wp-config.php not found"
+        return 1
+    fi
+}
+
+check_wpcli_works() {
+    local version
+    if version=$($WP_CLI --path="$SITE_PATH" --allow-root core version 2>/dev/null); then
+        pass "WP-CLI connected" "WP $version"
+        return 0
+    else
+        fail "WP-CLI connected" "command failed"
+        return 1
+    fi
+}
+
+check_database_connected() {
+    if $WP_CLI --path="$SITE_PATH" --allow-root db check &>/dev/null; then
+        pass "Database connected"
+        return 0
+    else
+        fail "Database connected" "db check failed"
+        return 1
+    fi
+}
+
+check_file_permissions() {
+    local wp_content="${SITE_PATH}/wp-content"
+
+    if [[ ! -d "$wp_content" ]]; then
+        warn "File permissions" "wp-content not found"
+        return 0
+    fi
+
+    local owner group
+    owner=$(stat -c '%U' "$wp_content" 2>/dev/null)
+    group=$(stat -c '%G' "$wp_content" 2>/dev/null)
+
+    if [[ "$owner" == "$WEB_USER" ]] && [[ "$group" == "$WEB_GROUP" ]]; then
+        pass "File permissions OK" "${owner}:${group}"
+        return 0
+    else
+        warn "File permissions" "expected ${WEB_USER}:${WEB_GROUP}, got ${owner}:${group}"
+        return 0
+    fi
+}
+
+check_wpconfig_secure() {
+    local config_file="${SITE_PATH}/wp-config.php"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 0  # Already reported in wordpress_installed check
+    fi
+
+    local perms
+    perms=$(stat -c '%a' "$config_file" 2>/dev/null)
+
+    # Check for world-readable permissions
+    if [[ "$perms" == "777" ]] || [[ "$perms" == "666" ]] || [[ "$perms" == "644" && "${perms: -1}" != "0" ]]; then
+        # Actually 644 is common and acceptable, let's check for truly bad perms
+        if [[ "$perms" == "777" ]] || [[ "$perms" == "666" ]]; then
+            fail "wp-config.php secure" "permissions $perms (world-writable!)"
+            return 1
+        fi
+    fi
+
+    pass "wp-config.php secure" "permissions $perms"
+    return 0
+}
+
+run_quick_checks() {
+    header "Quick Checks"
+
+    # Directory must exist to continue
+    if ! check_directory_exists; then
+        return 1
+    fi
+
+    # WordPress must be installed to continue
+    if ! check_wordpress_installed; then
+        return 1
+    fi
+
+    check_wpcli_works || true
+    check_database_connected || true
+    check_file_permissions || true
+    check_wpconfig_secure || true
+
+    return 0
+}
+
+#===============================================================================
+# EXTERNAL CHECKS (HTTP)
+#===============================================================================
+
+check_homepage_loads() {
+    local url="https://${DOMAIN}/"
+    local start_time end_time duration
+    local http_code
+
+    start_time=$(date +%s.%N)
+
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+        --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+        --max-time "$HTTP_TIMEOUT" \
+        -L "$url" 2>/dev/null) || http_code="000"
+
+    end_time=$(date +%s.%N)
+    duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "?")
+
+    if [[ "$http_code" == "200" ]]; then
+        pass "Homepage loads" "HTTP $http_code, ${duration}s"
+        return 0
+    elif [[ "$http_code" == "000" ]]; then
+        fail "Homepage loads" "connection failed"
+        return 1
+    else
+        fail "Homepage loads" "HTTP $http_code"
+        return 1
+    fi
+}
+
+check_ssl_valid() {
+    local expiry_date days_remaining
+
+    # Get SSL expiry
+    expiry_date=$(echo | openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null | \
+                  openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+
+    if [[ -z "$expiry_date" ]]; then
+        fail "SSL valid" "could not retrieve certificate"
+        return 1
+    fi
+
+    # Calculate days remaining
+    local expiry_ts now_ts
+    expiry_ts=$(date -d "$expiry_date" +%s 2>/dev/null) || {
+        fail "SSL valid" "could not parse expiry date"
+        return 1
+    }
+    now_ts=$(date +%s)
+    days_remaining=$(( (expiry_ts - now_ts) / 86400 ))
+
+    if [[ $days_remaining -lt 0 ]]; then
+        fail "SSL valid" "EXPIRED ${days_remaining#-} days ago!"
+        return 1
+    elif [[ $days_remaining -lt 7 ]]; then
+        warn "SSL valid" "expires in $days_remaining days!"
+        return 0
+    elif [[ $days_remaining -lt 14 ]]; then
+        warn "SSL valid" "expires in $days_remaining days"
+        return 0
+    else
+        pass "SSL valid" "expires in $days_remaining days"
+        return 0
+    fi
+}
+
+check_no_mixed_content() {
+    local url="https://${DOMAIN}/"
+    local html
+
+    html=$(curl -s --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" -L "$url" 2>/dev/null)
+
+    if [[ -z "$html" ]]; then
+        warn "No mixed content" "could not fetch homepage"
+        return 0
+    fi
+
+    # Look for http:// references to the same domain (excluding protocol-relative)
+    if echo "$html" | grep -qi "http://${DOMAIN}" 2>/dev/null; then
+        warn "No mixed content" "found http://${DOMAIN} references"
+        return 0
+    fi
+
+    # Look for common mixed content patterns
+    if echo "$html" | grep -qiE 'src="http://|href="http://' 2>/dev/null; then
+        local count
+        count=$(echo "$html" | grep -oiE 'src="http://|href="http://' | wc -l)
+        warn "No mixed content" "found $count http:// resource references"
+        return 0
+    fi
+
+    pass "No mixed content detected"
+    return 0
+}
+
+check_wpadmin_accessible() {
+    local url="https://${DOMAIN}/wp-admin/"
+    local http_code
+
+    # wp-admin should redirect to login (302) or show login page (200)
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+        --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+        --max-time "$HTTP_TIMEOUT" \
+        "$url" 2>/dev/null) || http_code="000"
+
+    if [[ "$http_code" == "200" ]] || [[ "$http_code" == "302" ]]; then
+        pass "wp-admin accessible" "HTTP $http_code"
+        return 0
+    elif [[ "$http_code" == "000" ]]; then
+        fail "wp-admin accessible" "connection failed"
+        return 1
+    else
+        fail "wp-admin accessible" "HTTP $http_code"
+        return 1
+    fi
+}
+
+check_rest_api() {
+    local url="https://${DOMAIN}/wp-json/"
+    local response http_code
+
+    response=$(curl -s --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+        -w '\n%{http_code}' "$url" 2>/dev/null)
+
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" != "200" ]]; then
+        if [[ "$http_code" == "000" ]]; then
+            fail "REST API responding" "connection failed"
+        else
+            fail "REST API responding" "HTTP $http_code"
+        fi
+        return 1
+    fi
+
+    # Check if response looks like JSON
+    if echo "$body" | grep -q '"name"' 2>/dev/null; then
+        pass "REST API responding"
+        return 0
+    else
+        warn "REST API responding" "unexpected response format"
+        return 0
+    fi
+}
+
+check_permalinks() {
+    # Try to get a post URL to test
+    local post_url
+    post_url=$($WP_CLI --path="$SITE_PATH" --allow-root post list \
+        --post_type=post --post_status=publish --field=url --posts_per_page=1 2>/dev/null | head -1)
+
+    if [[ -z "$post_url" ]]; then
+        # Try pages if no posts
+        post_url=$($WP_CLI --path="$SITE_PATH" --allow-root post list \
+            --post_type=page --post_status=publish --field=url --posts_per_page=1 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$post_url" ]]; then
+        warn "Permalinks" "no posts/pages found to test"
+        return 0
+    fi
+
+    local http_code
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
+        --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+        --max-time "$HTTP_TIMEOUT" \
+        -L "$post_url" 2>/dev/null) || http_code="000"
+
+    if [[ "$http_code" == "200" ]]; then
+        pass "Permalinks working" "tested: $(basename "$post_url")"
+        return 0
+    else
+        fail "Permalinks working" "HTTP $http_code for $post_url"
+        return 1
+    fi
+}
+
+run_external_checks() {
+    header "External Checks"
+
+    check_homepage_loads || true
+    check_ssl_valid || true
+    check_no_mixed_content || true
+    check_wpadmin_accessible || true
+    check_rest_api || true
+    check_permalinks || true
+}
+
+#===============================================================================
+# WORDPRESS CHECKS (WP-CLI)
+#===============================================================================
+
+check_no_fatal_errors() {
+    local output
+    if output=$($WP_CLI --path="$SITE_PATH" --allow-root eval "echo 'ok';" 2>&1); then
+        if [[ "$output" == "ok" ]]; then
+            pass "No fatal errors"
+            return 0
+        fi
+    fi
+
+    fail "No fatal errors" "wp eval failed"
+    return 1
+}
+
+check_plugins_active() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root plugin list --status=active --format=count 2>/dev/null) || count="?"
+
+    if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -gt 0 ]]; then
+        pass "Plugins active" "$count"
+        return 0
+    elif [[ "$count" == "0" ]]; then
+        warn "Plugins active" "none active"
+        return 0
+    else
+        warn "Plugins active" "could not count"
+        return 0
+    fi
+}
+
+check_theme_active() {
+    local theme
+    theme=$($WP_CLI --path="$SITE_PATH" --allow-root theme list --status=active --field=name 2>/dev/null | head -1)
+
+    if [[ -n "$theme" ]]; then
+        pass "Theme active" "$theme"
+        return 0
+    else
+        fail "Theme active" "no active theme found"
+        return 1
+    fi
+}
+
+check_site_url() {
+    local site_url expected_url
+    site_url=$($WP_CLI --path="$SITE_PATH" --allow-root option get siteurl 2>/dev/null)
+    expected_url="https://${DOMAIN}"
+
+    # Normalize URLs (remove trailing slash)
+    site_url="${site_url%/}"
+    expected_url="${expected_url%/}"
+
+    if [[ "$site_url" == "$expected_url" ]]; then
+        pass "Site URL correct" "$site_url"
+        return 0
+    elif [[ "$site_url" == "http://${DOMAIN}" ]]; then
+        warn "Site URL" "using HTTP instead of HTTPS"
+        return 0
+    else
+        fail "Site URL" "expected $expected_url, got $site_url"
+        return 1
+    fi
+}
+
+check_home_url() {
+    local home_url expected_url
+    home_url=$($WP_CLI --path="$SITE_PATH" --allow-root option get home 2>/dev/null)
+    expected_url="https://${DOMAIN}"
+
+    # Normalize URLs (remove trailing slash)
+    home_url="${home_url%/}"
+    expected_url="${expected_url%/}"
+
+    if [[ "$home_url" == "$expected_url" ]]; then
+        pass "Home URL correct" "$home_url"
+        return 0
+    elif [[ "$home_url" == "http://${DOMAIN}" ]]; then
+        warn "Home URL" "using HTTP instead of HTTPS"
+        return 0
+    else
+        fail "Home URL" "expected $expected_url, got $home_url"
+        return 1
+    fi
+}
+
+check_search_engines() {
+    local blog_public
+    blog_public=$($WP_CLI --path="$SITE_PATH" --allow-root option get blog_public 2>/dev/null)
+
+    if [[ "$blog_public" == "1" ]]; then
+        pass "Search engines allowed"
+        return 0
+    elif [[ "$blog_public" == "0" ]]; then
+        warn "Search engines" "BLOCKED (blog_public=0)"
+        return 0
+    else
+        warn "Search engines" "unknown status: $blog_public"
+        return 0
+    fi
+}
+
+run_wordpress_checks() {
+    header "WordPress Checks"
+
+    check_no_fatal_errors || true
+    check_plugins_active || true
+    check_theme_active || true
+    check_site_url || true
+    check_home_url || true
+    check_search_engines || true
+}
+
+#===============================================================================
+# SUMMARY
+#===============================================================================
+
+show_summary() {
+    local end_time elapsed
+    end_time=$(date +%s.%N)
+    elapsed=$(echo "$end_time - $START_TIME" | bc 2>/dev/null || echo "?")
+
+    if [[ "$JSON_MODE" == true ]]; then
+        # Output JSON
+        echo "{"
+        echo "  \"domain\": \"$DOMAIN\","
+        echo "  \"path\": \"$SITE_PATH\","
+        echo "  \"passed\": $PASSED,"
+        echo "  \"warnings\": $WARNINGS,"
+        echo "  \"failed\": $FAILED,"
+        echo "  \"elapsed\": \"${elapsed}s\","
+        echo "  \"results\": ["
+        local first=true
+        for result in "${JSON_RESULTS[@]}"; do
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                echo ","
+            fi
+            echo -n "    $result"
+        done
+        echo ""
+        echo "  ]"
+        echo "}"
+    else
+        echo ""
+        echo "=================="
+        echo -e "${BOLD}Summary${RESET}"
+        echo "=================="
+        echo -e "Passed:   ${GREEN}$PASSED${RESET}"
+        echo -e "Warnings: ${YELLOW}$WARNINGS${RESET}"
+        echo -e "Failed:   ${RED}$FAILED${RESET}"
+        echo ""
+
+        if [[ $FAILED -eq 0 ]]; then
+            if [[ $WARNINGS -eq 0 ]]; then
+                echo -e "${GREEN}Site is healthy!${RESET}"
+            else
+                echo -e "${YELLOW}Site is healthy with warnings.${RESET}"
+            fi
+        else
+            echo -e "${RED}Site has issues that need attention.${RESET}"
+        fi
+
+        echo ""
+        echo -e "${DIM}Elapsed: ${elapsed}s${RESET}"
+    fi
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+main() {
+    parse_args "$@"
+
+    # Check running as root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root"
+        exit 2
+    fi
+
+    # Check WP-CLI exists
+    if [[ ! -x "$WP_CLI" ]]; then
+        error "WP-CLI not found at $WP_CLI"
+        exit 2
+    fi
+
+    # Record start time
+    START_TIME=$(date +%s.%N)
+
+    # Header
+    if [[ "$JSON_MODE" != true ]]; then
+        echo ""
+        echo -e "${BOLD}JPS Site Validator${RESET}"
+        echo "=================="
+        info "Target: $DOMAIN"
+        info "Path: $SITE_PATH"
+    fi
+
+    # Run quick checks (required)
+    if ! run_quick_checks; then
+        # Critical failure - can't continue
+        show_summary
+        exit 1
+    fi
+
+    # Run external checks (unless --quick)
+    if [[ "$QUICK_MODE" != true ]]; then
+        run_external_checks
+    fi
+
+    # Run WordPress checks
+    run_wordpress_checks
+
+    # Show summary
+    show_summary
+
+    # Exit code based on failures
+    if [[ $FAILED -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"
