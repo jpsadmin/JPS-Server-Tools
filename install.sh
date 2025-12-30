@@ -270,6 +270,8 @@ create_wrappers() {
         "jps-notify"
         "jps-daily-monitor"
         "jps-monitor-install"
+        "jps-dns-check"
+        "jps-deploy-site"
     )
 
     for script in "${scripts[@]}"; do
@@ -361,6 +363,8 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-notify"
         "$INSTALL_DIR/bin/jps-daily-monitor"
         "$INSTALL_DIR/bin/jps-monitor-install"
+        "$INSTALL_DIR/bin/jps-dns-check"
+        "$INSTALL_DIR/bin/jps-deploy-site"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
@@ -390,6 +394,8 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-notify"
         "$BIN_LINKS_DIR/jps-daily-monitor"
         "$BIN_LINKS_DIR/jps-monitor-install"
+        "$BIN_LINKS_DIR/jps-dns-check"
+        "$BIN_LINKS_DIR/jps-deploy-site"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -486,6 +492,14 @@ ${BOLD}Available Commands:${RESET}
     Configure daily monitoring and notifications.
     Options: --help, --uninstall, --status, --test
 
+  ${GREEN}jps-dns-check${RESET}
+    Verify domain DNS configuration.
+    Options: --help, --json, --ip, --quiet
+
+  ${GREEN}jps-deploy-site${RESET}
+    Deploy a new WordPress site.
+    Options: --help, --domain, --email, --progress, --skip-ssl
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -529,6 +543,8 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-notify"
     rm -f "$BIN_LINKS_DIR/jps-daily-monitor"
     rm -f "$BIN_LINKS_DIR/jps-monitor-install"
+    rm -f "$BIN_LINKS_DIR/jps-dns-check"
+    rm -f "$BIN_LINKS_DIR/jps-deploy-site"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

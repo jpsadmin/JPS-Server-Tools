@@ -1,0 +1,733 @@
+#!/bin/bash
+#===============================================================================
+# JPS Deploy Site - WordPress Site Deployment
+#
+# Creates a new WordPress site with all necessary infrastructure:
+# - Directory structure
+# - MariaDB database and user
+# - WordPress installation via WP-CLI
+# - OpenLiteSpeed virtual host configuration
+# - SSL certificate via Certbot
+# - Proper file permissions
+#
+# Usage:
+#   jps-deploy-site -d example.com              # Basic deployment
+#   jps-deploy-site -d example.com -e admin@x   # With admin email
+#   jps-deploy-site -d example.com --progress   # JSON progress output
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Deployment failed
+#   2 - Invalid arguments
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-deploy-site"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Deploy Site - WordPress Site Deployment
+
+DESCRIPTION:
+    Creates a new WordPress site with all necessary infrastructure including
+    directory structure, database, WordPress installation, virtual host
+    configuration, SSL certificate, and proper permissions.
+
+USAGE:
+    jps-deploy-site -d <domain> [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -d, --domain DOMAIN     Domain name for the new site (required)
+    -e, --email EMAIL       Admin email address (default: admin@jpshosting.net)
+    -u, --username USER     WP admin username (auto-generated if not set)
+    -t, --title TITLE       Site title (default: domain name)
+    --progress              Output JSON progress updates (for automation)
+    --skip-ssl              Skip SSL certificate generation
+    --skip-plugins          Skip installing standard plugin stack
+    -v, --verbose           Show detailed output
+    -q, --quiet             Minimal output
+
+DEPLOYMENT STEPS:
+    1. Validate domain and check prerequisites
+    2. Create directory structure
+    3. Create database and user
+    4. Download and install WordPress
+    5. Configure virtual host
+    6. Generate SSL certificate
+    7. Set file permissions
+    8. Run validation checks
+
+EXAMPLES:
+    # Basic deployment
+    jps-deploy-site -d newsite.example.com
+
+    # With custom admin email
+    jps-deploy-site -d newsite.example.com -e admin@company.com
+
+    # With JSON progress output (for GUI integration)
+    jps-deploy-site -d newsite.example.com --progress
+
+EXIT CODES:
+    0 - Deployment completed successfully
+    1 - Deployment failed
+    2 - Invalid arguments
+
+FILES CREATED:
+    /usr/local/websites/{domain}/html/         - Document root
+    /usr/local/websites/{domain}/logs/         - Log files
+    /usr/local/lsws/conf/vhosts/{domain}/      - Virtual host config
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+ADMIN_EMAIL="admin@jpshosting.net"
+ADMIN_USERNAME=""
+SITE_TITLE=""
+PROGRESS_OUTPUT=false
+SKIP_SSL=false
+SKIP_PLUGINS=false
+VERBOSE=false
+QUIET=false
+
+# Generated during deployment
+DB_NAME=""
+DB_USER=""
+DB_PASS=""
+ADMIN_PASS=""
+
+# Progress tracking
+CURRENT_STEP=0
+TOTAL_STEPS=8
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -d|--domain)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --domain requires a domain name"
+                    exit 2
+                fi
+                DOMAIN="$2"
+                shift 2
+                ;;
+            -e|--email)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --email requires an email address"
+                    exit 2
+                fi
+                ADMIN_EMAIL="$2"
+                shift 2
+                ;;
+            -u|--username)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --username requires a username"
+                    exit 2
+                fi
+                ADMIN_USERNAME="$2"
+                shift 2
+                ;;
+            -t|--title)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --title requires a site title"
+                    exit 2
+                fi
+                SITE_TITLE="$2"
+                shift 2
+                ;;
+            --progress)
+                PROGRESS_OUTPUT=true
+                shift
+                ;;
+            --skip-ssl)
+                SKIP_SSL=true
+                shift
+                ;;
+            --skip-plugins)
+                SKIP_PLUGINS=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                # Assume positional argument is domain if not set
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain name is required"
+        echo "Usage: $SCRIPT_NAME -d <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Normalize domain (lowercase, no trailing dot)
+    DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+
+    # Validate domain format
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+        error "Invalid domain format: $DOMAIN"
+        exit 2
+    fi
+
+    # Set defaults
+    [[ -z "$SITE_TITLE" ]] && SITE_TITLE="$DOMAIN"
+    [[ -z "$ADMIN_USERNAME" ]] && ADMIN_USERNAME="jpsadmin_$(random_string 4)"
+}
+
+#===============================================================================
+# PROGRESS OUTPUT
+#===============================================================================
+
+# Output progress update
+progress() {
+    local step="$1"
+    local name="$2"
+    local status="$3"
+    local message="$4"
+
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        # JSON progress output
+        local json
+        json=$(cat << EOF
+{"step":$step,"name":"$name","status":"$status","message":"$(json_escape "$message")","total_steps":$TOTAL_STEPS}
+EOF
+)
+        echo "$json"
+    elif [[ "$QUIET" != true ]]; then
+        # Human-readable output
+        case "$status" in
+            start)
+                echo -n "  [$step/$TOTAL_STEPS] $message..."
+                ;;
+            complete)
+                echo " done"
+                ;;
+            error)
+                echo " FAILED"
+                error "$message"
+                ;;
+        esac
+    fi
+}
+
+# Output credentials (for progress mode)
+output_credentials() {
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        cat << EOF
+{"step":"credentials","wp_admin_url":"https://${DOMAIN}/wp-admin/","wp_username":"${ADMIN_USERNAME}","wp_password":"${ADMIN_PASS}","db_name":"${DB_NAME}","db_user":"${DB_USER}","db_password":"${DB_PASS}"}
+EOF
+    fi
+}
+
+#===============================================================================
+# DEPLOYMENT STEPS
+#===============================================================================
+
+# Step 1: Validate prerequisites
+step_validate() {
+    progress 1 "validate" "start" "Validating prerequisites"
+
+    # Check if domain already exists
+    local site_dir="${WEBSITES_ROOT}/${DOMAIN}"
+    if [[ -d "$site_dir" ]]; then
+        progress 1 "validate" "error" "Site directory already exists: $site_dir"
+        return 1
+    fi
+
+    # Check if vhost already exists
+    local vhost_dir="${VHOSTS_DIR}/${DOMAIN}"
+    if [[ -d "$vhost_dir" ]]; then
+        progress 1 "validate" "error" "Virtual host already exists: $vhost_dir"
+        return 1
+    fi
+
+    # Check required commands
+    local missing_cmds=()
+    command_exists mysql || missing_cmds+=("mysql")
+    command_exists wp || missing_cmds+=("wp-cli")
+    command_exists certbot || [[ "$SKIP_SSL" == true ]] || missing_cmds+=("certbot")
+
+    if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+        progress 1 "validate" "error" "Missing required commands: ${missing_cmds[*]}"
+        return 1
+    fi
+
+    progress 1 "validate" "complete" "Prerequisites validated"
+    return 0
+}
+
+# Step 2: Create directory structure
+step_create_directories() {
+    progress 2 "directories" "start" "Creating directory structure"
+
+    local site_dir="${WEBSITES_ROOT}/${DOMAIN}"
+    local doc_root="${site_dir}/html"
+    local logs_dir="${site_dir}/logs"
+
+    # Create directories
+    mkdir -p "$doc_root" "$logs_dir"
+
+    # Create log files
+    touch "${logs_dir}/access.log"
+    touch "${logs_dir}/error.log"
+
+    progress 2 "directories" "complete" "Directory structure created"
+    return 0
+}
+
+# Step 3: Create database
+step_create_database() {
+    progress 3 "database" "start" "Creating database and user"
+
+    # Generate database credentials
+    # Use domain-based naming with underscores (MySQL-safe)
+    local safe_name
+    safe_name=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-16)
+    DB_NAME="wp_${safe_name}"
+    DB_USER="${safe_name}_user"
+    DB_PASS=$(random_string 24)
+
+    # Create database and user
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null || {
+        progress 3 "database" "error" "Failed to create database"
+        return 1
+    }
+
+    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || {
+        progress 3 "database" "error" "Failed to create database user"
+        return 1
+    }
+
+    mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';" 2>/dev/null || {
+        progress 3 "database" "error" "Failed to grant privileges"
+        return 1
+    }
+
+    mysql -e "FLUSH PRIVILEGES;" 2>/dev/null
+
+    progress 3 "database" "complete" "Database ${DB_NAME} created"
+    return 0
+}
+
+# Step 4: Install WordPress
+step_install_wordpress() {
+    progress 4 "wordpress" "start" "Installing WordPress"
+
+    local doc_root="${WEBSITES_ROOT}/${DOMAIN}/html"
+    ADMIN_PASS=$(random_string 16)
+
+    # Download WordPress
+    wp core download --path="$doc_root" --allow-root 2>/dev/null || {
+        progress 4 "wordpress" "error" "Failed to download WordPress"
+        return 1
+    }
+
+    # Create wp-config.php
+    wp config create \
+        --path="$doc_root" \
+        --dbname="$DB_NAME" \
+        --dbuser="$DB_USER" \
+        --dbpass="$DB_PASS" \
+        --dbhost="localhost" \
+        --dbcharset="utf8mb4" \
+        --allow-root 2>/dev/null || {
+        progress 4 "wordpress" "error" "Failed to create wp-config.php"
+        return 1
+    }
+
+    # Install WordPress
+    wp core install \
+        --path="$doc_root" \
+        --url="https://${DOMAIN}" \
+        --title="$SITE_TITLE" \
+        --admin_user="$ADMIN_USERNAME" \
+        --admin_password="$ADMIN_PASS" \
+        --admin_email="$ADMIN_EMAIL" \
+        --skip-email \
+        --allow-root 2>/dev/null || {
+        progress 4 "wordpress" "error" "Failed to install WordPress"
+        return 1
+    }
+
+    # Set permalink structure
+    wp rewrite structure '/%postname%/' --path="$doc_root" --allow-root 2>/dev/null || true
+
+    # Remove default plugins/themes we don't need
+    wp plugin delete hello akismet --path="$doc_root" --allow-root 2>/dev/null || true
+    wp theme delete twentytwentytwo twentytwentythree --path="$doc_root" --allow-root 2>/dev/null || true
+
+    progress 4 "wordpress" "complete" "WordPress installed successfully"
+    return 0
+}
+
+# Step 5: Configure virtual host
+step_configure_vhost() {
+    progress 5 "vhost" "start" "Configuring virtual host"
+
+    local vhost_dir="${VHOSTS_DIR}/${DOMAIN}"
+    local doc_root="${WEBSITES_ROOT}/${DOMAIN}/html"
+    local logs_dir="${WEBSITES_ROOT}/${DOMAIN}/logs"
+
+    # Create vhost directory
+    mkdir -p "$vhost_dir"
+
+    # Create vhconf.conf
+    cat > "${vhost_dir}/vhconf.conf" << EOF
+docRoot                   ${doc_root}
+vhDomain                  ${DOMAIN}
+vhAliases                 www.${DOMAIN}
+enableGzip                1
+enableIpGeo               0
+
+errorlog ${logs_dir}/error.log {
+  useServer               0
+  logLevel                WARN
+  rollingSize             10M
+  keepDays                30
+  compressArchive         1
+}
+
+accesslog ${logs_dir}/access.log {
+  useServer               0
+  logFormat               "%h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\""
+  logHeaders              5
+  rollingSize             10M
+  keepDays                30
+  compressArchive         1
+}
+
+index  {
+  useServer               0
+  indexFiles              index.php, index.html
+}
+
+scripthandler  {
+  add                     lsapi:jps php
+}
+
+rewrite  {
+  enable                  1
+  autoLoadHtaccess        1
+}
+
+context / {
+  location                ${doc_root}
+  allowBrowse             1
+  rewrite  {
+    enable                1
+    inherit               1
+  }
+}
+
+phpIniOverride  {
+  php_admin_value memory_limit 256M
+  php_admin_value upload_max_filesize 64M
+  php_admin_value post_max_size 64M
+  php_admin_value max_execution_time 300
+  php_admin_value max_input_time 300
+}
+EOF
+
+    # Add virtual host to main OLS config if not already present
+    if ! grep -q "virtualhost ${DOMAIN}" "$OLS_CONFIG" 2>/dev/null; then
+        # Find the last virtualhost block and add after it
+        cat >> "$OLS_CONFIG" << EOF
+
+virtualhost ${DOMAIN} {
+  vhRoot                  ${WEBSITES_ROOT}/${DOMAIN}
+  configFile              ${vhost_dir}/vhconf.conf
+  allowSymbolLink         1
+  enableScript            1
+  restrained              0
+}
+EOF
+    fi
+
+    # Add listener mapping for HTTP
+    local listener_config="${VHOSTS_DIR}/../listeners.conf"
+    if [[ -f "$listener_config" ]]; then
+        # Check if domain is already mapped
+        if ! grep -q "map.*${DOMAIN}" "$listener_config" 2>/dev/null; then
+            echo "  map                     ${DOMAIN} ${DOMAIN}, www.${DOMAIN}" >> "$listener_config"
+        fi
+    fi
+
+    progress 5 "vhost" "complete" "Virtual host configured"
+    return 0
+}
+
+# Step 6: Generate SSL certificate
+step_generate_ssl() {
+    if [[ "$SKIP_SSL" == true ]]; then
+        progress 6 "ssl" "start" "Skipping SSL certificate (--skip-ssl)"
+        progress 6 "ssl" "complete" "SSL skipped"
+        return 0
+    fi
+
+    progress 6 "ssl" "start" "Generating SSL certificate"
+
+    # Use Certbot with Cloudflare DNS plugin
+    local certbot_cmd="certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email ${ADMIN_EMAIL}"
+
+    if $certbot_cmd 2>/dev/null; then
+        # Update vhost config to use SSL
+        local vhost_conf="${VHOSTS_DIR}/${DOMAIN}/vhconf.conf"
+
+        # SSL will be handled by the HTTPS listener in OLS
+        # The certificates are at /etc/letsencrypt/live/${DOMAIN}/
+
+        progress 6 "ssl" "complete" "SSL certificate generated"
+        return 0
+    else
+        # SSL failed but site might still work on HTTP
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            progress 6 "ssl" "error" "SSL certificate generation failed (site will work on HTTP)"
+        else
+            warn "SSL certificate generation failed. Site will work on HTTP only."
+        fi
+        return 0  # Don't fail the whole deployment for SSL issues
+    fi
+}
+
+# Step 7: Set permissions
+step_set_permissions() {
+    progress 7 "permissions" "start" "Setting file permissions"
+
+    local site_dir="${WEBSITES_ROOT}/${DOMAIN}"
+    local doc_root="${site_dir}/html"
+
+    # Set ownership to nobody:nogroup (OpenLiteSpeed user)
+    chown -R nobody:nogroup "$site_dir"
+
+    # Set directory permissions
+    find "$doc_root" -type d -exec chmod 755 {} \;
+
+    # Set file permissions
+    find "$doc_root" -type f -exec chmod 644 {} \;
+
+    # Secure wp-config.php
+    chmod 640 "${doc_root}/wp-config.php" 2>/dev/null || true
+
+    # Make wp-content writable
+    chmod -R 775 "${doc_root}/wp-content" 2>/dev/null || true
+
+    progress 7 "permissions" "complete" "Permissions set correctly"
+    return 0
+}
+
+# Step 8: Validate and reload
+step_validate_and_reload() {
+    progress 8 "finalize" "start" "Validating and finalizing"
+
+    # Reload OpenLiteSpeed to apply changes
+    if command_exists lswsctrl; then
+        lswsctrl restart 2>/dev/null || {
+            # Try alternative restart
+            systemctl restart lshttpd 2>/dev/null || true
+        }
+    else
+        systemctl restart lshttpd 2>/dev/null || true
+    fi
+
+    # Give OLS a moment to restart
+    sleep 2
+
+    # Run quick validation
+    local doc_root="${WEBSITES_ROOT}/${DOMAIN}/html"
+    local validation_ok=true
+
+    # Check WordPress files exist
+    [[ -f "${doc_root}/wp-config.php" ]] || validation_ok=false
+    [[ -f "${doc_root}/wp-login.php" ]] || validation_ok=false
+    [[ -d "${doc_root}/wp-content" ]] || validation_ok=false
+
+    # Check database connection
+    wp db check --path="$doc_root" --allow-root 2>/dev/null || validation_ok=false
+
+    if [[ "$validation_ok" == true ]]; then
+        progress 8 "finalize" "complete" "Deployment validated successfully"
+        return 0
+    else
+        progress 8 "finalize" "error" "Validation failed - some checks did not pass"
+        return 1
+    fi
+}
+
+# Log deployment to lifecycle log
+log_deployment() {
+    local status="$1"
+    local lifecycle_log="${LOG_DIR}/lifecycle/deploy.log"
+
+    mkdir -p "$(dirname "$lifecycle_log")"
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    echo "[$timestamp] domain=${DOMAIN} status=${status} admin_user=${ADMIN_USERNAME} admin_email=${ADMIN_EMAIL}" >> "$lifecycle_log"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Require root
+    require_root
+
+    # Parse arguments
+    parse_args "$@"
+
+    # Header
+    if [[ "$QUIET" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        header "JPS Site Deployment"
+        echo "Domain: $DOMAIN"
+        echo "Admin Email: $ADMIN_EMAIL"
+        echo ""
+    fi
+
+    # Run deployment steps
+    local failed=false
+
+    step_validate || failed=true
+
+    if [[ "$failed" != true ]]; then
+        step_create_directories || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_create_database || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_install_wordpress || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_configure_vhost || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_generate_ssl || true  # Don't fail for SSL issues
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_set_permissions || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_validate_and_reload || failed=true
+    fi
+
+    # Output results
+    if [[ "$failed" == true ]]; then
+        log_deployment "failed"
+
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            echo '{"step":"result","status":"failed","message":"Deployment failed"}'
+        else
+            echo ""
+            error "Deployment failed!"
+        fi
+        exit 1
+    else
+        log_deployment "success"
+
+        # Output credentials
+        output_credentials
+
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            echo '{"step":"result","status":"success","message":"Deployment completed successfully"}'
+        else
+            echo ""
+            success "Deployment completed successfully!"
+            echo ""
+            echo "Site URL:      https://${DOMAIN}"
+            echo "WP Admin:      https://${DOMAIN}/wp-admin/"
+            echo "Username:      ${ADMIN_USERNAME}"
+            echo "Password:      ${ADMIN_PASS}"
+            echo ""
+            echo "Database:      ${DB_NAME}"
+            echo "DB User:       ${DB_USER}"
+            echo "DB Password:   ${DB_PASS}"
+        fi
+        exit 0
+    fi
+}
+
+# Run main function
+main "$@"
