@@ -1,6 +1,6 @@
 {
   "report_date": "2025-12-30",
-  "timestamp": "2025-12-30T06:12:10-05:00",
+  "timestamp": "2025-12-30T07:05:37-05:00",
   "hostname": "jps-vps",
   "server_ip": "69.62.67.12",
   "status": "warning",
@@ -13,12 +13,12 @@
     "ssl_critical": 0,
     "services_ok": 3,
     "services_down": 0,
-    "disk_usage_percent": 15,
-    "memory_usage_percent": 11,
+    "disk_usage_percent": 16,
+    "memory_usage_percent": 10,
     "disk_status": "ok",
     "memory_status": "ok",
-    "backup_status": "warning",
-    "warnings_count": 5,
+    "backup_status": "ok",
+    "warnings_count": 2,
     "criticals_count": 0
   },
   "sites": [
@@ -30,7 +30,7 @@
         "failed": 0
       },
       "ssl_days_remaining": 82,
-      "backup_age_hours": null
+      "backup_age_hours": 0
     },
     {
       "domain": "jpshosting.net",
@@ -40,7 +40,7 @@
         "failed": 0
       },
       "ssl_days_remaining": 82,
-      "backup_age_hours": null
+      "backup_age_hours": 0
     },
     {
       "domain": "jpshosting.biz",
@@ -50,15 +50,12 @@
         "failed": 0
       },
       "ssl_days_remaining": 31,
-      "backup_age_hours": null
+      "backup_age_hours": 0
     }
   ],
   "warnings": [
     "Site jpshosting.net: 1 validation warnings",
-    "1 plugin updates available for jpshosting.net",
-    "No checkpoint found for docs.jpshosting.net",
-    "No checkpoint found for jpshosting.biz",
-    "No checkpoint found for jpshosting.net"
+    "1 plugin updates available for jpshosting.net"
   ],
   "criticals": []
 }

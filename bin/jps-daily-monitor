@@ -450,7 +450,7 @@ check_backup_age() {
     while IFS= read -r site_dir; do
         local domain
         domain=$(basename "$site_dir")
-        local checkpoint_dir="${backup_dir}/${domain}"
+        local checkpoint_dir="${backup_dir}/${domain}/checkpoints"
 
         # Find most recent checkpoint
         local latest_checkpoint=""
