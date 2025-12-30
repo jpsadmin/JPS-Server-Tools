@@ -541,7 +541,7 @@ days_since() {
 # Usage: token=$(random_string 16)
 random_string() {
     local length="${1:-12}"
-    tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length"
+    openssl rand -base64 48 2>/dev/null | tr -dc a-zA-Z0-9 | head -c "$length"
 }
 
 # timestamp() - Get current timestamp in specified format
