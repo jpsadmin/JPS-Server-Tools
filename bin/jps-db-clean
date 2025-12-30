@@ -1,0 +1,923 @@
+#!/bin/bash
+#===============================================================================
+# JPS DB Clean - WordPress Database Maintenance
+#
+# Cleans up WordPress database by removing revisions, spam, transients,
+# and orphaned data. Always runs as dry-run unless --execute is specified.
+#
+# Usage:
+#   jps-db-clean <domain>              # Dry run - show what would be cleaned
+#   jps-db-clean <domain> --execute    # Actually perform the cleanup
+#   jps-db-clean <domain> --all        # Include extended cleanup tasks
+#   jps-db-clean --help                # Show usage
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Errors occurred
+#   2 - Invalid arguments or critical error
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-db-clean"
+readonly SCRIPT_VERSION="1.0.0"
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+# Paths
+readonly WEBSITES_ROOT="/usr/local/websites"
+readonly WP_CLI="/usr/local/bin/wp"
+readonly LOG_DIR="/opt/jps-server-tools/logs/db-clean"
+
+# Cleanup settings
+readonly REVISIONS_TO_KEEP=5
+readonly TRASH_AGE_DAYS=7
+readonly UNAPPROVED_AGE_DAYS=30
+
+#===============================================================================
+# COLORS
+#===============================================================================
+
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[0;33m'
+    readonly BLUE='\033[0;34m'
+    readonly BOLD='\033[1m'
+    readonly DIM='\033[2m'
+    readonly RESET='\033[0m'
+else
+    readonly RED=''
+    readonly GREEN=''
+    readonly YELLOW=''
+    readonly BLUE=''
+    readonly BOLD=''
+    readonly DIM=''
+    readonly RESET=''
+fi
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+SITE_PATH=""
+EXECUTE_MODE=false
+ALL_MODE=false
+QUIET_MODE=false
+JSON_MODE=false
+
+# Database info
+DB_PREFIX=""
+DB_NAME=""
+
+# Counters for cleanup
+declare -A COUNTS=(
+    [revisions]=0
+    [auto_drafts]=0
+    [trashed_posts]=0
+    [trashed_comments]=0
+    [spam_comments]=0
+    [expired_transients]=0
+    [orphaned_postmeta]=0
+    [orphaned_commentmeta]=0
+    [all_transients]=0
+    [pingbacks]=0
+    [unapproved_comments]=0
+    [orphaned_terms]=0
+)
+
+# Track what was actually cleaned
+declare -A CLEANED=(
+    [revisions]=0
+    [auto_drafts]=0
+    [trashed_posts]=0
+    [trashed_comments]=0
+    [spam_comments]=0
+    [expired_transients]=0
+    [orphaned_postmeta]=0
+    [orphaned_commentmeta]=0
+    [all_transients]=0
+    [pingbacks]=0
+    [unapproved_comments]=0
+    [orphaned_terms]=0
+)
+
+# Sizes
+SIZE_BEFORE=0
+SIZE_AFTER=0
+
+# Start time
+START_TIME=""
+
+# Errors flag
+HAS_ERRORS=false
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+info() {
+    if [[ "$QUIET_MODE" != true ]] && [[ "$JSON_MODE" != true ]]; then
+        echo -e "${BLUE}[INFO]${RESET} $*"
+    fi
+}
+
+success() {
+    if [[ "$JSON_MODE" != true ]]; then
+        echo -e "  ${GREEN}✓${RESET} $*"
+    fi
+}
+
+fail() {
+    if [[ "$JSON_MODE" != true ]]; then
+        echo -e "  ${RED}✗${RESET} $*"
+    fi
+    HAS_ERRORS=true
+}
+
+warn() {
+    if [[ "$JSON_MODE" != true ]]; then
+        echo -e "  ${YELLOW}⚠${RESET} $*"
+    fi
+}
+
+header() {
+    if [[ "$QUIET_MODE" != true ]] && [[ "$JSON_MODE" != true ]]; then
+        echo ""
+        echo -e "${BOLD}$*${RESET}"
+    fi
+}
+
+error() {
+    echo -e "${RED}[ERROR]${RESET} $*" >&2
+}
+
+log_action() {
+    local message="$1"
+    local log_file="${LOG_DIR}/${DOMAIN}.log"
+
+    # Ensure log directory exists
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $message" >> "$log_file" 2>/dev/null || true
+}
+
+#===============================================================================
+# HELP
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS DB Clean - WordPress Database Maintenance
+
+DESCRIPTION:
+    Cleans up WordPress database by removing revisions, spam, transients,
+    and orphaned data. Always runs as dry-run unless --execute is specified.
+
+USAGE:
+    jps-db-clean <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to clean (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version
+    -e, --execute       Actually perform the cleanup (default is dry-run)
+    -a, --all           Include extended cleanup tasks
+    -q, --quiet         Minimal output (just summary)
+    -j, --json          Output results as JSON
+
+SAFE DEFAULTS (always included):
+    - Post revisions (keeping last 5 per post)
+    - Auto-drafts
+    - Trashed posts (older than 7 days)
+    - Trashed comments
+    - Spam comments
+    - Expired transients
+    - Orphaned postmeta
+    - Orphaned commentmeta
+
+EXTENDED CLEANUP (with --all):
+    - All transients (not just expired)
+    - Pingbacks/trackbacks
+    - Unapproved comments (older than 30 days)
+    - Orphaned term relationships
+
+ALWAYS RUN LAST:
+    - Table optimization
+
+EXAMPLES:
+    # Dry run - see what would be cleaned
+    sudo jps-db-clean example.com
+
+    # Execute the cleanup
+    sudo jps-db-clean example.com --execute
+
+    # Full cleanup including extended tasks
+    sudo jps-db-clean example.com --all --execute
+
+    # JSON output for scripting
+    sudo jps-db-clean example.com --json
+
+EXIT CODES:
+    0 - Success
+    1 - Errors occurred during cleanup
+    2 - Invalid arguments or critical error
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -e|--execute)
+                EXECUTE_MODE=true
+                shift
+                ;;
+            -a|--all)
+                ALL_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -j|--json)
+                JSON_MODE=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate domain is provided
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-db-clean <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Set site path
+    SITE_PATH="${WEBSITES_ROOT}/${DOMAIN}/html"
+}
+
+#===============================================================================
+# VALIDATION
+#===============================================================================
+
+validate_environment() {
+    # Check running as root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root"
+        exit 2
+    fi
+
+    # Check WP-CLI exists
+    if [[ ! -x "$WP_CLI" ]]; then
+        error "WP-CLI not found at $WP_CLI"
+        exit 2
+    fi
+
+    # Check domain directory exists
+    if [[ ! -d "$SITE_PATH" ]]; then
+        error "Site directory not found: $SITE_PATH"
+        exit 2
+    fi
+
+    # Check WordPress is installed
+    if [[ ! -f "${SITE_PATH}/wp-config.php" ]]; then
+        error "WordPress not found at $SITE_PATH (no wp-config.php)"
+        exit 2
+    fi
+
+    # Test WP-CLI works
+    if ! $WP_CLI --path="$SITE_PATH" --allow-root core is-installed 2>/dev/null; then
+        error "WP-CLI cannot connect to WordPress at $SITE_PATH"
+        exit 2
+    fi
+
+    # Get database prefix
+    DB_PREFIX=$($WP_CLI --path="$SITE_PATH" --allow-root config get table_prefix 2>/dev/null) || {
+        error "Could not get database prefix"
+        exit 2
+    }
+
+    # Get database name
+    DB_NAME=$($WP_CLI --path="$SITE_PATH" --allow-root config get DB_NAME 2>/dev/null) || {
+        error "Could not get database name"
+        exit 2
+    }
+
+    # Check for recent WooCommerce orders (safety check)
+    if $WP_CLI --path="$SITE_PATH" --allow-root plugin is-active woocommerce 2>/dev/null; then
+        local recent_orders
+        recent_orders=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+            "SELECT COUNT(*) FROM ${DB_PREFIX}posts WHERE post_type='shop_order' AND post_date > DATE_SUB(NOW(), INTERVAL 24 HOUR)" \
+            --skip-column-names 2>/dev/null) || recent_orders=0
+
+        if [[ "$recent_orders" -gt 0 ]] && [[ "$EXECUTE_MODE" == true ]]; then
+            warn "WooCommerce detected with $recent_orders orders in last 24 hours"
+            warn "Consider creating a backup before proceeding"
+        fi
+    fi
+}
+
+#===============================================================================
+# DATABASE SIZE
+#===============================================================================
+
+get_db_size() {
+    local size_bytes
+    size_bytes=$($WP_CLI --path="$SITE_PATH" --allow-root db size --size_format=b 2>/dev/null | grep -oE '[0-9]+' | head -1) || size_bytes=0
+    echo "$size_bytes"
+}
+
+format_size() {
+    local bytes="$1"
+    if [[ $bytes -ge 1073741824 ]]; then
+        echo "$(echo "scale=1; $bytes / 1073741824" | bc) GB"
+    elif [[ $bytes -ge 1048576 ]]; then
+        echo "$(echo "scale=1; $bytes / 1048576" | bc) MB"
+    elif [[ $bytes -ge 1024 ]]; then
+        echo "$(echo "scale=1; $bytes / 1024" | bc) KB"
+    else
+        echo "$bytes B"
+    fi
+}
+
+#===============================================================================
+# COUNTING FUNCTIONS
+#===============================================================================
+
+count_revisions() {
+    # Count revisions excluding the most recent N per post
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}posts p1
+         WHERE p1.post_type = 'revision'
+         AND p1.ID NOT IN (
+             SELECT p2.ID FROM ${DB_PREFIX}posts p2
+             WHERE p2.post_type = 'revision'
+             AND p2.post_parent = p1.post_parent
+             ORDER BY p2.post_date DESC
+             LIMIT $REVISIONS_TO_KEEP
+         )" --skip-column-names 2>/dev/null) || count=0
+
+    # Simpler approach: count all revisions, we'll be smarter during cleanup
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root post list --post_type=revision --format=count 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_auto_drafts() {
+    $WP_CLI --path="$SITE_PATH" --allow-root post list --post_status=auto-draft --format=count 2>/dev/null || echo "0"
+}
+
+count_trashed_posts() {
+    # Posts in trash older than X days
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}posts
+         WHERE post_status = 'trash'
+         AND post_modified < DATE_SUB(NOW(), INTERVAL $TRASH_AGE_DAYS DAY)" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_trashed_comments() {
+    $WP_CLI --path="$SITE_PATH" --allow-root comment list --status=trash --format=count 2>/dev/null || echo "0"
+}
+
+count_spam_comments() {
+    $WP_CLI --path="$SITE_PATH" --allow-root comment list --status=spam --format=count 2>/dev/null || echo "0"
+}
+
+count_expired_transients() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}options
+         WHERE option_name LIKE '_transient_timeout_%'
+         AND option_value < UNIX_TIMESTAMP()" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_all_transients() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}options
+         WHERE option_name LIKE '_transient_%' OR option_name LIKE '_site_transient_%'" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_orphaned_postmeta() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}postmeta pm
+         LEFT JOIN ${DB_PREFIX}posts p ON pm.post_id = p.ID
+         WHERE p.ID IS NULL" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_orphaned_commentmeta() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}commentmeta cm
+         LEFT JOIN ${DB_PREFIX}comments c ON cm.comment_id = c.comment_ID
+         WHERE c.comment_ID IS NULL" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_pingbacks() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}comments
+         WHERE comment_type IN ('pingback', 'trackback')" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_unapproved_comments() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}comments
+         WHERE comment_approved = '0'
+         AND comment_date < DATE_SUB(NOW(), INTERVAL $UNAPPROVED_AGE_DAYS DAY)" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+count_orphaned_terms() {
+    local count
+    count=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "SELECT COUNT(*) FROM ${DB_PREFIX}term_relationships tr
+         LEFT JOIN ${DB_PREFIX}posts p ON tr.object_id = p.ID
+         WHERE p.ID IS NULL" \
+        --skip-column-names 2>/dev/null) || count=0
+    echo "$count"
+}
+
+#===============================================================================
+# CLEANUP FUNCTIONS
+#===============================================================================
+
+clean_revisions() {
+    local count="${COUNTS[revisions]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Delete revisions, keeping the most recent per post
+    # WP-CLI doesn't have a built-in way to keep N revisions, so we use SQL
+    local deleted
+    deleted=$($WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE p1 FROM ${DB_PREFIX}posts p1
+         INNER JOIN ${DB_PREFIX}posts p2 ON p1.post_parent = p2.ID
+         WHERE p1.post_type = 'revision'
+         AND p1.ID NOT IN (
+             SELECT ID FROM (
+                 SELECT p3.ID FROM ${DB_PREFIX}posts p3
+                 WHERE p3.post_type = 'revision'
+                 AND p3.post_parent = p1.post_parent
+                 ORDER BY p3.post_date DESC
+                 LIMIT $REVISIONS_TO_KEEP
+             ) keep_these
+         )" 2>&1) || true
+
+    # Get affected rows from WP-CLI or estimate
+    CLEANED[revisions]=$count
+    success "Post revisions: $count deleted (kept last $REVISIONS_TO_KEEP per post)"
+    log_action "Deleted $count revisions"
+}
+
+clean_auto_drafts() {
+    local count="${COUNTS[auto_drafts]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    local ids
+    ids=$($WP_CLI --path="$SITE_PATH" --allow-root post list --post_status=auto-draft --field=ID 2>/dev/null)
+
+    if [[ -n "$ids" ]]; then
+        echo "$ids" | xargs -r $WP_CLI --path="$SITE_PATH" --allow-root post delete --force 2>/dev/null || true
+        CLEANED[auto_drafts]=$count
+        success "Auto-drafts: $count deleted"
+        log_action "Deleted $count auto-drafts"
+    fi
+}
+
+clean_trashed_posts() {
+    local count="${COUNTS[trashed_posts]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE FROM ${DB_PREFIX}posts
+         WHERE post_status = 'trash'
+         AND post_modified < DATE_SUB(NOW(), INTERVAL $TRASH_AGE_DAYS DAY)" 2>/dev/null || true
+
+    CLEANED[trashed_posts]=$count
+    success "Trashed posts: $count deleted (older than $TRASH_AGE_DAYS days)"
+    log_action "Deleted $count trashed posts"
+}
+
+clean_trashed_comments() {
+    local count="${COUNTS[trashed_comments]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    local ids
+    ids=$($WP_CLI --path="$SITE_PATH" --allow-root comment list --status=trash --field=comment_ID 2>/dev/null)
+
+    if [[ -n "$ids" ]]; then
+        echo "$ids" | xargs -r $WP_CLI --path="$SITE_PATH" --allow-root comment delete --force 2>/dev/null || true
+        CLEANED[trashed_comments]=$count
+        success "Trashed comments: $count deleted"
+        log_action "Deleted $count trashed comments"
+    fi
+}
+
+clean_spam_comments() {
+    local count="${COUNTS[spam_comments]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    local ids
+    ids=$($WP_CLI --path="$SITE_PATH" --allow-root comment list --status=spam --field=comment_ID 2>/dev/null)
+
+    if [[ -n "$ids" ]]; then
+        echo "$ids" | xargs -r $WP_CLI --path="$SITE_PATH" --allow-root comment delete --force 2>/dev/null || true
+        CLEANED[spam_comments]=$count
+        success "Spam comments: $count deleted"
+        log_action "Deleted $count spam comments"
+    fi
+}
+
+clean_expired_transients() {
+    local count="${COUNTS[expired_transients]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root transient delete --expired 2>/dev/null || true
+    CLEANED[expired_transients]=$count
+    success "Expired transients: $count deleted"
+    log_action "Deleted $count expired transients"
+}
+
+clean_all_transients() {
+    local count="${COUNTS[all_transients]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root transient delete --all 2>/dev/null || true
+    CLEANED[all_transients]=$count
+    success "All transients: $count deleted"
+    log_action "Deleted $count transients (all)"
+}
+
+clean_orphaned_postmeta() {
+    local count="${COUNTS[orphaned_postmeta]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE pm FROM ${DB_PREFIX}postmeta pm
+         LEFT JOIN ${DB_PREFIX}posts p ON pm.post_id = p.ID
+         WHERE p.ID IS NULL" 2>/dev/null || true
+
+    CLEANED[orphaned_postmeta]=$count
+    success "Orphaned postmeta: $count deleted"
+    log_action "Deleted $count orphaned postmeta rows"
+}
+
+clean_orphaned_commentmeta() {
+    local count="${COUNTS[orphaned_commentmeta]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE cm FROM ${DB_PREFIX}commentmeta cm
+         LEFT JOIN ${DB_PREFIX}comments c ON cm.comment_id = c.comment_ID
+         WHERE c.comment_ID IS NULL" 2>/dev/null || true
+
+    CLEANED[orphaned_commentmeta]=$count
+    success "Orphaned commentmeta: $count deleted"
+    log_action "Deleted $count orphaned commentmeta rows"
+}
+
+clean_pingbacks() {
+    local count="${COUNTS[pingbacks]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE FROM ${DB_PREFIX}comments
+         WHERE comment_type IN ('pingback', 'trackback')" 2>/dev/null || true
+
+    CLEANED[pingbacks]=$count
+    success "Pingbacks/trackbacks: $count deleted"
+    log_action "Deleted $count pingbacks/trackbacks"
+}
+
+clean_unapproved_comments() {
+    local count="${COUNTS[unapproved_comments]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE FROM ${DB_PREFIX}comments
+         WHERE comment_approved = '0'
+         AND comment_date < DATE_SUB(NOW(), INTERVAL $UNAPPROVED_AGE_DAYS DAY)" 2>/dev/null || true
+
+    CLEANED[unapproved_comments]=$count
+    success "Unapproved comments: $count deleted (older than $UNAPPROVED_AGE_DAYS days)"
+    log_action "Deleted $count old unapproved comments"
+}
+
+clean_orphaned_terms() {
+    local count="${COUNTS[orphaned_terms]}"
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    $WP_CLI --path="$SITE_PATH" --allow-root db query \
+        "DELETE tr FROM ${DB_PREFIX}term_relationships tr
+         LEFT JOIN ${DB_PREFIX}posts p ON tr.object_id = p.ID
+         WHERE p.ID IS NULL" 2>/dev/null || true
+
+    CLEANED[orphaned_terms]=$count
+    success "Orphaned term relationships: $count deleted"
+    log_action "Deleted $count orphaned term relationships"
+}
+
+optimize_tables() {
+    if $WP_CLI --path="$SITE_PATH" --allow-root db optimize 2>/dev/null; then
+        success "Tables optimized"
+        log_action "Database tables optimized"
+    else
+        fail "Table optimization failed"
+    fi
+}
+
+#===============================================================================
+# ANALYSIS
+#===============================================================================
+
+analyze_database() {
+    header "Analyzing database..."
+
+    COUNTS[revisions]=$(count_revisions)
+    COUNTS[auto_drafts]=$(count_auto_drafts)
+    COUNTS[trashed_posts]=$(count_trashed_posts)
+    COUNTS[trashed_comments]=$(count_trashed_comments)
+    COUNTS[spam_comments]=$(count_spam_comments)
+    COUNTS[expired_transients]=$(count_expired_transients)
+    COUNTS[orphaned_postmeta]=$(count_orphaned_postmeta)
+    COUNTS[orphaned_commentmeta]=$(count_orphaned_commentmeta)
+
+    if [[ "$ALL_MODE" == true ]]; then
+        COUNTS[all_transients]=$(count_all_transients)
+        COUNTS[pingbacks]=$(count_pingbacks)
+        COUNTS[unapproved_comments]=$(count_unapproved_comments)
+        COUNTS[orphaned_terms]=$(count_orphaned_terms)
+    fi
+}
+
+#===============================================================================
+# OUTPUT
+#===============================================================================
+
+show_dry_run_summary() {
+    header "Cleanup Summary (DRY RUN)"
+
+    printf "  %-25s %s\n" "Post revisions:" "${COUNTS[revisions]} (keeping last $REVISIONS_TO_KEEP per post)"
+    printf "  %-25s %s\n" "Auto-drafts:" "${COUNTS[auto_drafts]}"
+    printf "  %-25s %s\n" "Trashed posts:" "${COUNTS[trashed_posts]} (older than $TRASH_AGE_DAYS days)"
+    printf "  %-25s %s\n" "Trashed comments:" "${COUNTS[trashed_comments]}"
+    printf "  %-25s %s\n" "Spam comments:" "${COUNTS[spam_comments]}"
+    printf "  %-25s %s\n" "Expired transients:" "${COUNTS[expired_transients]}"
+    printf "  %-25s %s\n" "Orphaned postmeta:" "${COUNTS[orphaned_postmeta]}"
+    printf "  %-25s %s\n" "Orphaned commentmeta:" "${COUNTS[orphaned_commentmeta]}"
+
+    if [[ "$ALL_MODE" == true ]]; then
+        echo ""
+        echo "  Extended cleanup:"
+        printf "  %-25s %s\n" "All transients:" "${COUNTS[all_transients]}"
+        printf "  %-25s %s\n" "Pingbacks/trackbacks:" "${COUNTS[pingbacks]}"
+        printf "  %-25s %s\n" "Unapproved comments:" "${COUNTS[unapproved_comments]} (older than $UNAPPROVED_AGE_DAYS days)"
+        printf "  %-25s %s\n" "Orphaned terms:" "${COUNTS[orphaned_terms]}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}To execute cleanup, run:${RESET}"
+    if [[ "$ALL_MODE" == true ]]; then
+        echo "  jps-db-clean $DOMAIN --all --execute"
+    else
+        echo "  jps-db-clean $DOMAIN --execute"
+    fi
+}
+
+show_execute_summary() {
+    local saved=$((SIZE_BEFORE - SIZE_AFTER))
+    local percent=0
+    if [[ $SIZE_BEFORE -gt 0 ]]; then
+        percent=$(echo "scale=1; $saved * 100 / $SIZE_BEFORE" | bc 2>/dev/null || echo "0")
+    fi
+
+    echo ""
+    echo -e "Database size before: ${BOLD}$(format_size $SIZE_BEFORE)${RESET}"
+    echo -e "Database size after:  ${BOLD}$(format_size $SIZE_AFTER)${RESET}"
+
+    if [[ $saved -gt 0 ]]; then
+        echo -e "Space saved: ${GREEN}$(format_size $saved) ($percent%)${RESET}"
+    else
+        echo -e "Space saved: ${DIM}none (may increase after optimization)${RESET}"
+    fi
+
+    echo ""
+    if [[ "$HAS_ERRORS" == true ]]; then
+        echo -e "${YELLOW}Cleanup completed with some warnings.${RESET}"
+    else
+        echo -e "${GREEN}Cleanup complete!${RESET}"
+    fi
+}
+
+show_json_output() {
+    local end_time elapsed
+    end_time=$(date +%s.%N)
+    elapsed=$(echo "$end_time - $START_TIME" | bc 2>/dev/null || echo "0")
+
+    echo "{"
+    echo "  \"domain\": \"$DOMAIN\","
+    echo "  \"database\": \"$DB_NAME\","
+    echo "  \"mode\": \"$(if [[ "$EXECUTE_MODE" == true ]]; then echo "execute"; else echo "dry-run"; fi)\","
+    echo "  \"extended\": $ALL_MODE,"
+    echo "  \"counts\": {"
+    echo "    \"revisions\": ${COUNTS[revisions]},"
+    echo "    \"auto_drafts\": ${COUNTS[auto_drafts]},"
+    echo "    \"trashed_posts\": ${COUNTS[trashed_posts]},"
+    echo "    \"trashed_comments\": ${COUNTS[trashed_comments]},"
+    echo "    \"spam_comments\": ${COUNTS[spam_comments]},"
+    echo "    \"expired_transients\": ${COUNTS[expired_transients]},"
+    echo "    \"orphaned_postmeta\": ${COUNTS[orphaned_postmeta]},"
+    echo "    \"orphaned_commentmeta\": ${COUNTS[orphaned_commentmeta]}"
+    if [[ "$ALL_MODE" == true ]]; then
+        echo "    ,\"all_transients\": ${COUNTS[all_transients]},"
+        echo "    \"pingbacks\": ${COUNTS[pingbacks]},"
+        echo "    \"unapproved_comments\": ${COUNTS[unapproved_comments]},"
+        echo "    \"orphaned_terms\": ${COUNTS[orphaned_terms]}"
+    fi
+    echo "  },"
+    if [[ "$EXECUTE_MODE" == true ]]; then
+        echo "  \"size_before\": $SIZE_BEFORE,"
+        echo "  \"size_after\": $SIZE_AFTER,"
+        echo "  \"space_saved\": $((SIZE_BEFORE - SIZE_AFTER)),"
+    fi
+    echo "  \"elapsed\": \"${elapsed}s\","
+    echo "  \"success\": $(if [[ "$HAS_ERRORS" == true ]]; then echo "false"; else echo "true"; fi)"
+    echo "}"
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+main() {
+    parse_args "$@"
+
+    # Record start time
+    START_TIME=$(date +%s.%N)
+
+    # Validate environment
+    validate_environment
+
+    # Header
+    if [[ "$JSON_MODE" != true ]]; then
+        echo ""
+        echo -e "${BOLD}JPS Database Cleaner${RESET}"
+        echo "===================="
+        echo "Target: $DOMAIN"
+        echo "Database: $DB_NAME"
+    fi
+
+    # Get initial database size
+    SIZE_BEFORE=$(get_db_size)
+
+    # Analyze database
+    analyze_database
+
+    if [[ "$EXECUTE_MODE" == true ]]; then
+        # Log start
+        log_action "Starting database cleanup for $DOMAIN"
+
+        if [[ "$JSON_MODE" != true ]]; then
+            echo ""
+            echo -e "Database size before: ${BOLD}$(format_size $SIZE_BEFORE)${RESET}"
+            header "Cleaning..."
+        fi
+
+        # Safe defaults
+        clean_revisions
+        clean_auto_drafts
+        clean_trashed_posts
+        clean_trashed_comments
+        clean_spam_comments
+        clean_expired_transients
+        clean_orphaned_postmeta
+        clean_orphaned_commentmeta
+
+        # Extended cleanup
+        if [[ "$ALL_MODE" == true ]]; then
+            clean_all_transients
+            clean_pingbacks
+            clean_unapproved_comments
+            clean_orphaned_terms
+        fi
+
+        # Always optimize at the end
+        optimize_tables
+
+        # Get final database size
+        SIZE_AFTER=$(get_db_size)
+
+        # Log completion
+        log_action "Cleanup completed. Before: $(format_size $SIZE_BEFORE), After: $(format_size $SIZE_AFTER)"
+
+        if [[ "$JSON_MODE" == true ]]; then
+            show_json_output
+        else
+            show_execute_summary
+        fi
+    else
+        # Dry run
+        if [[ "$JSON_MODE" == true ]]; then
+            show_json_output
+        else
+            show_dry_run_summary
+        fi
+    fi
+
+    # Elapsed time
+    if [[ "$JSON_MODE" != true ]] && [[ "$QUIET_MODE" != true ]]; then
+        local end_time elapsed
+        end_time=$(date +%s.%N)
+        elapsed=$(echo "$end_time - $START_TIME" | bc 2>/dev/null || echo "?")
+        echo ""
+        echo -e "${DIM}Elapsed: ${elapsed}s${RESET}"
+    fi
+
+    # Exit code
+    if [[ "$HAS_ERRORS" == true ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"

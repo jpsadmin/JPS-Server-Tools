@@ -252,6 +252,7 @@ create_wrappers() {
         "jps-site-delete"
         "jps-install-stack"
         "jps-validate-site"
+        "jps-db-clean"
     )
 
     for script in "${scripts[@]}"; do
@@ -338,6 +339,7 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-site-delete"
         "$INSTALL_DIR/bin/jps-install-stack"
         "$INSTALL_DIR/bin/jps-validate-site"
+        "$INSTALL_DIR/bin/jps-db-clean"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
@@ -363,6 +365,7 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-site-delete"
         "$BIN_LINKS_DIR/jps-install-stack"
         "$BIN_LINKS_DIR/jps-validate-site"
+        "$BIN_LINKS_DIR/jps-db-clean"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -443,6 +446,10 @@ ${BOLD}Available Commands:${RESET}
     Post-migration site validation.
     Options: --help, --quick, --quiet, --json
 
+  ${GREEN}jps-db-clean${RESET}
+    WordPress database maintenance and cleanup.
+    Options: --help, --execute, --all, --json
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -482,6 +489,7 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-site-delete"
     rm -f "$BIN_LINKS_DIR/jps-install-stack"
     rm -f "$BIN_LINKS_DIR/jps-validate-site"
+    rm -f "$BIN_LINKS_DIR/jps-db-clean"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

@@ -723,6 +723,118 @@ sudo jps-validate-site example.com --quiet
 - `1` - One or more checks failed
 - `2` - Invalid arguments or critical error
 
+### jps-db-clean
+
+WordPress database maintenance and cleanup.
+
+```
+Usage: jps-db-clean <domain> [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -e, --execute       Actually perform cleanup (default is dry-run)
+  -a, --all           Include extended cleanup tasks
+  -q, --quiet         Minimal output
+  -j, --json          Output results as JSON
+```
+
+**Safe Defaults (always included):**
+
+| Task | Description |
+|------|-------------|
+| Post revisions | Delete all but last 5 revisions per post |
+| Auto-drafts | Delete all auto-draft posts |
+| Trashed posts | Delete posts in trash older than 7 days |
+| Trashed comments | Delete comments in trash |
+| Spam comments | Delete all spam comments |
+| Expired transients | Delete expired transient options |
+| Orphaned postmeta | Delete postmeta with no matching post |
+| Orphaned commentmeta | Delete commentmeta with no matching comment |
+
+**Extended Cleanup (with --all):**
+
+| Task | Description |
+|------|-------------|
+| All transients | Delete ALL transients (not just expired) |
+| Pingbacks/trackbacks | Delete all pingback/trackback comments |
+| Unapproved comments | Delete comments pending approval older than 30 days |
+| Orphaned term relationships | Clean up taxonomy relationships |
+
+**Example Output (dry run):**
+
+```
+JPS Database Cleaner
+====================
+Target: example.com
+Database: wp_example
+
+Analyzing database...
+
+Cleanup Summary (DRY RUN)
+  Post revisions:        847 (keeping last 5 per post)
+  Auto-drafts:           12
+  Trashed posts:         3 (older than 7 days)
+  Trashed comments:      28
+  Spam comments:         156
+  Expired transients:    89
+  Orphaned postmeta:     234
+  Orphaned commentmeta:  45
+
+To execute cleanup, run:
+  jps-db-clean example.com --execute
+```
+
+**Example Output (execute):**
+
+```
+JPS Database Cleaner
+====================
+Target: example.com
+Database: wp_example
+
+Database size before: 48.2 MB
+
+Cleaning...
+  ✓ Post revisions: 847 deleted (kept last 5 per post)
+  ✓ Auto-drafts: 12 deleted
+  ✓ Trashed posts: 3 deleted (older than 7 days)
+  ✓ Trashed comments: 28 deleted
+  ✓ Spam comments: 156 deleted
+  ✓ Expired transients: 89 deleted
+  ✓ Orphaned postmeta: 234 deleted
+  ✓ Orphaned commentmeta: 45 deleted
+  ✓ Tables optimized
+
+Database size before: 48.2 MB
+Database size after:  44.0 MB
+Space saved: 4.2 MB (8.7%)
+
+Cleanup complete!
+```
+
+**Examples:**
+
+```bash
+# Dry run - see what would be cleaned
+sudo jps-db-clean example.com
+
+# Execute the cleanup
+sudo jps-db-clean example.com --execute
+
+# Full cleanup including extended tasks
+sudo jps-db-clean example.com --all --execute
+
+# JSON output for scripting
+sudo jps-db-clean example.com --json
+```
+
+**Exit Codes:**
+
+- `0` - Success
+- `1` - Errors occurred during cleanup
+- `2` - Invalid arguments or critical error
+
 ## Configuration
 
 Edit `/opt/jps-server-tools/config/jps-tools.conf` to customize settings.
@@ -922,7 +1034,8 @@ jps-server-tools/
 │   ├── jps-site-archive    # Full site preservation
 │   ├── jps-site-delete     # Safe site deletion
 │   ├── jps-install-stack   # WordPress plugin/theme installer
-│   └── jps-validate-site   # Post-migration validation
+│   ├── jps-validate-site   # Post-migration validation
+│   └── jps-db-clean        # Database maintenance
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/
