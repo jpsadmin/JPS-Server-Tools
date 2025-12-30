@@ -1,0 +1,612 @@
+#!/bin/bash
+#===============================================================================
+# JPS Notify - Multi-Channel Notification System
+#
+# Sends notifications via email, Discord, and/or Slack webhooks.
+# Designed to be used by other JPS tools for alerting.
+#
+# Usage:
+#   jps-notify "Subject" "Message body"
+#   jps-notify --critical "URGENT: Site down" "Details..."
+#   jps-notify --warning "SSL Expiring" "Details..."
+#   jps-notify --test                    # Send test notification
+#
+# Exit Codes:
+#   0 - Notification sent successfully
+#   1 - Failed to send notification
+#   2 - Invalid arguments or configuration
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-notify"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load main configuration
+load_config
+
+# Notification configuration file
+readonly NOTIFY_CONFIG="${INSTALL_DIR}/config/notify.conf"
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Notify - Multi-Channel Notification System
+
+DESCRIPTION:
+    Sends notifications via email, Discord webhook, and/or Slack webhook.
+    Used by JPS monitoring tools to send alerts.
+
+USAGE:
+    jps-notify [OPTIONS] "Subject" "Message body"
+    jps-notify --test
+    echo "Message" | jps-notify "Subject" -
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -c, --critical      Mark as critical alert (red/urgent)
+    -w, --warning       Mark as warning alert (yellow)
+    -i, --info          Mark as informational (blue) - default
+    -s, --success       Mark as success notification (green)
+    --test              Send a test notification to all channels
+    --email-only        Only send via email
+    --discord-only      Only send via Discord
+    --slack-only        Only send via Slack
+    -q, --quiet         Suppress output except errors
+
+CONFIGURATION:
+    Configuration file: /opt/jps-server-tools/config/notify.conf
+
+    [email]
+    enabled=true
+    to=admin@example.com
+    from=monitor@example.com
+
+    [discord]
+    enabled=false
+    webhook_url=https://discord.com/api/webhooks/...
+
+    [slack]
+    enabled=false
+    webhook_url=https://hooks.slack.com/services/...
+
+EXAMPLES:
+    # Send a simple notification
+    jps-notify "Backup Complete" "Daily backup finished successfully"
+
+    # Send a critical alert
+    jps-notify --critical "Site Down" "example.com is not responding"
+
+    # Send warning
+    jps-notify --warning "SSL Expiring" "Certificate expires in 7 days"
+
+    # Test all notification channels
+    jps-notify --test
+
+    # Pipe message from stdin
+    echo "Detailed report..." | jps-notify "Daily Report" -
+
+EXIT CODES:
+    0 - Notification sent successfully
+    1 - Failed to send notification
+    2 - Invalid arguments or configuration
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Alert level (info, success, warning, critical)
+ALERT_LEVEL="info"
+
+# Channels to use
+USE_EMAIL=true
+USE_DISCORD=true
+USE_SLACK=true
+
+# Quiet mode
+QUIET=false
+
+# Test mode
+TEST_MODE=false
+
+# Configuration values (loaded from notify.conf)
+EMAIL_ENABLED=false
+EMAIL_TO=""
+EMAIL_FROM=""
+EMAIL_SMTP_HOST="localhost"
+
+DISCORD_ENABLED=false
+DISCORD_WEBHOOK_URL=""
+
+SLACK_ENABLED=false
+SLACK_WEBHOOK_URL=""
+
+#===============================================================================
+# CONFIGURATION LOADING
+#===============================================================================
+
+# Load notification configuration
+load_notify_config() {
+    if [[ ! -f "$NOTIFY_CONFIG" ]]; then
+        debug "Notify config not found: $NOTIFY_CONFIG"
+        return 0
+    fi
+
+    local section=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+
+        # Check for section headers
+        if [[ "$line" =~ ^\[([a-z]+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        # Parse key=value pairs
+        if [[ "$line" =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # Remove surrounding quotes if present
+            value="${value#\"}"
+            value="${value%\"}"
+            value="${value#\'}"
+            value="${value%\'}"
+
+            case "$section" in
+                email)
+                    case "$key" in
+                        enabled) EMAIL_ENABLED="$value" ;;
+                        to) EMAIL_TO="$value" ;;
+                        from) EMAIL_FROM="$value" ;;
+                        smtp_host) EMAIL_SMTP_HOST="$value" ;;
+                    esac
+                    ;;
+                discord)
+                    case "$key" in
+                        enabled) DISCORD_ENABLED="$value" ;;
+                        webhook_url) DISCORD_WEBHOOK_URL="$value" ;;
+                    esac
+                    ;;
+                slack)
+                    case "$key" in
+                        enabled) SLACK_ENABLED="$value" ;;
+                        webhook_url) SLACK_WEBHOOK_URL="$value" ;;
+                    esac
+                    ;;
+            esac
+        fi
+    done < "$NOTIFY_CONFIG"
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -c|--critical)
+                ALERT_LEVEL="critical"
+                shift
+                ;;
+            -w|--warning)
+                ALERT_LEVEL="warning"
+                shift
+                ;;
+            -i|--info)
+                ALERT_LEVEL="info"
+                shift
+                ;;
+            -s|--success)
+                ALERT_LEVEL="success"
+                shift
+                ;;
+            --test)
+                TEST_MODE=true
+                shift
+                ;;
+            --email-only)
+                USE_DISCORD=false
+                USE_SLACK=false
+                shift
+                ;;
+            --discord-only)
+                USE_EMAIL=false
+                USE_SLACK=false
+                shift
+                ;;
+            --slack-only)
+                USE_EMAIL=false
+                USE_DISCORD=false
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # Remaining args are subject and message
+    NOTIFY_SUBJECT="${1:-}"
+    NOTIFY_MESSAGE="${2:-}"
+}
+
+#===============================================================================
+# NOTIFICATION FUNCTIONS
+#===============================================================================
+
+# Get emoji/icon for alert level
+get_level_emoji() {
+    case "$ALERT_LEVEL" in
+        critical) echo "🚨" ;;
+        warning)  echo "⚠️" ;;
+        success)  echo "✅" ;;
+        info|*)   echo "ℹ️" ;;
+    esac
+}
+
+# Get color code for alert level (Discord/Slack)
+get_level_color() {
+    case "$ALERT_LEVEL" in
+        critical) echo "16711680" ;;  # Red (0xFF0000)
+        warning)  echo "16744448" ;;  # Orange (0xFFA500)
+        success)  echo "65280" ;;     # Green (0x00FF00)
+        info|*)   echo "3447003" ;;   # Blue (0x3498DB)
+    esac
+}
+
+# Get color hex for Slack
+get_level_color_hex() {
+    case "$ALERT_LEVEL" in
+        critical) echo "#FF0000" ;;
+        warning)  echo "#FFA500" ;;
+        success)  echo "#00FF00" ;;
+        info|*)   echo "#3498DB" ;;
+    esac
+}
+
+# Send email notification
+send_email() {
+    local subject="$1"
+    local message="$2"
+
+    if [[ "$EMAIL_ENABLED" != "true" ]]; then
+        debug "Email notifications disabled"
+        return 0
+    fi
+
+    if [[ -z "$EMAIL_TO" ]]; then
+        debug "No email recipient configured"
+        return 0
+    fi
+
+    local emoji
+    emoji=$(get_level_emoji)
+    local full_subject="${emoji} ${subject}"
+
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+
+    local body="$message
+
+--
+JPS Server Tools - ${hostname}
+Sent at: $(date '+%Y-%m-%d %H:%M:%S')
+"
+
+    # Try mail command first
+    if command_exists mail; then
+        if [[ -n "$EMAIL_FROM" ]]; then
+            echo -e "$body" | mail -s "$full_subject" -r "$EMAIL_FROM" "$EMAIL_TO" 2>/dev/null
+        else
+            echo -e "$body" | mail -s "$full_subject" "$EMAIL_TO" 2>/dev/null
+        fi
+        [[ "$QUIET" != true ]] && info "Email sent to $EMAIL_TO"
+        return 0
+    fi
+
+    # Try sendmail
+    if command_exists sendmail; then
+        local from="${EMAIL_FROM:-noreply@$hostname}"
+        {
+            echo "To: $EMAIL_TO"
+            echo "From: $from"
+            echo "Subject: $full_subject"
+            echo "Content-Type: text/plain; charset=utf-8"
+            echo ""
+            echo -e "$body"
+        } | sendmail -t 2>/dev/null
+        [[ "$QUIET" != true ]] && info "Email sent to $EMAIL_TO"
+        return 0
+    fi
+
+    # Try msmtp
+    if command_exists msmtp; then
+        local from="${EMAIL_FROM:-noreply@$hostname}"
+        {
+            echo "To: $EMAIL_TO"
+            echo "From: $from"
+            echo "Subject: $full_subject"
+            echo "Content-Type: text/plain; charset=utf-8"
+            echo ""
+            echo -e "$body"
+        } | msmtp "$EMAIL_TO" 2>/dev/null
+        [[ "$QUIET" != true ]] && info "Email sent to $EMAIL_TO"
+        return 0
+    fi
+
+    warn "No email client available (mail, sendmail, or msmtp)"
+    return 1
+}
+
+# Send Discord notification
+send_discord() {
+    local subject="$1"
+    local message="$2"
+
+    if [[ "$DISCORD_ENABLED" != "true" ]]; then
+        debug "Discord notifications disabled"
+        return 0
+    fi
+
+    if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
+        debug "No Discord webhook configured"
+        return 0
+    fi
+
+    if ! command_exists curl; then
+        warn "curl not available for Discord notification"
+        return 1
+    fi
+
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    local color
+    color=$(get_level_color)
+    local emoji
+    emoji=$(get_level_emoji)
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    # Escape message for JSON
+    local escaped_message
+    escaped_message=$(json_escape "$message")
+    local escaped_subject
+    escaped_subject=$(json_escape "$subject")
+
+    local payload='{
+        "embeds": [{
+            "title": "'"${emoji} ${escaped_subject}"'",
+            "description": "'"$escaped_message"'",
+            "color": '"$color"',
+            "footer": {
+                "text": "JPS Server Tools - '"$hostname"'"
+            },
+            "timestamp": "'"$timestamp"'"
+        }]
+    }'
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "$DISCORD_WEBHOOK_URL" 2>/dev/null)
+
+    local http_code
+    http_code=$(echo "$response" | tail -n1)
+
+    if [[ "$http_code" =~ ^2 ]]; then
+        [[ "$QUIET" != true ]] && info "Discord notification sent"
+        return 0
+    else
+        warn "Discord notification failed (HTTP $http_code)"
+        return 1
+    fi
+}
+
+# Send Slack notification
+send_slack() {
+    local subject="$1"
+    local message="$2"
+
+    if [[ "$SLACK_ENABLED" != "true" ]]; then
+        debug "Slack notifications disabled"
+        return 0
+    fi
+
+    if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+        debug "No Slack webhook configured"
+        return 0
+    fi
+
+    if ! command_exists curl; then
+        warn "curl not available for Slack notification"
+        return 1
+    fi
+
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    local color
+    color=$(get_level_color_hex)
+    local emoji
+    emoji=$(get_level_emoji)
+
+    # Escape message for JSON
+    local escaped_message
+    escaped_message=$(json_escape "$message")
+    local escaped_subject
+    escaped_subject=$(json_escape "$subject")
+
+    local payload='{
+        "attachments": [{
+            "color": "'"$color"'",
+            "title": "'"${emoji} ${escaped_subject}"'",
+            "text": "'"$escaped_message"'",
+            "footer": "JPS Server Tools - '"$hostname"'",
+            "ts": '"$(date +%s)"'
+        }]
+    }'
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        "$SLACK_WEBHOOK_URL" 2>/dev/null)
+
+    local http_code
+    http_code=$(echo "$response" | tail -n1)
+
+    if [[ "$http_code" =~ ^2 ]]; then
+        [[ "$QUIET" != true ]] && info "Slack notification sent"
+        return 0
+    else
+        warn "Slack notification failed (HTTP $http_code)"
+        return 1
+    fi
+}
+
+# Send notification to all enabled channels
+send_notification() {
+    local subject="$1"
+    local message="$2"
+    local any_success=false
+
+    if [[ "$USE_EMAIL" == true ]]; then
+        send_email "$subject" "$message" && any_success=true
+    fi
+
+    if [[ "$USE_DISCORD" == true ]]; then
+        send_discord "$subject" "$message" && any_success=true
+    fi
+
+    if [[ "$USE_SLACK" == true ]]; then
+        send_slack "$subject" "$message" && any_success=true
+    fi
+
+    if [[ "$any_success" == true ]]; then
+        return 0
+    else
+        error "Failed to send notification via any channel"
+        return 1
+    fi
+}
+
+# Send test notification
+send_test() {
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+
+    local subject="Test Notification from JPS Server Tools"
+    local message="This is a test notification from jps-notify.
+
+Server: $hostname
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+Alert Level: $ALERT_LEVEL
+
+If you received this message, notifications are working correctly!"
+
+    info "Sending test notification..."
+    echo ""
+    echo "Configuration:"
+    echo "  Email enabled: $EMAIL_ENABLED (to: ${EMAIL_TO:-not set})"
+    echo "  Discord enabled: $DISCORD_ENABLED"
+    echo "  Slack enabled: $SLACK_ENABLED"
+    echo ""
+
+    send_notification "$subject" "$message"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Load notification configuration
+    load_notify_config
+
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Handle test mode
+    if [[ "$TEST_MODE" == true ]]; then
+        send_test
+        exit $?
+    fi
+
+    # Validate subject
+    if [[ -z "$NOTIFY_SUBJECT" ]]; then
+        error "Subject is required"
+        echo "Usage: jps-notify \"Subject\" \"Message\"" >&2
+        exit 2
+    fi
+
+    # Read message from stdin if - specified
+    if [[ "$NOTIFY_MESSAGE" == "-" ]]; then
+        NOTIFY_MESSAGE=$(cat)
+    fi
+
+    # Validate message
+    if [[ -z "$NOTIFY_MESSAGE" ]]; then
+        error "Message is required"
+        echo "Usage: jps-notify \"Subject\" \"Message\"" >&2
+        exit 2
+    fi
+
+    # Send the notification
+    send_notification "$NOTIFY_SUBJECT" "$NOTIFY_MESSAGE"
+}
+
+# Run main function
+main "$@"

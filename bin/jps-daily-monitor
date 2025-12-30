@@ -1,0 +1,764 @@
+#!/bin/bash
+#===============================================================================
+# JPS Daily Monitor - Comprehensive Health Check and Reporting
+#
+# Runs all health checks, generates reports, and sends notifications.
+# Designed to run daily via cron for proactive server monitoring.
+#
+# Usage:
+#   jps-daily-monitor              # Run all checks, notify if issues
+#   jps-daily-monitor --quiet      # Run silently, only notify on issues
+#   jps-daily-monitor --force      # Always send notification (even if healthy)
+#   jps-daily-monitor --json       # Output JSON only, no notification
+#
+# Exit Codes:
+#   0 - All checks passed (healthy)
+#   1 - Warnings found
+#   2 - Critical issues found
+#
+# Cron Example:
+#   0 6 * * * /usr/local/bin/jps-daily-monitor --quiet
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-daily-monitor"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+# Report directory
+readonly REPORT_DIR="${LOG_DIR:-/opt/jps-server-tools/logs}/daily-monitor"
+readonly TODAY=$(date '+%Y-%m-%d')
+readonly REPORT_FILE="${REPORT_DIR}/${TODAY}.json"
+readonly NOTIFY_SCRIPT="${INSTALL_DIR}/bin/jps-notify"
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Daily Monitor - Comprehensive Health Check and Reporting
+
+DESCRIPTION:
+    Runs all health checks, generates detailed reports, and sends notifications.
+    Designed for daily execution via cron for proactive monitoring.
+
+USAGE:
+    jps-daily-monitor [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -q, --quiet         Run silently, only notify on issues
+    -f, --force         Always send notification (even if healthy)
+    -j, --json          Output JSON only, no notification
+    -v, --verbose       Show detailed check progress
+    --no-notify         Skip sending notifications
+
+CHECKS PERFORMED:
+    1. Site Validation   - Run jps-validate-site on each site
+    2. SSL Certificates  - Check expiry (warn: 14 days, crit: 7 days)
+    3. Disk Usage        - Check all partitions (warn: 80%, crit: 90%)
+    4. Memory Usage      - Check RAM usage (warn: 85%)
+    5. Services          - Verify OLS, MariaDB, Fail2ban running
+    6. WordPress Updates - Check for core/plugin updates available
+    7. Backup Age        - Warn if checkpoint > 48 hours old
+
+OUTPUT:
+    - JSON report saved to: /opt/jps-server-tools/logs/daily-monitor/YYYY-MM-DD.json
+    - Human-readable summary sent via jps-notify
+
+CRON EXAMPLE:
+    # Run daily at 6:00 AM
+    0 6 * * * /usr/local/bin/jps-daily-monitor --quiet
+
+EXIT CODES:
+    0 - All checks passed (healthy)
+    1 - Warnings found
+    2 - Critical issues found
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+QUIET=false
+FORCE_NOTIFY=false
+JSON_ONLY=false
+VERBOSE=false
+SKIP_NOTIFY=false
+
+# Results tracking
+declare -A SITE_RESULTS
+declare -a WARNINGS=()
+declare -a CRITICALS=()
+
+# Summary counters
+SITES_HEALTHY=0
+SITES_WARNING=0
+SITES_CRITICAL=0
+SSL_OK=0
+SSL_WARNING=0
+SSL_CRITICAL=0
+SERVICES_OK=0
+SERVICES_DOWN=0
+DISK_STATUS="ok"
+MEMORY_STATUS="ok"
+BACKUP_STATUS="ok"
+
+# Thresholds (loaded from config or defaults)
+SSL_WARN_DAYS="${SSL_WARN_DAYS:-14}"
+SSL_CRIT_DAYS="${SSL_CRIT_DAYS:-7}"
+DISK_WARN_PERCENT="${DISK_WARN_PERCENT:-80}"
+DISK_CRIT_PERCENT="${DISK_CRIT_PERCENT:-90}"
+MEM_WARN_PERCENT="${MEM_WARN_PERCENT:-85}"
+BACKUP_STALE_HOURS="${BACKUP_STALE_HOURS:-48}"
+
+# Collected data for JSON report
+declare -A SSL_DAYS_MAP
+declare -A BACKUP_AGE_MAP
+declare -A VALIDATION_MAP
+DISK_USAGE_PERCENT=0
+MEMORY_USAGE_PERCENT=0
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -f|--force)
+                FORCE_NOTIFY=true
+                shift
+                ;;
+            -j|--json)
+                JSON_ONLY=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --no-notify)
+                SKIP_NOTIFY=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_check() {
+    local message="$1"
+    if [[ "$VERBOSE" == true ]] && [[ "$JSON_ONLY" != true ]]; then
+        echo "[CHECK] $message"
+    fi
+}
+
+log_result() {
+    local level="$1"
+    local message="$2"
+
+    case "$level" in
+        ok)
+            if [[ "$VERBOSE" == true ]] && [[ "$JSON_ONLY" != true ]]; then
+                echo "[OK] $message"
+            fi
+            ;;
+        warn)
+            WARNINGS+=("$message")
+            if [[ "$JSON_ONLY" != true ]]; then
+                echo "[WARN] $message"
+            fi
+            ;;
+        crit)
+            CRITICALS+=("$message")
+            if [[ "$JSON_ONLY" != true ]]; then
+                echo "[CRIT] $message"
+            fi
+            ;;
+    esac
+}
+
+#===============================================================================
+# CHECK FUNCTIONS
+#===============================================================================
+
+# Check disk usage
+check_disk() {
+    log_check "Checking disk usage..."
+
+    local max_percent=0
+
+    while IFS= read -r line; do
+        local mountpoint percent
+        mountpoint=$(echo "$line" | awk '{print $6}')
+        percent=$(echo "$line" | awk '{print $5}' | tr -d '%')
+
+        if [[ "$percent" -gt "$max_percent" ]]; then
+            max_percent=$percent
+        fi
+
+        if [[ "$percent" -ge "$DISK_CRIT_PERCENT" ]]; then
+            log_result "crit" "Disk usage on ${mountpoint} is ${percent}% (critical)"
+            DISK_STATUS="critical"
+        elif [[ "$percent" -ge "$DISK_WARN_PERCENT" ]]; then
+            log_result "warn" "Disk usage on ${mountpoint} is ${percent}% (warning)"
+            [[ "$DISK_STATUS" != "critical" ]] && DISK_STATUS="warning"
+        else
+            log_result "ok" "Disk ${mountpoint}: ${percent}%"
+        fi
+    done < <(df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2)
+
+    DISK_USAGE_PERCENT=$max_percent
+}
+
+# Check memory usage
+check_memory() {
+    log_check "Checking memory usage..."
+
+    MEMORY_USAGE_PERCENT=$(free | awk '/^Mem:/ {printf "%.0f", ($3/$2)*100}')
+
+    if [[ "$MEMORY_USAGE_PERCENT" -ge "$MEM_WARN_PERCENT" ]]; then
+        log_result "warn" "Memory usage is ${MEMORY_USAGE_PERCENT}%"
+        MEMORY_STATUS="warning"
+    else
+        log_result "ok" "Memory usage: ${MEMORY_USAGE_PERCENT}%"
+    fi
+}
+
+# Check services
+check_services() {
+    log_check "Checking services..."
+
+    local services=("lshttpd" "mariadb" "fail2ban")
+
+    for service in "${services[@]}"; do
+        if service_status "$service"; then
+            log_result "ok" "Service $service is running"
+            ((SERVICES_OK++))
+        else
+            log_result "crit" "Service $service is not running"
+            ((SERVICES_DOWN++))
+        fi
+    done
+}
+
+# Check SSL certificates for all sites
+check_ssl() {
+    log_check "Checking SSL certificates..."
+
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        log_result "warn" "Websites directory not found: $WEBSITES_ROOT"
+        return
+    fi
+
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+
+        local ssl_days
+        ssl_days=$(get_ssl_days_remaining "$domain" 2>/dev/null || echo "-1")
+        SSL_DAYS_MAP["$domain"]="$ssl_days"
+
+        if [[ "$ssl_days" == "-1" ]]; then
+            log_result "ok" "SSL for ${domain}: could not check"
+            ((SSL_OK++))
+        elif [[ "$ssl_days" -le "$SSL_CRIT_DAYS" ]]; then
+            log_result "crit" "SSL for ${domain} expires in ${ssl_days} days"
+            ((SSL_CRITICAL++))
+        elif [[ "$ssl_days" -le "$SSL_WARN_DAYS" ]]; then
+            log_result "warn" "SSL for ${domain} expires in ${ssl_days} days"
+            ((SSL_WARNING++))
+        else
+            log_result "ok" "SSL for ${domain}: ${ssl_days} days remaining"
+            ((SSL_OK++))
+        fi
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+}
+
+# Run jps-validate-site on each site
+check_site_validation() {
+    log_check "Validating sites..."
+
+    local validate_script="${INSTALL_DIR}/bin/jps-validate-site"
+
+    if [[ ! -x "$validate_script" ]]; then
+        log_result "warn" "jps-validate-site not found or not executable"
+        return
+    fi
+
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        return
+    fi
+
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+
+        log_check "Validating $domain..."
+
+        # Run validation in JSON mode
+        local result
+        if result=$("$validate_script" "$domain" --json 2>/dev/null); then
+            # Parse JSON result
+            if command_exists jq; then
+                local passed warnings failed
+                passed=$(echo "$result" | jq -r '.passed // 0')
+                warnings=$(echo "$result" | jq -r '.warnings // 0')
+                failed=$(echo "$result" | jq -r '.failed // 0')
+
+                VALIDATION_MAP["$domain"]="${passed}:${warnings}:${failed}"
+
+                if [[ "$failed" -gt 0 ]]; then
+                    log_result "crit" "Site ${domain}: ${failed} validation failures"
+                    ((SITES_CRITICAL++))
+                elif [[ "$warnings" -gt 0 ]]; then
+                    log_result "warn" "Site ${domain}: ${warnings} validation warnings"
+                    ((SITES_WARNING++))
+                else
+                    log_result "ok" "Site ${domain}: ${passed} checks passed"
+                    ((SITES_HEALTHY++))
+                fi
+            else
+                # jq not available, just check exit code
+                VALIDATION_MAP["$domain"]="unknown"
+                log_result "ok" "Site ${domain}: validation passed"
+                ((SITES_HEALTHY++))
+            fi
+        else
+            VALIDATION_MAP["$domain"]="error"
+            log_result "crit" "Site ${domain}: validation failed"
+            ((SITES_CRITICAL++))
+        fi
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+}
+
+# Check WordPress updates available
+check_wp_updates() {
+    log_check "Checking for WordPress updates..."
+
+    local wp_bin
+    if ! wp_bin=$(_find_wp_cli 2>/dev/null); then
+        log_result "ok" "WP-CLI not available, skipping update check"
+        return
+    fi
+
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        return
+    fi
+
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+        local html_path="${site_dir}/html"
+
+        if ! is_wordpress "$html_path"; then
+            continue
+        fi
+
+        # Check for core updates
+        local core_update
+        core_update=$(wp_cli "$html_path" core check-update --format=count 2>/dev/null || echo "0")
+
+        # Check for plugin updates
+        local plugin_updates
+        plugin_updates=$(wp_cli "$html_path" plugin list --update=available --format=count 2>/dev/null || echo "0")
+
+        if [[ "$core_update" -gt 0 ]]; then
+            log_result "warn" "WordPress core update available for ${domain}"
+        fi
+
+        if [[ "$plugin_updates" -gt 0 ]]; then
+            log_result "warn" "${plugin_updates} plugin updates available for ${domain}"
+        fi
+
+        if [[ "$core_update" -eq 0 ]] && [[ "$plugin_updates" -eq 0 ]]; then
+            log_result "ok" "No updates pending for ${domain}"
+        fi
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+}
+
+# Check backup age (checkpoint age)
+check_backup_age() {
+    log_check "Checking backup age..."
+
+    local backup_dir="${BACKUP_DIR:-/var/backups/jps}"
+    local stale_hours="${BACKUP_STALE_HOURS:-48}"
+    local stale_seconds=$((stale_hours * 3600))
+    local now
+    now=$(date +%s)
+    local all_ok=true
+
+    if [[ ! -d "$WEBSITES_ROOT" ]]; then
+        return
+    fi
+
+    while IFS= read -r site_dir; do
+        local domain
+        domain=$(basename "$site_dir")
+        local checkpoint_dir="${backup_dir}/${domain}"
+
+        # Find most recent checkpoint
+        local latest_checkpoint=""
+        local latest_time=0
+
+        if [[ -d "$checkpoint_dir" ]]; then
+            while IFS= read -r checkpoint; do
+                local ctime
+                ctime=$(stat -c %Y "$checkpoint" 2>/dev/null || echo "0")
+                if [[ "$ctime" -gt "$latest_time" ]]; then
+                    latest_time=$ctime
+                    latest_checkpoint="$checkpoint"
+                fi
+            done < <(find "$checkpoint_dir" -maxdepth 1 -type f -name "*.tar.gz" 2>/dev/null)
+        fi
+
+        if [[ -z "$latest_checkpoint" ]] || [[ "$latest_time" -eq 0 ]]; then
+            BACKUP_AGE_MAP["$domain"]="none"
+            log_result "warn" "No checkpoint found for ${domain}"
+            all_ok=false
+        else
+            local age_hours=$(( (now - latest_time) / 3600 ))
+            BACKUP_AGE_MAP["$domain"]="$age_hours"
+
+            if [[ "$age_hours" -gt "$stale_hours" ]]; then
+                log_result "warn" "Checkpoint for ${domain} is ${age_hours} hours old"
+                all_ok=false
+            else
+                log_result "ok" "Checkpoint for ${domain}: ${age_hours} hours ago"
+            fi
+        fi
+    done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+
+    if [[ "$all_ok" != true ]]; then
+        BACKUP_STATUS="warning"
+    fi
+}
+
+#===============================================================================
+# REPORT GENERATION
+#===============================================================================
+
+generate_json_report() {
+    # Create report directory
+    mkdir -p "$REPORT_DIR"
+
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    local server_ip
+    server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    # Build sites array
+    local sites_json="["
+    local first=true
+    for domain in "${!VALIDATION_MAP[@]}"; do
+        [[ "$first" == true ]] && first=false || sites_json+=","
+
+        local validation="${VALIDATION_MAP[$domain]}"
+        local ssl_days="${SSL_DAYS_MAP[$domain]:-unknown}"
+        local backup_age="${BACKUP_AGE_MAP[$domain]:-unknown}"
+
+        # Parse validation string (passed:warnings:failed)
+        local passed=0 warnings=0 failed=0
+        if [[ "$validation" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+            passed="${BASH_REMATCH[1]}"
+            warnings="${BASH_REMATCH[2]}"
+            failed="${BASH_REMATCH[3]}"
+        fi
+
+        sites_json+='{
+            "domain": "'"$domain"'",
+            "validation": {
+                "passed": '"$passed"',
+                "warnings": '"$warnings"',
+                "failed": '"$failed"'
+            },
+            "ssl_days_remaining": '"${ssl_days:-null}"',
+            "backup_age_hours": '"${backup_age:-null}"'
+        }'
+    done
+    sites_json+="]"
+
+    # Build warnings array
+    local warnings_json="["
+    first=true
+    for msg in "${WARNINGS[@]}"; do
+        [[ "$first" == true ]] && first=false || warnings_json+=","
+        warnings_json+="\"$(json_escape "$msg")\""
+    done
+    warnings_json+="]"
+
+    # Build criticals array
+    local criticals_json="["
+    first=true
+    for msg in "${CRITICALS[@]}"; do
+        [[ "$first" == true ]] && first=false || criticals_json+=","
+        criticals_json+="\"$(json_escape "$msg")\""
+    done
+    criticals_json+="]"
+
+    # Determine overall status
+    local status="healthy"
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        status="critical"
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        status="warning"
+    fi
+
+    # Generate JSON
+    local json_report='{
+    "report_date": "'"$TODAY"'",
+    "timestamp": "'"$(date -Iseconds)"'",
+    "hostname": "'"$hostname"'",
+    "server_ip": "'"$server_ip"'",
+    "status": "'"$status"'",
+    "summary": {
+        "sites_healthy": '"$SITES_HEALTHY"',
+        "sites_warning": '"$SITES_WARNING"',
+        "sites_critical": '"$SITES_CRITICAL"',
+        "ssl_ok": '"$SSL_OK"',
+        "ssl_warning": '"$SSL_WARNING"',
+        "ssl_critical": '"$SSL_CRITICAL"',
+        "services_ok": '"$SERVICES_OK"',
+        "services_down": '"$SERVICES_DOWN"',
+        "disk_usage_percent": '"$DISK_USAGE_PERCENT"',
+        "memory_usage_percent": '"$MEMORY_USAGE_PERCENT"',
+        "disk_status": "'"$DISK_STATUS"'",
+        "memory_status": "'"$MEMORY_STATUS"'",
+        "backup_status": "'"$BACKUP_STATUS"'",
+        "warnings_count": '"${#WARNINGS[@]}"',
+        "criticals_count": '"${#CRITICALS[@]}"'
+    },
+    "sites": '"$sites_json"',
+    "warnings": '"$warnings_json"',
+    "criticals": '"$criticals_json"'
+}'
+
+    # Save report
+    if command_exists jq; then
+        echo "$json_report" | jq . > "$REPORT_FILE"
+    else
+        echo "$json_report" > "$REPORT_FILE"
+    fi
+
+    if [[ "$JSON_ONLY" == true ]]; then
+        if command_exists jq; then
+            echo "$json_report" | jq .
+        else
+            echo "$json_report"
+        fi
+    fi
+}
+
+generate_text_summary() {
+    local hostname
+    hostname=$(hostname -f 2>/dev/null || hostname)
+    local server_ip
+    server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    local summary=""
+    summary+="JPS Server Health Report\n"
+    summary+="========================\n"
+    summary+="Date: $(date '+%Y-%m-%d %H:%M:%S')\n"
+    summary+="Server: ${hostname} (${server_ip})\n\n"
+
+    summary+="SUMMARY\n"
+    summary+="-------\n"
+    summary+="Sites: ${SITES_HEALTHY} healthy, ${SITES_WARNING} warnings, ${SITES_CRITICAL} critical\n"
+
+    # SSL summary
+    local ssl_summary="SSL: ${SSL_OK} OK"
+    if [[ $SSL_WARNING -gt 0 ]]; then
+        ssl_summary+=", ${SSL_WARNING} expiring soon"
+    fi
+    if [[ $SSL_CRITICAL -gt 0 ]]; then
+        ssl_summary+=", ${SSL_CRITICAL} critical"
+    fi
+    summary+="${ssl_summary}\n"
+
+    summary+="Disk: ${DISK_USAGE_PERCENT}% used (${DISK_STATUS})\n"
+    summary+="Memory: ${MEMORY_USAGE_PERCENT}% used (${MEMORY_STATUS})\n"
+
+    if [[ $SERVICES_DOWN -gt 0 ]]; then
+        summary+="Services: ${SERVICES_DOWN} DOWN!\n"
+    else
+        summary+="Services: All running\n"
+    fi
+
+    summary+="\n"
+
+    # Details
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        summary+="CRITICAL ISSUES\n"
+        summary+="---------------\n"
+        for msg in "${CRITICALS[@]}"; do
+            summary+="* ${msg}\n"
+        done
+        summary+="\n"
+    fi
+
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        summary+="WARNINGS\n"
+        summary+="--------\n"
+        for msg in "${WARNINGS[@]}"; do
+            summary+="* ${msg}\n"
+        done
+        summary+="\n"
+    fi
+
+    summary+="Full report: ${REPORT_FILE}\n"
+
+    echo -e "$summary"
+}
+
+#===============================================================================
+# NOTIFICATION
+#===============================================================================
+
+send_notification() {
+    if [[ "$SKIP_NOTIFY" == true ]]; then
+        return 0
+    fi
+
+    if [[ ! -x "$NOTIFY_SCRIPT" ]]; then
+        warn "jps-notify not found, skipping notification"
+        return 0
+    fi
+
+    # Determine notification type
+    local notify_level=""
+    local emoji=""
+    local subject=""
+
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        notify_level="--critical"
+        emoji="🚨"
+        subject="JPS Daily Monitor: ${#CRITICALS[@]} Critical Issue(s)"
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        notify_level="--warning"
+        emoji="⚠️"
+        subject="JPS Daily Monitor: ${#WARNINGS[@]} Warning(s)"
+    else
+        notify_level="--success"
+        emoji="✅"
+        subject="JPS Daily Monitor: All Systems Healthy"
+    fi
+
+    # Only send if issues found or force flag
+    if [[ ${#CRITICALS[@]} -eq 0 ]] && [[ ${#WARNINGS[@]} -eq 0 ]] && [[ "$FORCE_NOTIFY" != true ]]; then
+        [[ "$VERBOSE" == true ]] && info "All healthy, skipping notification (use --force to send anyway)"
+        return 0
+    fi
+
+    local message
+    message=$(generate_text_summary)
+
+    "$NOTIFY_SCRIPT" $notify_level "$subject" "$message"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Header
+    if [[ "$QUIET" != true ]] && [[ "$JSON_ONLY" != true ]]; then
+        echo "JPS Daily Monitor - $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "=================================================="
+        echo ""
+    fi
+
+    # Run all checks
+    check_disk
+    check_memory
+    check_services
+    check_ssl
+    check_site_validation
+    check_wp_updates
+    check_backup_age
+
+    # Generate reports
+    generate_json_report
+
+    # Send notification
+    if [[ "$JSON_ONLY" != true ]]; then
+        send_notification
+    fi
+
+    # Summary
+    if [[ "$QUIET" != true ]] && [[ "$JSON_ONLY" != true ]]; then
+        echo ""
+        echo "=================================================="
+        echo "Summary: ${#WARNINGS[@]} warnings, ${#CRITICALS[@]} critical"
+        echo "Report saved: ${REPORT_FILE}"
+    fi
+
+    # Determine exit code
+    if [[ ${#CRITICALS[@]} -gt 0 ]]; then
+        exit 2
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        exit 1
+    else
+        exit 0
+    fi
+}
+
+# Run main function
+main "$@"

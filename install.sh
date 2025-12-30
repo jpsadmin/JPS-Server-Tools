@@ -229,6 +229,20 @@ install_files() {
         fi
     fi
 
+    # Copy notify.conf (only if doesn't exist)
+    if [[ ! -f "$INSTALL_DIR/config/notify.conf" ]]; then
+        info "Installing notification configuration..."
+        if [[ -f "${source_dir}/config/notify.conf" ]]; then
+            cp -v "${source_dir}/config/notify.conf" "$INSTALL_DIR/config/"
+        fi
+    else
+        info "Notification config already exists, not overwriting"
+        # Copy as example for reference
+        if [[ -f "${source_dir}/config/notify.conf" ]]; then
+            cp -v "${source_dir}/config/notify.conf" "$INSTALL_DIR/config/notify.conf.example"
+        fi
+    fi
+
     # Make scripts executable
     info "Setting permissions..."
     chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
@@ -253,6 +267,9 @@ create_wrappers() {
         "jps-install-stack"
         "jps-validate-site"
         "jps-db-clean"
+        "jps-notify"
+        "jps-daily-monitor"
+        "jps-monitor-install"
     )
 
     for script in "${scripts[@]}"; do
@@ -287,6 +304,7 @@ setup_logs() {
         "$INSTALL_DIR/logs/audit"
         "$INSTALL_DIR/logs/backup-verify"
         "$INSTALL_DIR/logs/lifecycle"
+        "$INSTALL_DIR/logs/daily-monitor"
     )
 
     for dir in "${log_dirs[@]}"; do
@@ -340,6 +358,9 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-install-stack"
         "$INSTALL_DIR/bin/jps-validate-site"
         "$INSTALL_DIR/bin/jps-db-clean"
+        "$INSTALL_DIR/bin/jps-notify"
+        "$INSTALL_DIR/bin/jps-daily-monitor"
+        "$INSTALL_DIR/bin/jps-monitor-install"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
@@ -366,6 +387,9 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-install-stack"
         "$BIN_LINKS_DIR/jps-validate-site"
         "$BIN_LINKS_DIR/jps-db-clean"
+        "$BIN_LINKS_DIR/jps-notify"
+        "$BIN_LINKS_DIR/jps-daily-monitor"
+        "$BIN_LINKS_DIR/jps-monitor-install"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -450,6 +474,18 @@ ${BOLD}Available Commands:${RESET}
     WordPress database maintenance and cleanup.
     Options: --help, --execute, --all, --json
 
+  ${GREEN}jps-daily-monitor${RESET}
+    Daily health check with notifications.
+    Options: --help, --quiet, --json, --no-notify
+
+  ${GREEN}jps-notify${RESET}
+    Multi-channel notification sender.
+    Options: --help, --test, --email, --discord, --slack
+
+  ${GREEN}jps-monitor-install${RESET}
+    Configure daily monitoring and notifications.
+    Options: --help, --uninstall, --status, --test
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -490,6 +526,9 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-install-stack"
     rm -f "$BIN_LINKS_DIR/jps-validate-site"
     rm -f "$BIN_LINKS_DIR/jps-db-clean"
+    rm -f "$BIN_LINKS_DIR/jps-notify"
+    rm -f "$BIN_LINKS_DIR/jps-daily-monitor"
+    rm -f "$BIN_LINKS_DIR/jps-monitor-install"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

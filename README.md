@@ -11,6 +11,7 @@ JPS Server Tools fills the gap between WordPress management plugins and server a
 - **Site Status**: Quick inventory of all hosted sites with health checks
 - **Health Monitoring**: Silent cron monitoring with alerts only on issues
 - **Site Lifecycle**: Checkpoint, suspend, archive, and safely delete sites
+- **Daily Monitoring**: Automated health checks with email, Discord, and Slack notifications
 
 These are server-level operations that WordPress plugins cannot see or manage.
 
@@ -835,6 +836,203 @@ sudo jps-db-clean example.com --json
 - `1` - Errors occurred during cleanup
 - `2` - Invalid arguments or critical error
 
+### jps-daily-monitor
+
+Comprehensive daily health check with multi-channel notifications.
+
+```
+Usage: jps-daily-monitor [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -v, --verbose       Show detailed output
+  -q, --quiet         Suppress output (for cron)
+  -j, --json          Output results as JSON
+  --no-notify         Skip sending notifications
+```
+
+**Checks Performed:**
+
+| Category | Checks |
+|----------|--------|
+| Sites | WordPress core, wp-config.php, database connection |
+| SSL | Certificate expiry (warning at 14 days, critical at 7 days) |
+| Disk | Usage per partition (warning at 80%, critical at 90%) |
+| Memory | Usage percentage (warning at 85%) |
+| Services | OpenLiteSpeed, MariaDB status |
+| Backups | WPVivid backup age (warning if older than 48 hours) |
+
+**Report Output:**
+
+Reports are saved as JSON files in `/opt/jps-server-tools/logs/daily-monitor/`:
+
+```json
+{
+  "generated": "2024-01-15T06:00:00Z",
+  "hostname": "jps-vps",
+  "summary": {
+    "ok": 15,
+    "warning": 2,
+    "critical": 0,
+    "overall": "warning"
+  },
+  "checks": {
+    "sites": [...],
+    "ssl": [...],
+    "disk": [...],
+    "memory": {...},
+    "services": {...},
+    "backups": [...]
+  }
+}
+```
+
+**Examples:**
+
+```bash
+# Run manual check with verbose output
+sudo jps-daily-monitor --verbose
+
+# Run for cron (quiet, sends notifications)
+sudo jps-daily-monitor --quiet
+
+# Check without sending notifications
+sudo jps-daily-monitor --no-notify
+
+# JSON output for external processing
+sudo jps-daily-monitor --json
+```
+
+**Exit Codes:**
+
+- `0` - All checks OK
+- `1` - Warnings found
+- `2` - Critical issues found
+
+### jps-notify
+
+Multi-channel notification sender supporting email, Discord, and Slack.
+
+```
+Usage: jps-notify [OPTIONS] [MESSAGE]
+       echo "MESSAGE" | jps-notify [OPTIONS]
+       jps-notify --test
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  -t, --test          Send test notification to all channels
+  -s, --subject SUBJ  Email subject line
+  --email             Send email only
+  --discord           Send Discord only
+  --slack             Send Slack only
+  --critical          Mark as critical (red color)
+  --warning           Mark as warning (yellow color)
+  --ok                Mark as OK (green color)
+```
+
+**Configuration:**
+
+Configure channels in `/opt/jps-server-tools/config/notify.conf`:
+
+```ini
+[email]
+enabled=true
+to=admin@example.com
+from=monitor@example.com
+smtp_host=localhost
+
+[discord]
+enabled=true
+webhook_url=https://discord.com/api/webhooks/...
+
+[slack]
+enabled=true
+webhook_url=https://hooks.slack.com/services/...
+```
+
+**Examples:**
+
+```bash
+# Send test notification
+sudo jps-notify --test
+
+# Send message to all channels
+sudo jps-notify "Server backup completed"
+
+# Send critical alert
+sudo jps-notify --critical --subject "CRITICAL: Disk full" "Disk /var is at 95%"
+
+# Send to Discord only
+sudo jps-notify --discord "Deployment complete"
+
+# Pipe input
+echo "Site example.com is down" | sudo jps-notify --warning
+```
+
+**Exit Codes:**
+
+- `0` - Notification sent successfully
+- `1` - One or more channels failed
+- `2` - Invalid arguments or configuration error
+
+### jps-monitor-install
+
+Interactive setup for daily monitoring and notifications.
+
+```
+Usage: jps-monitor-install [OPTIONS]
+
+Options:
+  -h, --help          Show help message
+  -V, --version       Show version
+  --uninstall         Remove cron job and optionally config
+  --status            Show current configuration status
+  --non-interactive   Use config file values, skip prompts
+  --test              Send test notification after setup
+```
+
+**Setup Process:**
+
+1. Checks for required dependencies (curl, mail utilities)
+2. Prompts for email configuration
+3. Prompts for Discord webhook (optional)
+4. Prompts for Slack webhook (optional)
+5. Configures daily cron job time
+6. Writes configuration to notify.conf
+7. Optionally sends test notification
+
+**Examples:**
+
+```bash
+# Interactive setup
+sudo jps-monitor-install
+
+# Check current status
+sudo jps-monitor-install --status
+
+# Remove monitoring
+sudo jps-monitor-install --uninstall
+
+# Non-interactive setup (uses existing config)
+sudo jps-monitor-install --non-interactive
+```
+
+**Cron Job:**
+
+The installer creates a cron job that runs daily (default 6:00 AM):
+
+```
+0 6 * * * /usr/local/bin/jps-daily-monitor --quiet
+```
+
+**Exit Codes:**
+
+- `0` - Setup completed successfully
+- `1` - Error during setup
+- `2` - Invalid arguments
+
 ## Configuration
 
 Edit `/opt/jps-server-tools/config/jps-tools.conf` to customize settings.
@@ -906,6 +1104,9 @@ logs/
 ├── backup-verify/
 │   ├── 2024-01-15.log
 │   └── 2024-01-14.log
+├── daily-monitor/
+│   ├── 2024-01-15-060000.json
+│   └── 2024-01-14-060000.json
 └── lifecycle/
     ├── checkpoint.log
     ├── suspend.log
@@ -1035,14 +1236,19 @@ jps-server-tools/
 │   ├── jps-site-delete     # Safe site deletion
 │   ├── jps-install-stack   # WordPress plugin/theme installer
 │   ├── jps-validate-site   # Post-migration validation
-│   └── jps-db-clean        # Database maintenance
+│   ├── jps-db-clean        # Database maintenance
+│   ├── jps-daily-monitor   # Daily health check with notifications
+│   ├── jps-notify          # Multi-channel notification sender
+│   └── jps-monitor-install # Monitoring setup wizard
 ├── lib/
 │   └── jps-common.sh       # Shared functions library
 ├── config/
-│   └── jps-tools.conf      # Configuration file
+│   ├── jps-tools.conf      # Main configuration file
+│   └── notify.conf         # Notification settings
 ├── logs/
 │   ├── audit/              # Audit JSON snapshots
 │   ├── backup-verify/      # Verification logs
+│   ├── daily-monitor/      # Daily monitor reports
 │   └── lifecycle/          # Lifecycle operation logs
 ├── install.sh              # Installer script
 └── README.md               # This file

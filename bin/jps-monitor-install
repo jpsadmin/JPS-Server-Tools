@@ -1,0 +1,499 @@
+#!/bin/bash
+#===============================================================================
+# JPS Monitor Install - Setup Script for Daily Monitoring
+#
+# Configures notification settings and sets up cron jobs for automated
+# daily monitoring of the JPS server.
+#
+# Usage:
+#   jps-monitor-install              # Interactive setup
+#   jps-monitor-install --uninstall  # Remove cron job
+#   jps-monitor-install --status     # Show current status
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Error
+#   2 - Invalid arguments
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-monitor-install"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+# Paths
+readonly NOTIFY_CONFIG="${INSTALL_DIR}/config/notify.conf"
+readonly CRON_MARKER="# JPS Daily Monitor"
+readonly DAILY_MONITOR="/usr/local/bin/jps-daily-monitor"
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Monitor Install - Setup Script for Daily Monitoring
+
+DESCRIPTION:
+    Interactive setup for JPS daily monitoring. Configures notification
+    settings (email, Discord, Slack) and sets up cron jobs.
+
+USAGE:
+    jps-monitor-install [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    --uninstall         Remove the cron job
+    --status            Show current configuration status
+    --non-interactive   Skip prompts, use config file values
+    --test              Test notification after setup
+
+WHAT IT DOES:
+    1. Checks for required dependencies (mailutils, curl)
+    2. Prompts for email configuration
+    3. Prompts for Discord webhook (optional)
+    4. Prompts for Slack webhook (optional)
+    5. Writes configuration to notify.conf
+    6. Sets up daily cron job (runs at 6:00 AM)
+    7. Optionally sends a test notification
+
+CRON JOB:
+    The script adds a cron job to run jps-daily-monitor daily at 6:00 AM:
+    0 6 * * * /usr/local/bin/jps-daily-monitor --quiet
+
+FILES:
+    Configuration: /opt/jps-server-tools/config/notify.conf
+    Reports: /opt/jps-server-tools/logs/daily-monitor/
+
+EXAMPLES:
+    # Interactive setup
+    jps-monitor-install
+
+    # Check current status
+    jps-monitor-install --status
+
+    # Remove monitoring cron job
+    jps-monitor-install --uninstall
+
+EXIT CODES:
+    0 - Success
+    1 - Error
+    2 - Invalid arguments
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+UNINSTALL=false
+SHOW_STATUS=false
+NON_INTERACTIVE=false
+RUN_TEST=false
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            --uninstall)
+                UNINSTALL=true
+                shift
+                ;;
+            --status)
+                SHOW_STATUS=true
+                shift
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --test)
+                RUN_TEST=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# UTILITY FUNCTIONS
+#===============================================================================
+
+# Check if cron job exists
+cron_job_exists() {
+    crontab -l 2>/dev/null | grep -q "$CRON_MARKER"
+}
+
+# Add cron job
+add_cron_job() {
+    local hour="${1:-6}"
+    local minute="${2:-0}"
+
+    if cron_job_exists; then
+        info "Cron job already exists, updating..."
+        remove_cron_job
+    fi
+
+    # Add new cron job
+    (crontab -l 2>/dev/null || true; echo "${minute} ${hour} * * * ${DAILY_MONITOR} --quiet ${CRON_MARKER}") | crontab -
+
+    success "Cron job added: runs daily at ${hour}:$(printf '%02d' $minute)"
+}
+
+# Remove cron job
+remove_cron_job() {
+    if cron_job_exists; then
+        crontab -l 2>/dev/null | grep -v "$CRON_MARKER" | crontab -
+        success "Cron job removed"
+    else
+        info "No cron job found"
+    fi
+}
+
+# Check dependencies
+check_dependencies() {
+    header "Checking Dependencies"
+
+    local missing=()
+
+    # Required: curl for webhooks
+    if ! command_exists curl; then
+        missing+=("curl")
+    else
+        success "curl is installed"
+    fi
+
+    # Optional: jq for JSON parsing
+    if ! command_exists jq; then
+        warn "jq not installed (optional, for better JSON handling)"
+    else
+        success "jq is installed"
+    fi
+
+    # Email: check for mail utilities
+    local has_mail=false
+    if command_exists mail; then
+        success "mail command available"
+        has_mail=true
+    elif command_exists sendmail; then
+        success "sendmail available"
+        has_mail=true
+    elif command_exists msmtp; then
+        success "msmtp available"
+        has_mail=true
+    fi
+
+    if [[ "$has_mail" == false ]]; then
+        warn "No mail utility found (mail, sendmail, or msmtp)"
+        echo "  Install with: apt install mailutils"
+        echo "  Or: apt install msmtp msmtp-mta"
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required dependencies: ${missing[*]}"
+        echo "Install with: apt install ${missing[*]}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Show current status
+show_status() {
+    header "JPS Daily Monitor Status"
+
+    echo "Configuration file: $NOTIFY_CONFIG"
+    if [[ -f "$NOTIFY_CONFIG" ]]; then
+        success "Config file exists"
+    else
+        warn "Config file not found"
+    fi
+
+    echo ""
+    echo "Email notification:"
+    if grep -q "^\[email\]" "$NOTIFY_CONFIG" 2>/dev/null; then
+        local email_enabled email_to
+        email_enabled=$(grep "^enabled=" "$NOTIFY_CONFIG" 2>/dev/null | head -1 | cut -d= -f2)
+        email_to=$(grep "^to=" "$NOTIFY_CONFIG" 2>/dev/null | head -1 | cut -d= -f2)
+        echo "  Enabled: ${email_enabled:-false}"
+        echo "  Recipient: ${email_to:-not set}"
+    else
+        echo "  Not configured"
+    fi
+
+    echo ""
+    echo "Discord notification:"
+    if grep -q "^\[discord\]" "$NOTIFY_CONFIG" 2>/dev/null; then
+        local discord_enabled
+        discord_enabled=$(sed -n '/^\[discord\]/,/^\[/p' "$NOTIFY_CONFIG" 2>/dev/null | grep "^enabled=" | cut -d= -f2)
+        local discord_url
+        discord_url=$(sed -n '/^\[discord\]/,/^\[/p' "$NOTIFY_CONFIG" 2>/dev/null | grep "^webhook_url=" | cut -d= -f2)
+        echo "  Enabled: ${discord_enabled:-false}"
+        if [[ -n "$discord_url" ]]; then
+            echo "  Webhook: configured"
+        else
+            echo "  Webhook: not set"
+        fi
+    else
+        echo "  Not configured"
+    fi
+
+    echo ""
+    echo "Slack notification:"
+    if grep -q "^\[slack\]" "$NOTIFY_CONFIG" 2>/dev/null; then
+        local slack_enabled
+        slack_enabled=$(sed -n '/^\[slack\]/,/^\[/p' "$NOTIFY_CONFIG" 2>/dev/null | grep "^enabled=" | cut -d= -f2)
+        local slack_url
+        slack_url=$(sed -n '/^\[slack\]/,/^\[/p' "$NOTIFY_CONFIG" 2>/dev/null | grep "^webhook_url=" | cut -d= -f2)
+        echo "  Enabled: ${slack_enabled:-false}"
+        if [[ -n "$slack_url" ]]; then
+            echo "  Webhook: configured"
+        else
+            echo "  Webhook: not set"
+        fi
+    else
+        echo "  Not configured"
+    fi
+
+    echo ""
+    echo "Cron job:"
+    if cron_job_exists; then
+        success "Installed"
+        crontab -l 2>/dev/null | grep "$CRON_MARKER"
+    else
+        warn "Not installed"
+    fi
+
+    echo ""
+    echo "Recent reports:"
+    local report_dir="${LOG_DIR:-/opt/jps-server-tools/logs}/daily-monitor"
+    if [[ -d "$report_dir" ]]; then
+        ls -lt "$report_dir"/*.json 2>/dev/null | head -5 || echo "  No reports found"
+    else
+        echo "  Report directory not found"
+    fi
+}
+
+# Interactive configuration
+configure_interactive() {
+    header "JPS Monitor Setup"
+
+    echo "This wizard will configure daily monitoring and notifications."
+    echo ""
+
+    # Email configuration
+    subheader "Email Configuration"
+    local email_enabled email_to email_from
+
+    if confirm "Enable email notifications?" "y"; then
+        email_enabled="true"
+        email_to=$(prompt_input "Recipient email address" "admin@jpshosting.net")
+        email_from=$(prompt_input "Sender email address" "monitor@jpshosting.net")
+    else
+        email_enabled="false"
+        email_to=""
+        email_from=""
+    fi
+
+    echo ""
+
+    # Discord configuration
+    subheader "Discord Configuration"
+    local discord_enabled discord_url
+
+    if confirm "Enable Discord notifications?" "n"; then
+        discord_enabled="true"
+        echo "Create a webhook at: Server Settings > Integrations > Webhooks"
+        discord_url=$(prompt_input "Discord webhook URL")
+    else
+        discord_enabled="false"
+        discord_url=""
+    fi
+
+    echo ""
+
+    # Slack configuration
+    subheader "Slack Configuration"
+    local slack_enabled slack_url
+
+    if confirm "Enable Slack notifications?" "n"; then
+        slack_enabled="true"
+        echo "Create a webhook at: https://api.slack.com/messaging/webhooks"
+        slack_url=$(prompt_input "Slack webhook URL")
+    else
+        slack_enabled="false"
+        slack_url=""
+    fi
+
+    echo ""
+
+    # Cron schedule
+    subheader "Schedule Configuration"
+    local cron_hour cron_minute
+
+    cron_hour=$(prompt_input "Run daily at hour (0-23)" "6")
+    cron_minute=$(prompt_input "Run at minute (0-59)" "0")
+
+    echo ""
+
+    # Write configuration
+    header "Writing Configuration"
+
+    cat > "$NOTIFY_CONFIG" << EOF
+#===============================================================================
+# JPS Notify Configuration
+# Generated by jps-monitor-install on $(date '+%Y-%m-%d %H:%M:%S')
+#===============================================================================
+
+[email]
+enabled=${email_enabled}
+to=${email_to}
+from=${email_from}
+smtp_host=localhost
+
+[discord]
+enabled=${discord_enabled}
+webhook_url=${discord_url}
+
+[slack]
+enabled=${slack_enabled}
+webhook_url=${slack_url}
+
+[thresholds]
+ssl_warning_days=14
+ssl_critical_days=7
+disk_warning_percent=80
+disk_critical_percent=90
+memory_warning_percent=85
+backup_stale_hours=48
+EOF
+
+    success "Configuration saved to $NOTIFY_CONFIG"
+
+    # Setup cron
+    add_cron_job "$cron_hour" "$cron_minute"
+
+    # Create log directory
+    local report_dir="${LOG_DIR:-/opt/jps-server-tools/logs}/daily-monitor"
+    mkdir -p "$report_dir"
+    success "Report directory created: $report_dir"
+
+    echo ""
+
+    # Test notification
+    if [[ "$RUN_TEST" == true ]] || confirm "Send a test notification now?" "y"; then
+        echo ""
+        header "Testing Notification"
+        local notify_script="${INSTALL_DIR}/bin/jps-notify"
+        if [[ -x "$notify_script" ]]; then
+            "$notify_script" --test
+        else
+            warn "jps-notify not found or not executable"
+        fi
+    fi
+
+    echo ""
+    header "Setup Complete"
+    echo "Daily monitoring is now configured."
+    echo ""
+    echo "Next steps:"
+    echo "  - Run 'jps-daily-monitor' to test the full check"
+    echo "  - Run 'jps-monitor-install --status' to review configuration"
+    echo "  - Reports will be saved to: $report_dir"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Require root
+    require_root
+
+    # Parse arguments
+    parse_args "$@"
+
+    # Handle uninstall
+    if [[ "$UNINSTALL" == true ]]; then
+        header "Uninstalling JPS Daily Monitor"
+        remove_cron_job
+        if confirm "Remove notification configuration?" "n"; then
+            rm -f "$NOTIFY_CONFIG"
+            success "Configuration removed"
+        fi
+        success "Uninstall complete"
+        exit 0
+    fi
+
+    # Handle status
+    if [[ "$SHOW_STATUS" == true ]]; then
+        show_status
+        exit 0
+    fi
+
+    # Check dependencies
+    if ! check_dependencies; then
+        error "Please install missing dependencies and try again"
+        exit 1
+    fi
+
+    # Run interactive configuration
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        # Just setup cron with defaults
+        add_cron_job 6 0
+        success "Cron job configured (non-interactive mode)"
+    else
+        configure_interactive
+    fi
+}
+
+# Run main function
+main "$@"
