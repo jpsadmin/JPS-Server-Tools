@@ -1,0 +1,8 @@
+[2025-12-29 19:50:54] Starting database cleanup for jpshosting.biz
+[2025-12-29 19:50:54] Deleted 648 revisions
+[2025-12-29 19:50:56] Deleted 1 auto-drafts
+[2025-12-29 19:50:56] Deleted 5 trashed posts
+[2025-12-29 19:50:58] Deleted 5 expired transients
+[2025-12-29 19:50:58] Deleted 2962 orphaned postmeta rows
+[2025-12-29 19:51:06] Database tables optimized
+[2025-12-29 19:51:07] Cleanup completed. Before: 235.6 MB, After: 214.2 MB

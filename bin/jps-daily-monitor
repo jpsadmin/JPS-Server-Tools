@@ -289,10 +289,10 @@ check_services() {
     for service in "${services[@]}"; do
         if service_status "$service"; then
             log_result "ok" "Service $service is running"
-            ((SERVICES_OK++))
+            SERVICES_OK=$((SERVICES_OK + 1))
         else
             log_result "crit" "Service $service is not running"
-            ((SERVICES_DOWN++))
+            SERVICES_DOWN=$((SERVICES_DOWN + 1))
         fi
     done
 }
@@ -316,16 +316,16 @@ check_ssl() {
 
         if [[ "$ssl_days" == "-1" ]]; then
             log_result "ok" "SSL for ${domain}: could not check"
-            ((SSL_OK++))
+            SSL_OK=$((SSL_OK + 1))
         elif [[ "$ssl_days" -le "$SSL_CRIT_DAYS" ]]; then
             log_result "crit" "SSL for ${domain} expires in ${ssl_days} days"
-            ((SSL_CRITICAL++))
+            SSL_CRITICAL=$((SSL_CRITICAL + 1))
         elif [[ "$ssl_days" -le "$SSL_WARN_DAYS" ]]; then
             log_result "warn" "SSL for ${domain} expires in ${ssl_days} days"
-            ((SSL_WARNING++))
+            SSL_WARNING=$((SSL_WARNING + 1))
         else
             log_result "ok" "SSL for ${domain}: ${ssl_days} days remaining"
-            ((SSL_OK++))
+            SSL_OK=$((SSL_OK + 1))
         fi
     done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
 }
@@ -365,24 +365,24 @@ check_site_validation() {
 
                 if [[ "$failed" -gt 0 ]]; then
                     log_result "crit" "Site ${domain}: ${failed} validation failures"
-                    ((SITES_CRITICAL++))
+                    SITES_CRITICAL=$((SITES_CRITICAL + 1))
                 elif [[ "$warnings" -gt 0 ]]; then
                     log_result "warn" "Site ${domain}: ${warnings} validation warnings"
-                    ((SITES_WARNING++))
+                    SITES_WARNING=$((SITES_WARNING + 1))
                 else
                     log_result "ok" "Site ${domain}: ${passed} checks passed"
-                    ((SITES_HEALTHY++))
+                    SITES_HEALTHY=$((SITES_HEALTHY + 1))
                 fi
             else
                 # jq not available, just check exit code
                 VALIDATION_MAP["$domain"]="unknown"
                 log_result "ok" "Site ${domain}: validation passed"
-                ((SITES_HEALTHY++))
+                SITES_HEALTHY=$((SITES_HEALTHY + 1))
             fi
         else
             VALIDATION_MAP["$domain"]="error"
             log_result "crit" "Site ${domain}: validation failed"
-            ((SITES_CRITICAL++))
+            SITES_CRITICAL=$((SITES_CRITICAL + 1))
         fi
     done < <(find "$WEBSITES_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
 }
@@ -450,7 +450,7 @@ check_backup_age() {
     while IFS= read -r site_dir; do
         local domain
         domain=$(basename "$site_dir")
-        local checkpoint_dir="${backup_dir}/${domain}"
+        local checkpoint_dir="${backup_dir}/${domain}/checkpoints"
 
         # Find most recent checkpoint
         local latest_checkpoint=""
@@ -468,7 +468,7 @@ check_backup_age() {
         fi
 
         if [[ -z "$latest_checkpoint" ]] || [[ "$latest_time" -eq 0 ]]; then
-            BACKUP_AGE_MAP["$domain"]="none"
+            BACKUP_AGE_MAP["$domain"]="null"
             log_result "warn" "No checkpoint found for ${domain}"
             all_ok=false
         else
