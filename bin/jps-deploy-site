@@ -77,6 +77,9 @@ OPTIONS:
     -e, --email EMAIL       Admin email address (default: admin@jpshosting.net)
     -u, --username USER     WP admin username (auto-generated if not set)
     -t, --title TITLE       Site title (default: domain name)
+    -p, --preset PRESET     Optimization preset to apply after deployment
+                            Options: woo, blog, docs, brochure, none
+                            Default: blog (use 'none' to skip optimization)
     --progress              Output JSON progress updates (for automation)
     --skip-ssl              Skip SSL certificate generation
     --skip-plugins          Skip installing standard plugin stack
@@ -92,13 +95,17 @@ DEPLOYMENT STEPS:
     6. Generate SSL certificate
     7. Set file permissions
     8. Run validation checks
+    9. Apply optimization preset
 
 EXAMPLES:
-    # Basic deployment
+    # Basic deployment (uses 'blog' optimization preset)
     jps-deploy-site -d newsite.example.com
 
-    # With custom admin email
-    jps-deploy-site -d newsite.example.com -e admin@company.com
+    # With WooCommerce optimization for e-commerce sites
+    jps-deploy-site -d store.example.com -e admin@company.com --preset=woo
+
+    # Skip optimization entirely
+    jps-deploy-site -d test.example.com --preset=none
 
     # With JSON progress output (for GUI integration)
     jps-deploy-site -d newsite.example.com --progress
@@ -127,6 +134,7 @@ DOMAIN=""
 ADMIN_EMAIL="admin@jpshosting.net"
 ADMIN_USERNAME=""
 SITE_TITLE=""
+PRESET="blog"  # Default optimization preset
 PROGRESS_OUTPUT=false
 SKIP_SSL=false
 SKIP_PLUGINS=false
@@ -141,7 +149,7 @@ ADMIN_PASS=""
 
 # Progress tracking
 CURRENT_STEP=0
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 
 #===============================================================================
 # ARGUMENT PARSING
@@ -188,6 +196,14 @@ parse_args() {
                     exit 2
                 fi
                 SITE_TITLE="$2"
+                shift 2
+                ;;
+            -p|--preset)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --preset requires a preset name"
+                    exit 2
+                fi
+                PRESET="$2"
                 shift 2
                 ;;
             --progress)
@@ -247,6 +263,16 @@ parse_args() {
     # Set defaults
     [[ -z "$SITE_TITLE" ]] && SITE_TITLE="$DOMAIN"
     [[ -z "$ADMIN_USERNAME" ]] && ADMIN_USERNAME="jpshost"
+
+    # Validate preset (if not 'none')
+    if [[ "$PRESET" != "none" ]]; then
+        local valid_presets="woo blog docs brochure"
+        if ! echo "$valid_presets" | grep -qw "$PRESET"; then
+            error "Invalid preset: $PRESET"
+            echo "Valid presets: woo, blog, docs, brochure, none" >&2
+            exit 2
+        fi
+    fi
 }
 
 #===============================================================================
@@ -664,6 +690,48 @@ step_validate_and_reload() {
     fi
 }
 
+# Step 9: Apply optimization preset
+step_apply_optimization() {
+    # Skip if preset is 'none'
+    if [[ "$PRESET" == "none" ]]; then
+        progress 9 "optimize" "start" "Skipping optimization (--preset=none)"
+        progress 9 "optimize" "complete" "Optimization skipped"
+        return 0
+    fi
+
+    progress 9 "optimize" "start" "Applying ${PRESET} optimization preset"
+
+    # Check if jps-optimize-site is available
+    local optimize_cmd="/usr/local/bin/jps-optimize-site"
+    if [[ ! -x "$optimize_cmd" ]]; then
+        # Try the local installation
+        optimize_cmd="${INSTALL_DIR}/bin/jps-optimize-site"
+    fi
+
+    if [[ ! -x "$optimize_cmd" ]]; then
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            progress 9 "optimize" "error" "jps-optimize-site not found - optimization skipped"
+        else
+            warn "jps-optimize-site not found. Skipping optimization."
+        fi
+        return 0  # Don't fail deployment for missing optimizer
+    fi
+
+    # Apply optimization with backup
+    if "$optimize_cmd" "$DOMAIN" --preset="$PRESET" --backup 2>/dev/null; then
+        progress 9 "optimize" "complete" "Optimization preset '${PRESET}' applied"
+        return 0
+    else
+        # Optimization failed but don't fail deployment
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            progress 9 "optimize" "error" "Optimization failed - site deployed but not optimized"
+        else
+            warn "Optimization failed. Site deployed but not optimized."
+        fi
+        return 0  # Don't fail the whole deployment
+    fi
+}
+
 # Log deployment to lifecycle log
 log_deployment() {
     local status="$1"
@@ -674,7 +742,7 @@ log_deployment() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    echo "[$timestamp] domain=${DOMAIN} status=${status} admin_user=${ADMIN_USERNAME} admin_email=${ADMIN_EMAIL}" >> "$lifecycle_log"
+    echo "[$timestamp] domain=${DOMAIN} status=${status} preset=${PRESET} admin_user=${ADMIN_USERNAME} admin_email=${ADMIN_EMAIL}" >> "$lifecycle_log"
 }
 
 #===============================================================================
@@ -693,6 +761,7 @@ main() {
         header "JPS Site Deployment"
         echo "Domain: $DOMAIN"
         echo "Admin Email: $ADMIN_EMAIL"
+        echo "Optimization: $PRESET"
         echo ""
     fi
 
@@ -727,6 +796,10 @@ main() {
 
     if [[ "$failed" != true ]]; then
         step_validate_and_reload || failed=true
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_apply_optimization || true  # Don't fail deployment for optimization issues
     fi
 
     # Output results
