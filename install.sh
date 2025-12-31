@@ -279,6 +279,7 @@ create_wrappers() {
         "jps-dns-check"
         "jps-deploy-site"
         "jps-optimize-site"
+        "jps-perf-audit"
     )
 
     for script in "${scripts[@]}"; do
@@ -373,6 +374,7 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-dns-check"
         "$INSTALL_DIR/bin/jps-deploy-site"
         "$INSTALL_DIR/bin/jps-optimize-site"
+        "$INSTALL_DIR/bin/jps-perf-audit"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/lib/jps-optimize.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
@@ -406,6 +408,7 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-dns-check"
         "$BIN_LINKS_DIR/jps-deploy-site"
         "$BIN_LINKS_DIR/jps-optimize-site"
+        "$BIN_LINKS_DIR/jps-perf-audit"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -514,6 +517,10 @@ ${BOLD}Available Commands:${RESET}
     Apply optimization presets to WordPress sites.
     Options: --help, --preset, --audit, --json, --list-presets
 
+  ${GREEN}jps-perf-audit${RESET}
+    Run PageSpeed Insights performance audits.
+    Options: --help, --all, --strategy, --json, --save, --compare
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -560,6 +567,7 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-dns-check"
     rm -f "$BIN_LINKS_DIR/jps-deploy-site"
     rm -f "$BIN_LINKS_DIR/jps-optimize-site"
+    rm -f "$BIN_LINKS_DIR/jps-perf-audit"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

@@ -1,0 +1,820 @@
+#!/bin/bash
+#===============================================================================
+# JPS Performance Audit - PageSpeed Insights Integration
+#
+# Runs performance audits on WordPress sites using Google PageSpeed Insights API.
+# Provides scores for Performance, Accessibility, Best Practices, and SEO.
+#
+# Usage:
+#   jps-perf-audit example.com                    # Audit single site
+#   jps-perf-audit example.com --strategy desktop # Desktop audit
+#   jps-perf-audit --all                          # Audit all sites
+#   jps-perf-audit example.com --save             # Save report
+#
+# Exit Codes:
+#   0 - Good (performance score 90+)
+#   1 - Needs improvement (score 50-89)
+#   2 - Poor (score < 50) or error
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-perf-audit"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+# PageSpeed Insights API endpoint
+readonly PSI_API="https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+
+# Default values
+DOMAIN=""
+STRATEGY="mobile"
+ALL_SITES=false
+SAVE_REPORT=false
+JSON_OUTPUT=false
+COMPARE_MODE=false
+QUIET=false
+VERBOSE=false
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Performance Audit - PageSpeed Insights Integration
+
+DESCRIPTION:
+    Runs performance audits on WordPress sites using Google PageSpeed Insights.
+    Provides scores for Performance, Accessibility, Best Practices, and SEO,
+    along with Core Web Vitals metrics.
+
+USAGE:
+    jps-perf-audit [OPTIONS] [DOMAIN]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -a, --all               Audit all active sites
+    -s, --strategy STRATEGY Test strategy: mobile (default) or desktop
+    --save                  Save report to site's perf/ directory
+    --json                  Output in JSON format
+    --compare               Compare with previous audit (requires saved history)
+    -q, --quiet             Minimal output (scores only)
+    -v, --verbose           Show detailed output including recommendations
+
+EXAMPLES:
+    # Audit a single site (mobile)
+    jps-perf-audit example.com
+
+    # Desktop audit with saved report
+    jps-perf-audit example.com --strategy desktop --save
+
+    # Audit all sites with JSON output
+    jps-perf-audit --all --json
+
+    # Compare with previous audit
+    jps-perf-audit example.com --compare
+
+OUTPUT METRICS:
+    Performance Score     Overall performance rating (0-100)
+    Accessibility Score   Accessibility compliance (0-100)
+    Best Practices Score  Web development best practices (0-100)
+    SEO Score             Search engine optimization (0-100)
+
+CORE WEB VITALS:
+    FCP  First Contentful Paint   Time to first content render
+    LCP  Largest Contentful Paint Time to largest element render
+    TBT  Total Blocking Time      Main thread blocking time
+    CLS  Cumulative Layout Shift  Visual stability measure
+    SI   Speed Index              Visual progress speed
+
+EXIT CODES:
+    0 - Good (performance score 90+)
+    1 - Needs improvement (score 50-89)
+    2 - Poor (score < 50) or error
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -a|--all)
+                ALL_SITES=true
+                shift
+                ;;
+            -s|--strategy)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --strategy requires a value (mobile or desktop)"
+                    exit 2
+                fi
+                STRATEGY="$2"
+                if [[ "$STRATEGY" != "mobile" && "$STRATEGY" != "desktop" ]]; then
+                    error "Invalid strategy: $STRATEGY. Use 'mobile' or 'desktop'"
+                    exit 2
+                fi
+                shift 2
+                ;;
+            --save)
+                SAVE_REPORT=true
+                shift
+                ;;
+            --json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            --compare)
+                COMPARE_MODE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ "$ALL_SITES" == false && -z "$DOMAIN" ]]; then
+        error "Domain name is required (or use --all for all sites)"
+        echo "Usage: $SCRIPT_NAME [OPTIONS] DOMAIN"
+        exit 2
+    fi
+
+    # Normalize domain
+    if [[ -n "$DOMAIN" ]]; then
+        DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')
+    fi
+}
+
+#===============================================================================
+# UTILITY FUNCTIONS
+#===============================================================================
+
+# Check if jq is available
+check_dependencies() {
+    if ! command_exists jq; then
+        error "jq is required for JSON parsing. Install with: apt install jq"
+        exit 2
+    fi
+    if ! command_exists curl; then
+        error "curl is required for API requests. Install with: apt install curl"
+        exit 2
+    fi
+}
+
+# Get rating for a metric value
+get_rating() {
+    local value="$1"
+    local good_threshold="$2"
+    local poor_threshold="$3"
+
+    if (( $(echo "$value <= $good_threshold" | bc -l) )); then
+        echo "good"
+    elif (( $(echo "$value <= $poor_threshold" | bc -l) )); then
+        echo "needs_improvement"
+    else
+        echo "poor"
+    fi
+}
+
+# Format score with color bar
+format_score_bar() {
+    local score="$1"
+    local width=20
+    local filled=$((score * width / 100))
+    local empty=$((width - filled))
+
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    echo "$bar"
+}
+
+# Get color code for score
+get_score_color() {
+    local score="$1"
+    if [[ $score -ge 90 ]]; then
+        echo "$GREEN"
+    elif [[ $score -ge 50 ]]; then
+        echo "$YELLOW"
+    else
+        echo "$RED"
+    fi
+}
+
+# Format time value
+format_time() {
+    local ms="$1"
+    if (( $(echo "$ms >= 1000" | bc -l) )); then
+        printf "%.1fs" "$(echo "$ms / 1000" | bc -l)"
+    else
+        printf "%.0fms" "$ms"
+    fi
+}
+
+#===============================================================================
+# PAGESPEED INSIGHTS API
+#===============================================================================
+
+# Run PageSpeed Insights audit
+run_psi_audit() {
+    local domain="$1"
+    local url="https://${domain}"
+
+    # Build API request URL
+    local request_url="${PSI_API}?url=$(urlencode "$url")&strategy=${STRATEGY}"
+    request_url+="&category=performance&category=accessibility&category=best-practices&category=seo"
+
+    # Make API request
+    local response
+    local http_code
+
+    # Use curl with timeout and error handling
+    response=$(curl -s -w "\n%{http_code}" --max-time 120 "$request_url" 2>/dev/null) || {
+        error "Failed to connect to PageSpeed Insights API"
+        return 1
+    }
+
+    # Extract HTTP status code
+    http_code=$(echo "$response" | tail -n1)
+    response=$(echo "$response" | sed '$d')
+
+    # Check for API errors
+    if [[ "$http_code" != "200" ]]; then
+        local api_error
+        api_error=$(echo "$response" | jq -r '.error.message // "Unknown error"' 2>/dev/null)
+        error "API error ($http_code): $api_error"
+        return 1
+    fi
+
+    echo "$response"
+}
+
+# URL encode function
+urlencode() {
+    local string="$1"
+    python3 -c "import urllib.parse; print(urllib.parse.quote('$string', safe=''))" 2>/dev/null || \
+    echo "$string" | sed 's/:/%3A/g; s/\//%2F/g; s/?/%3F/g; s/&/%26/g; s/=/%3D/g'
+}
+
+# Parse audit results
+parse_audit_results() {
+    local response="$1"
+
+    # Extract scores (multiply by 100 for percentage)
+    local perf_score acc_score bp_score seo_score
+    perf_score=$(echo "$response" | jq -r '.lighthouseResult.categories.performance.score * 100 | floor')
+    acc_score=$(echo "$response" | jq -r '.lighthouseResult.categories.accessibility.score * 100 | floor')
+    bp_score=$(echo "$response" | jq -r '(.lighthouseResult.categories."best-practices".score // 0) * 100 | floor')
+    seo_score=$(echo "$response" | jq -r '.lighthouseResult.categories.seo.score * 100 | floor')
+
+    # Extract Core Web Vitals
+    local fcp lcp tbt cls si
+    fcp=$(echo "$response" | jq -r '.lighthouseResult.audits."first-contentful-paint".numericValue // 0')
+    lcp=$(echo "$response" | jq -r '.lighthouseResult.audits."largest-contentful-paint".numericValue // 0')
+    tbt=$(echo "$response" | jq -r '.lighthouseResult.audits."total-blocking-time".numericValue // 0')
+    cls=$(echo "$response" | jq -r '.lighthouseResult.audits."cumulative-layout-shift".numericValue // 0')
+    si=$(echo "$response" | jq -r '.lighthouseResult.audits."speed-index".numericValue // 0')
+
+    # Extract recommendations (top 5 opportunities)
+    local recommendations
+    recommendations=$(echo "$response" | jq -r '
+        .lighthouseResult.audits
+        | to_entries
+        | map(select(.value.details.type == "opportunity" and .value.score != null and .value.score < 1))
+        | sort_by(.value.score)
+        | .[0:5]
+        | .[].value.title
+    ' 2>/dev/null | head -5)
+
+    # Build result object
+    cat << EOF
+{
+    "domain": "$DOMAIN",
+    "strategy": "$STRATEGY",
+    "timestamp": "$(date -Iseconds)",
+    "scores": {
+        "performance": $perf_score,
+        "accessibility": $acc_score,
+        "best_practices": $bp_score,
+        "seo": $seo_score
+    },
+    "metrics": {
+        "fcp": $fcp,
+        "lcp": $lcp,
+        "tbt": $tbt,
+        "cls": $cls,
+        "speed_index": $si
+    },
+    "recommendations": $(echo "$recommendations" | jq -R -s 'split("\n") | map(select(length > 0))')
+}
+EOF
+}
+
+#===============================================================================
+# OUTPUT FORMATTING
+#===============================================================================
+
+# Output results in human-readable format
+output_human() {
+    local result="$1"
+    local domain strategy timestamp
+    local perf_score acc_score bp_score seo_score
+    local fcp lcp tbt cls si
+
+    # Parse JSON result
+    domain=$(echo "$result" | jq -r '.domain')
+    strategy=$(echo "$result" | jq -r '.strategy')
+    timestamp=$(echo "$result" | jq -r '.timestamp')
+
+    perf_score=$(echo "$result" | jq -r '.scores.performance')
+    acc_score=$(echo "$result" | jq -r '.scores.accessibility')
+    bp_score=$(echo "$result" | jq -r '.scores.best_practices')
+    seo_score=$(echo "$result" | jq -r '.scores.seo')
+
+    fcp=$(echo "$result" | jq -r '.metrics.fcp')
+    lcp=$(echo "$result" | jq -r '.metrics.lcp')
+    tbt=$(echo "$result" | jq -r '.metrics.tbt')
+    cls=$(echo "$result" | jq -r '.metrics.cls')
+    si=$(echo "$result" | jq -r '.metrics.speed_index')
+
+    # Quiet mode - just scores
+    if [[ "$QUIET" == true ]]; then
+        echo "$domain: Performance=$perf_score Accessibility=$acc_score Best-Practices=$bp_score SEO=$seo_score"
+        return
+    fi
+
+    # Full output
+    echo ""
+    echo "=== Performance Audit: $domain ==="
+    echo "Strategy: ${strategy^}"
+    echo "Timestamp: $(date -d "$timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$timestamp")"
+    echo ""
+
+    # Scores section
+    echo "SCORES:"
+    local perf_color acc_color bp_color seo_color
+    perf_color=$(get_score_color "$perf_score")
+    acc_color=$(get_score_color "$acc_score")
+    bp_color=$(get_score_color "$bp_score")
+    seo_color=$(get_score_color "$seo_score")
+
+    printf "  Performance:    %s%3d/100%s  %s\n" "$perf_color" "$perf_score" "$RESET" "$(format_score_bar "$perf_score")"
+    printf "  Accessibility:  %s%3d/100%s  %s\n" "$acc_color" "$acc_score" "$RESET" "$(format_score_bar "$acc_score")"
+    printf "  Best Practices: %s%3d/100%s  %s\n" "$bp_color" "$bp_score" "$RESET" "$(format_score_bar "$bp_score")"
+    printf "  SEO:            %s%3d/100%s  %s\n" "$seo_color" "$seo_score" "$RESET" "$(format_score_bar "$seo_score")"
+    echo ""
+
+    # Core Web Vitals
+    echo "CORE WEB VITALS:"
+
+    # FCP - Good: <1.8s, Poor: >3s
+    local fcp_rating fcp_icon
+    fcp_rating=$(get_rating "$fcp" 1800 3000)
+    case "$fcp_rating" in
+        good) fcp_icon="${GREEN}✓ Good${RESET}" ;;
+        needs_improvement) fcp_icon="${YELLOW}○ Needs Improvement${RESET}" ;;
+        poor) fcp_icon="${RED}✗ Poor${RESET}" ;;
+    esac
+    printf "  First Contentful Paint (FCP):   %-8s %s\n" "$(format_time "$fcp")" "$fcp_icon"
+
+    # LCP - Good: <2.5s, Poor: >4s
+    local lcp_rating lcp_icon
+    lcp_rating=$(get_rating "$lcp" 2500 4000)
+    case "$lcp_rating" in
+        good) lcp_icon="${GREEN}✓ Good${RESET}" ;;
+        needs_improvement) lcp_icon="${YELLOW}○ Needs Improvement${RESET}" ;;
+        poor) lcp_icon="${RED}✗ Poor${RESET}" ;;
+    esac
+    printf "  Largest Contentful Paint (LCP): %-8s %s\n" "$(format_time "$lcp")" "$lcp_icon"
+
+    # TBT - Good: <200ms, Poor: >600ms
+    local tbt_rating tbt_icon
+    tbt_rating=$(get_rating "$tbt" 200 600)
+    case "$tbt_rating" in
+        good) tbt_icon="${GREEN}✓ Good${RESET}" ;;
+        needs_improvement) tbt_icon="${YELLOW}○ Needs Improvement${RESET}" ;;
+        poor) tbt_icon="${RED}✗ Poor${RESET}" ;;
+    esac
+    printf "  Total Blocking Time (TBT):      %-8s %s\n" "$(format_time "$tbt")" "$tbt_icon"
+
+    # CLS - Good: <0.1, Poor: >0.25
+    local cls_rating cls_icon
+    cls_rating=$(get_rating "$cls" 0.1 0.25)
+    case "$cls_rating" in
+        good) cls_icon="${GREEN}✓ Good${RESET}" ;;
+        needs_improvement) cls_icon="${YELLOW}○ Needs Improvement${RESET}" ;;
+        poor) cls_icon="${RED}✗ Poor${RESET}" ;;
+    esac
+    printf "  Cumulative Layout Shift (CLS):  %-8.3f %s\n" "$cls" "$cls_icon"
+
+    # Speed Index - Good: <3.4s, Poor: >5.8s
+    local si_rating si_icon
+    si_rating=$(get_rating "$si" 3400 5800)
+    case "$si_rating" in
+        good) si_icon="${GREEN}✓ Good${RESET}" ;;
+        needs_improvement) si_icon="${YELLOW}○ Needs Improvement${RESET}" ;;
+        poor) si_icon="${RED}✗ Poor${RESET}" ;;
+    esac
+    printf "  Speed Index:                    %-8s %s\n" "$(format_time "$si")" "$si_icon"
+
+    # Recommendations (verbose mode)
+    if [[ "$VERBOSE" == true ]]; then
+        echo ""
+        echo "RECOMMENDATIONS:"
+        local recommendations
+        recommendations=$(echo "$result" | jq -r '.recommendations[]' 2>/dev/null)
+        if [[ -n "$recommendations" ]]; then
+            echo "$recommendations" | while read -r rec; do
+                echo "  • $rec"
+            done
+        else
+            echo "  No critical recommendations"
+        fi
+    fi
+
+    echo ""
+}
+
+# Output results in JSON format
+output_json() {
+    local result="$1"
+    echo "$result" | jq .
+}
+
+#===============================================================================
+# REPORT MANAGEMENT
+#===============================================================================
+
+# Save report to site directory
+save_report() {
+    local domain="$1"
+    local result="$2"
+
+    local site_dir="${WEBSITES_ROOT}/${domain}"
+    local perf_dir="${site_dir}/perf"
+    local timestamp
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    local report_file="${perf_dir}/audit-${STRATEGY}-${timestamp}.json"
+
+    # Create perf directory if needed
+    if [[ ! -d "$perf_dir" ]]; then
+        mkdir -p "$perf_dir"
+        chown nobody:nogroup "$perf_dir" 2>/dev/null || true
+    fi
+
+    # Save report
+    echo "$result" | jq . > "$report_file"
+
+    # Create/update latest symlink
+    ln -sf "$(basename "$report_file")" "${perf_dir}/latest-${STRATEGY}.json"
+
+    if [[ "$JSON_OUTPUT" != true && "$QUIET" != true ]]; then
+        info "Report saved: $report_file"
+    fi
+}
+
+# Get previous report for comparison
+get_previous_report() {
+    local domain="$1"
+    local perf_dir="${WEBSITES_ROOT}/${domain}/perf"
+    local latest_link="${perf_dir}/latest-${STRATEGY}.json"
+
+    if [[ -L "$latest_link" && -f "$latest_link" ]]; then
+        cat "$latest_link"
+    else
+        echo ""
+    fi
+}
+
+# Compare current with previous audit
+compare_audits() {
+    local current="$1"
+    local previous="$2"
+
+    if [[ -z "$previous" ]]; then
+        warn "No previous audit found for comparison"
+        return
+    fi
+
+    echo ""
+    echo "COMPARISON WITH PREVIOUS AUDIT:"
+    echo ""
+
+    # Compare scores
+    local curr_perf prev_perf diff_perf
+    local curr_acc prev_acc diff_acc
+    local curr_bp prev_bp diff_bp
+    local curr_seo prev_seo diff_seo
+
+    curr_perf=$(echo "$current" | jq -r '.scores.performance')
+    prev_perf=$(echo "$previous" | jq -r '.scores.performance')
+    diff_perf=$((curr_perf - prev_perf))
+
+    curr_acc=$(echo "$current" | jq -r '.scores.accessibility')
+    prev_acc=$(echo "$previous" | jq -r '.scores.accessibility')
+    diff_acc=$((curr_acc - prev_acc))
+
+    curr_bp=$(echo "$current" | jq -r '.scores.best_practices')
+    prev_bp=$(echo "$previous" | jq -r '.scores.best_practices')
+    diff_bp=$((curr_bp - prev_bp))
+
+    curr_seo=$(echo "$current" | jq -r '.scores.seo')
+    prev_seo=$(echo "$previous" | jq -r '.scores.seo')
+    diff_seo=$((curr_seo - prev_seo))
+
+    # Format differences
+    format_diff() {
+        local diff="$1"
+        if [[ $diff -gt 0 ]]; then
+            echo "${GREEN}+${diff}${RESET}"
+        elif [[ $diff -lt 0 ]]; then
+            echo "${RED}${diff}${RESET}"
+        else
+            echo "="
+        fi
+    }
+
+    printf "  Performance:    %3d -> %3d  (%s)\n" "$prev_perf" "$curr_perf" "$(format_diff "$diff_perf")"
+    printf "  Accessibility:  %3d -> %3d  (%s)\n" "$prev_acc" "$curr_acc" "$(format_diff "$diff_acc")"
+    printf "  Best Practices: %3d -> %3d  (%s)\n" "$prev_bp" "$curr_bp" "$(format_diff "$diff_bp")"
+    printf "  SEO:            %3d -> %3d  (%s)\n" "$prev_seo" "$curr_seo" "$(format_diff "$diff_seo")"
+
+    # Previous audit date
+    local prev_timestamp
+    prev_timestamp=$(echo "$previous" | jq -r '.timestamp')
+    echo ""
+    echo "  Previous audit: $(date -d "$prev_timestamp" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$prev_timestamp")"
+}
+
+#===============================================================================
+# SITE DISCOVERY
+#===============================================================================
+
+# Get list of all active sites
+get_all_sites() {
+    local sites=()
+
+    if [[ -d "$WEBSITES_ROOT" ]]; then
+        for site_dir in "$WEBSITES_ROOT"/*/; do
+            local domain
+            domain=$(basename "$site_dir")
+
+            # Skip if not a valid site (check for html directory)
+            [[ -d "${site_dir}html" ]] || continue
+
+            # Skip suspended sites
+            [[ -f "${site_dir}.suspended" ]] && continue
+
+            sites+=("$domain")
+        done
+    fi
+
+    printf '%s\n' "${sites[@]}"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+# Audit a single site
+audit_site() {
+    local domain="$1"
+
+    # Check if site exists
+    if [[ ! -d "${WEBSITES_ROOT}/${domain}" ]]; then
+        error "Site not found: $domain"
+        return 2
+    fi
+
+    # Get previous report for comparison (if requested)
+    local previous_report=""
+    if [[ "$COMPARE_MODE" == true ]]; then
+        previous_report=$(get_previous_report "$domain")
+    fi
+
+    # Run audit
+    if [[ "$JSON_OUTPUT" != true && "$QUIET" != true ]]; then
+        info "Running PageSpeed Insights audit for $domain (${STRATEGY})..."
+    fi
+
+    local response
+    response=$(run_psi_audit "$domain") || return 2
+
+    # Parse results
+    local result
+    result=$(parse_audit_results "$response")
+
+    # Output results
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        output_json "$result"
+    else
+        output_human "$result"
+
+        # Show comparison if requested
+        if [[ "$COMPARE_MODE" == true && -n "$previous_report" ]]; then
+            compare_audits "$result" "$previous_report"
+        fi
+    fi
+
+    # Save report if requested
+    if [[ "$SAVE_REPORT" == true ]]; then
+        save_report "$domain" "$result"
+    fi
+
+    # Return exit code based on performance score
+    local perf_score
+    perf_score=$(echo "$result" | jq -r '.scores.performance')
+
+    if [[ $perf_score -ge 90 ]]; then
+        return 0  # Good
+    elif [[ $perf_score -ge 50 ]]; then
+        return 1  # Needs improvement
+    else
+        return 2  # Poor
+    fi
+}
+
+# Audit all sites
+audit_all_sites() {
+    local sites
+    mapfile -t sites < <(get_all_sites)
+
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        error "No sites found in $WEBSITES_ROOT"
+        return 2
+    fi
+
+    local all_results=()
+    local total=${#sites[@]}
+    local current=0
+    local good=0
+    local needs_improvement=0
+    local poor=0
+
+    if [[ "$JSON_OUTPUT" != true ]]; then
+        header "JPS Performance Audit - All Sites"
+        echo "Strategy: ${STRATEGY^}"
+        echo "Total sites: $total"
+        echo ""
+    fi
+
+    for domain in "${sites[@]}"; do
+        ((current++))
+
+        if [[ "$JSON_OUTPUT" != true && "$QUIET" != true ]]; then
+            echo "[$current/$total] Auditing $domain..."
+        fi
+
+        # Run audit with rate limiting (PSI has rate limits)
+        local response result
+        response=$(run_psi_audit "$domain" 2>/dev/null) || {
+            if [[ "$JSON_OUTPUT" != true ]]; then
+                warn "Failed to audit $domain"
+            fi
+            continue
+        }
+
+        result=$(parse_audit_results "$response")
+        all_results+=("$result")
+
+        # Track scores
+        local perf_score
+        perf_score=$(echo "$result" | jq -r '.scores.performance')
+
+        if [[ $perf_score -ge 90 ]]; then
+            ((good++))
+        elif [[ $perf_score -ge 50 ]]; then
+            ((needs_improvement++))
+        else
+            ((poor++))
+        fi
+
+        # Output individual result
+        if [[ "$JSON_OUTPUT" != true ]]; then
+            if [[ "$QUIET" == true ]]; then
+                output_human "$result"
+            else
+                output_human "$result"
+            fi
+        fi
+
+        # Save if requested
+        if [[ "$SAVE_REPORT" == true ]]; then
+            save_report "$domain" "$result"
+        fi
+
+        # Rate limiting - wait between requests
+        if [[ $current -lt $total ]]; then
+            sleep 2
+        fi
+    done
+
+    # Output summary
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        # JSON array output
+        echo "["
+        local first=true
+        for result in "${all_results[@]}"; do
+            if [[ "$first" == true ]]; then
+                first=false
+            else
+                echo ","
+            fi
+            echo "$result"
+        done
+        echo "]"
+    else
+        echo ""
+        echo "=== Summary ==="
+        echo "Total sites audited: ${#all_results[@]}"
+        printf "  ${GREEN}Good (90+):${RESET}              %d\n" "$good"
+        printf "  ${YELLOW}Needs Improvement (50-89):${RESET} %d\n" "$needs_improvement"
+        printf "  ${RED}Poor (<50):${RESET}              %d\n" "$poor"
+    fi
+}
+
+main() {
+    # Parse arguments
+    parse_args "$@"
+
+    # Check dependencies
+    check_dependencies
+
+    # Run audit(s)
+    if [[ "$ALL_SITES" == true ]]; then
+        audit_all_sites
+    else
+        audit_site "$DOMAIN"
+    fi
+}
+
+# Run main function
+main "$@"
