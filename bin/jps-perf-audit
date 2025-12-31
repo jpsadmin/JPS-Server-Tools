@@ -57,6 +57,12 @@ load_config
 # PageSpeed Insights API endpoint
 readonly PSI_API="https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
+# Load PageSpeed API key from config if available (optional - higher rate limits)
+PAGESPEED_API_KEY=""
+if [[ -f "${INSTALL_DIR}/config/jps-tools.conf" ]]; then
+    PAGESPEED_API_KEY=$(grep "^PAGESPEED_API_KEY=" "${INSTALL_DIR}/config/jps-tools.conf" 2>/dev/null | cut -d'"' -f2 || true)
+fi
+
 # Default values
 DOMAIN=""
 STRATEGY="mobile"
@@ -291,6 +297,11 @@ run_psi_audit() {
     # Build API request URL
     local request_url="${PSI_API}?url=$(urlencode "$url")&strategy=${STRATEGY}"
     request_url+="&category=performance&category=accessibility&category=best-practices&category=seo"
+
+    # Add API key if configured (provides higher rate limits)
+    if [[ -n "$PAGESPEED_API_KEY" ]]; then
+        request_url+="&key=${PAGESPEED_API_KEY}"
+    fi
 
     # Make API request
     local response
