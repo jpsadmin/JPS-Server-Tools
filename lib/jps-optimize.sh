@@ -9,9 +9,9 @@
 readonly _JPS_OPTIMIZE_LOADED=1
 
 # Source common library if not already loaded
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPTIMIZE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=jps-common.sh
-source "${SCRIPT_DIR}/jps-common.sh" 2>/dev/null || {
+source "${OPTIMIZE_SCRIPT_DIR}/jps-common.sh" 2>/dev/null || {
     echo "ERROR: Cannot load jps-common.sh" >&2
     exit 1
 }

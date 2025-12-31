@@ -701,6 +701,11 @@ step_apply_optimization() {
 
     progress 9 "optimize" "start" "Applying ${PRESET} optimization preset"
 
+    local doc_root="${WEBSITES_ROOT}/${DOMAIN}/html"
+
+    # Install and activate LiteSpeed Cache plugin (required for optimization)
+    wp plugin install litespeed-cache --activate --allow-root --path="$doc_root" 2>/dev/null || true
+
     # Check if jps-optimize-site is available
     local optimize_cmd="/usr/local/bin/jps-optimize-site"
     if [[ ! -x "$optimize_cmd" ]]; then
