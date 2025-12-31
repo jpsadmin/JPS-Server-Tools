@@ -1,0 +1,550 @@
+#!/bin/bash
+#===============================================================================
+# JPS Optimize Site - WordPress Performance Optimization
+#
+# Applies optimization presets to WordPress sites by configuring PHP settings
+# in vhconf.conf and LiteSpeed Cache plugin settings.
+#
+# Usage:
+#   jps-optimize-site example.com --preset=woo
+#   jps-optimize-site example.com --preset=blog --audit
+#   jps-optimize-site example.com --preset=woo --json
+#
+# Exit Codes:
+#   0 - Optimization completed successfully
+#   1 - Error during optimization
+#   2 - Invalid arguments or domain not found
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-optimize-site"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[CRIT] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Source optimization library
+if [[ -f "${INSTALL_DIR}/lib/jps-optimize.sh" ]]; then
+    # shellcheck source=../lib/jps-optimize.sh
+    source "${INSTALL_DIR}/lib/jps-optimize.sh"
+else
+    echo "[CRIT] Cannot find jps-optimize.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Optimize Site - WordPress Performance Optimization
+
+DESCRIPTION:
+    Applies optimization presets to WordPress sites by configuring
+    PHP settings and LiteSpeed Cache plugin.
+
+USAGE:
+    jps-optimize-site <domain> [OPTIONS]
+
+ARGUMENTS:
+    domain              The domain to optimize (e.g., example.com)
+
+OPTIONS:
+    -h, --help          Show this help message
+    -V, --version       Show version information
+    -v, --verbose       Show detailed progress
+    -p, --preset NAME   Apply preset (woo, blog, docs, brochure)
+    -a, --audit         Verify settings after applying
+    -j, --json          Output results in JSON format
+    -l, --list-presets  List available presets
+    --dry-run           Show what would be changed without applying
+    --php-only          Only apply PHP settings (skip LiteSpeed Cache)
+    --cache-only        Only apply LiteSpeed Cache settings (skip PHP)
+    --purge             Purge LiteSpeed Cache after optimization
+    --backup            Backup vhconf.conf before modifying
+
+PRESETS:
+    woo                 WooCommerce e-commerce (high memory, long timeouts)
+    blog                Content-focused blogs (balanced settings)
+    docs                Documentation sites (lightweight)
+    brochure            Simple brochure sites (minimal resources)
+
+EXAMPLES:
+    # Apply WooCommerce preset
+    jps-optimize-site example.com --preset=woo
+
+    # Apply preset and verify settings
+    jps-optimize-site example.com --preset=blog --audit
+
+    # Preview changes without applying
+    jps-optimize-site example.com --preset=woo --dry-run
+
+    # Output JSON report
+    jps-optimize-site example.com --preset=woo --json
+
+    # List available presets
+    jps-optimize-site --list-presets
+
+EXIT CODES:
+    0 - Optimization completed successfully
+    1 - Error during optimization
+    2 - Invalid arguments or domain not found
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+# Options
+DOMAIN=""
+PRESET=""
+VERBOSE=false
+AUDIT=false
+JSON_OUTPUT=false
+LIST_PRESETS=false
+DRY_RUN=false
+PHP_ONLY=false
+CACHE_ONLY=false
+PURGE_CACHE=false
+BACKUP=false
+
+# Paths (set after domain is known)
+SITE_DIR=""
+DOC_ROOT=""
+VHOST_DIR=""
+VHCONF_FILE=""
+PRESET_FILE=""
+
+#===============================================================================
+# LOGGING
+#===============================================================================
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        info "$*"
+    fi
+}
+
+log_action() {
+    if [[ "$JSON_OUTPUT" != true ]]; then
+        echo -e "${COLOR_CYAN}>>>${COLOR_RESET} $*"
+    fi
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -p|--preset)
+                PRESET="$2"
+                shift 2
+                ;;
+            --preset=*)
+                PRESET="${1#*=}"
+                shift
+                ;;
+            -a|--audit)
+                AUDIT=true
+                shift
+                ;;
+            -j|--json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            -l|--list-presets)
+                LIST_PRESETS=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --php-only)
+                PHP_ONLY=true
+                shift
+                ;;
+            --cache-only)
+                CACHE_ONLY=true
+                shift
+                ;;
+            --purge)
+                PURGE_CACHE=true
+                shift
+                ;;
+            --backup)
+                BACKUP=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# VALIDATION
+#===============================================================================
+
+validate_inputs() {
+    # Handle list presets (doesn't need domain)
+    if [[ "$LIST_PRESETS" == true ]]; then
+        return 0
+    fi
+
+    # Require domain
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required"
+        echo "Usage: jps-optimize-site <domain> --preset=<name>"
+        exit 2
+    fi
+
+    # Require preset
+    if [[ -z "$PRESET" ]]; then
+        error "Preset is required"
+        echo "Available presets: woo, blog, docs, brochure"
+        echo "Usage: jps-optimize-site <domain> --preset=<name>"
+        exit 2
+    fi
+
+    # Set paths based on domain
+    SITE_DIR="${WEBSITES_ROOT}/${DOMAIN}"
+    DOC_ROOT="${SITE_DIR}/html"
+    VHOST_DIR="${VHOSTS_DIR}/${DOMAIN}"
+    VHCONF_FILE="${VHOST_DIR}/vhconf.conf"
+
+    # Validate domain exists
+    if [[ ! -d "$SITE_DIR" ]]; then
+        error "Site directory not found: $SITE_DIR"
+        exit 2
+    fi
+
+    # Validate vhconf exists
+    if [[ ! -f "$VHCONF_FILE" ]]; then
+        error "vhconf.conf not found: $VHCONF_FILE"
+        exit 2
+    fi
+
+    # Validate preset exists
+    PRESET_FILE=$(get_preset_path "$PRESET") || {
+        error "Unknown preset: $PRESET"
+        echo "Available presets:"
+        list_presets
+        exit 2
+    }
+
+    # Validate preset file
+    validate_preset "$PRESET_FILE" || exit 2
+
+    # PHP_ONLY and CACHE_ONLY are mutually exclusive
+    if [[ "$PHP_ONLY" == true ]] && [[ "$CACHE_ONLY" == true ]]; then
+        error "--php-only and --cache-only cannot be used together"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# PHP OPTIMIZATION
+#===============================================================================
+
+apply_php_settings() {
+    log_action "Applying PHP settings from preset: $PRESET"
+
+    # Read PHP settings from preset
+    local memory_limit max_exec_time upload_size post_size max_input_vars max_input_time
+
+    memory_limit=$(get_yaml_value "$PRESET_FILE" "php.memory_limit")
+    max_exec_time=$(get_yaml_value "$PRESET_FILE" "php.max_execution_time")
+    upload_size=$(get_yaml_value "$PRESET_FILE" "php.upload_max_filesize")
+    post_size=$(get_yaml_value "$PRESET_FILE" "php.post_max_size")
+    max_input_vars=$(get_yaml_value "$PRESET_FILE" "php.max_input_vars")
+    max_input_time=$(get_yaml_value "$PRESET_FILE" "php.max_input_time")
+
+    local settings_applied=0
+
+    # Apply each setting
+    if [[ -n "$memory_limit" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set memory_limit = $memory_limit"
+        else
+            update_vhconf_php "$VHCONF_FILE" "memory_limit" "$memory_limit" && ((settings_applied++))
+            log_verbose "Set memory_limit = $memory_limit"
+        fi
+    fi
+
+    if [[ -n "$max_exec_time" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set max_execution_time = $max_exec_time"
+        else
+            update_vhconf_php "$VHCONF_FILE" "max_execution_time" "$max_exec_time" && ((settings_applied++))
+            log_verbose "Set max_execution_time = $max_exec_time"
+        fi
+    fi
+
+    if [[ -n "$upload_size" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set upload_max_filesize = $upload_size"
+        else
+            update_vhconf_php "$VHCONF_FILE" "upload_max_filesize" "$upload_size" && ((settings_applied++))
+            log_verbose "Set upload_max_filesize = $upload_size"
+        fi
+    fi
+
+    if [[ -n "$post_size" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set post_max_size = $post_size"
+        else
+            update_vhconf_php "$VHCONF_FILE" "post_max_size" "$post_size" && ((settings_applied++))
+            log_verbose "Set post_max_size = $post_size"
+        fi
+    fi
+
+    if [[ -n "$max_input_vars" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set max_input_vars = $max_input_vars"
+        else
+            update_vhconf_php "$VHCONF_FILE" "max_input_vars" "$max_input_vars" && ((settings_applied++))
+            log_verbose "Set max_input_vars = $max_input_vars"
+        fi
+    fi
+
+    if [[ -n "$max_input_time" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+            log_verbose "[DRY-RUN] Would set max_input_time = $max_input_time"
+        else
+            update_vhconf_php "$VHCONF_FILE" "max_input_time" "$max_input_time" && ((settings_applied++))
+            log_verbose "Set max_input_time = $max_input_time"
+        fi
+    fi
+
+    if [[ "$DRY_RUN" != true ]]; then
+        success "Applied ${settings_applied} PHP settings"
+    fi
+
+    return 0
+}
+
+#===============================================================================
+# LITESPEED CACHE OPTIMIZATION
+#===============================================================================
+
+apply_cache_settings() {
+    # Check if WordPress
+    if [[ ! -f "${DOC_ROOT}/wp-config.php" ]]; then
+        warn "Not a WordPress site, skipping LiteSpeed Cache configuration"
+        return 0
+    fi
+
+    log_action "Applying LiteSpeed Cache settings from preset: $PRESET"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_verbose "[DRY-RUN] Would configure LiteSpeed Cache plugin"
+        return 0
+    fi
+
+    apply_lscache_settings "$DOC_ROOT" "$PRESET" "$PRESET_FILE" || {
+        warn "Some LiteSpeed Cache settings may not have been applied"
+        return 1
+    }
+
+    success "Applied LiteSpeed Cache settings"
+    return 0
+}
+
+#===============================================================================
+# AUDIT
+#===============================================================================
+
+run_audit() {
+    log_action "Validating optimization settings"
+
+    local audit_result
+    audit_result=$(validate_optimization "$DOMAIN" "$PRESET" "$PRESET_FILE")
+    local audit_status=$?
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        return $audit_status
+    fi
+
+    echo ""
+    echo "$audit_result"
+    echo ""
+
+    case $audit_status in
+        0)
+            success "All optimizations validated successfully"
+            ;;
+        1)
+            warn "Some optimizations may need attention"
+            ;;
+        2)
+            error "Optimization validation failed"
+            ;;
+    esac
+
+    return $audit_status
+}
+
+#===============================================================================
+# JSON OUTPUT
+#===============================================================================
+
+output_json() {
+    local status="$1"
+
+    local report
+    report=$(generate_optimization_report "$DOMAIN" "$PRESET")
+
+    # Add status to report
+    local status_text
+    case $status in
+        0) status_text="success" ;;
+        1) status_text="warning" ;;
+        *) status_text="error" ;;
+    esac
+
+    # Insert status into JSON
+    echo "$report" | sed "s/}$/,\"status\":\"${status_text}\"}/"
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+main() {
+    parse_arguments "$@"
+    validate_inputs
+
+    # Handle list presets
+    if [[ "$LIST_PRESETS" == true ]]; then
+        header "Available Optimization Presets"
+        list_presets
+        exit 0
+    fi
+
+    # Require root
+    require_root
+
+    local exit_status=0
+
+    if [[ "$JSON_OUTPUT" != true ]]; then
+        header "Optimizing: $DOMAIN"
+        info "Using preset: $PRESET"
+        [[ "$DRY_RUN" == true ]] && warn "DRY-RUN mode - no changes will be made"
+        echo ""
+    fi
+
+    # Backup if requested
+    if [[ "$BACKUP" == true ]] && [[ "$DRY_RUN" != true ]]; then
+        log_action "Creating backup of vhconf.conf"
+        cp "$VHCONF_FILE" "${VHCONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+        log_verbose "Backup created"
+    fi
+
+    # Apply PHP settings
+    if [[ "$CACHE_ONLY" != true ]]; then
+        apply_php_settings || exit_status=1
+    fi
+
+    # Apply LiteSpeed Cache settings
+    if [[ "$PHP_ONLY" != true ]]; then
+        apply_cache_settings || exit_status=1
+    fi
+
+    # Purge cache if requested
+    if [[ "$PURGE_CACHE" == true ]] && [[ "$DRY_RUN" != true ]]; then
+        log_action "Purging LiteSpeed Cache"
+        purge_lscache "$DOC_ROOT" && success "Cache purged"
+    fi
+
+    # Run audit if requested
+    if [[ "$AUDIT" == true ]] && [[ "$DRY_RUN" != true ]]; then
+        run_audit || exit_status=$?
+    fi
+
+    # Reload OpenLiteSpeed if changes were made
+    if [[ "$DRY_RUN" != true ]] && [[ "$CACHE_ONLY" != true ]]; then
+        log_action "Reloading OpenLiteSpeed"
+        if systemctl reload lsws 2>/dev/null || /usr/local/lsws/bin/lswsctrl restart 2>/dev/null; then
+            log_verbose "OpenLiteSpeed reloaded"
+        else
+            warn "Failed to reload OpenLiteSpeed - changes may require manual restart"
+        fi
+    fi
+
+    # Output JSON if requested
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        output_json $exit_status
+        exit $exit_status
+    fi
+
+    echo ""
+    if [[ "$DRY_RUN" == true ]]; then
+        info "Dry-run complete - no changes were made"
+    elif [[ $exit_status -eq 0 ]]; then
+        success "Optimization complete for $DOMAIN"
+    else
+        warn "Optimization completed with warnings"
+    fi
+
+    exit $exit_status
+}
+
+# Run main
+main "$@"

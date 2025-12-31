@@ -1,0 +1,45 @@
+# Documentation Optimization Preset
+# Lightweight settings for documentation and wiki sites
+# Optimized for: static content, search, low traffic
+
+name: docs
+description: Documentation and wiki sites
+type: documentation
+
+php:
+  memory_limit: 128M
+  max_execution_time: 60
+  upload_max_filesize: 16M
+  post_max_size: 16M
+  max_input_vars: 2000
+  max_input_time: 60
+
+lscache:
+  # Cache settings - aggressive caching for mostly static content
+  browser_cache: true
+  mobile_cache: true
+  cache_logged_in: false
+  ttl_public: 2592000
+  ttl_private: 3600
+
+  # Page optimization - full optimization for static pages
+  css_minify: true
+  js_minify: true
+  html_minify: true
+  css_combine: true
+  js_combine: true
+
+  # Image optimization
+  lazy_load: true
+  webp: true
+
+  # Docs specific
+  exclude_paths:
+    - /wp-admin
+    - /wp-login.php
+
+opcache:
+  enabled: true
+  memory_consumption: 64
+  max_accelerated_files: 5000
+  validate_timestamps: 0

@@ -1,0 +1,45 @@
+# Brochure Site Optimization Preset
+# Minimal settings for simple brochure/portfolio sites
+# Optimized for: static pages, contact forms, minimal interactivity
+
+name: brochure
+description: Simple brochure and portfolio sites
+type: brochure
+
+php:
+  memory_limit: 128M
+  max_execution_time: 30
+  upload_max_filesize: 8M
+  post_max_size: 8M
+  max_input_vars: 1000
+  max_input_time: 30
+
+lscache:
+  # Cache settings - maximum caching for static brochure sites
+  browser_cache: true
+  mobile_cache: true
+  cache_logged_in: false
+  ttl_public: 2592000
+  ttl_private: 1800
+
+  # Page optimization - full optimization
+  css_minify: true
+  js_minify: true
+  html_minify: true
+  css_combine: true
+  js_combine: true
+
+  # Image optimization
+  lazy_load: true
+  webp: true
+
+  # Brochure specific - exclude only admin and contact form submissions
+  exclude_paths:
+    - /wp-admin
+    - /wp-login.php
+
+opcache:
+  enabled: true
+  memory_consumption: 64
+  max_accelerated_files: 4000
+  validate_timestamps: 0

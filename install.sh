@@ -201,7 +201,7 @@ install_files() {
 
     # Create installation directory
     info "Creating installation directory: $INSTALL_DIR"
-    mkdir -p "$INSTALL_DIR"/{bin,lib,config,logs/{audit,backup-verify}}
+    mkdir -p "$INSTALL_DIR"/{bin,lib,config,config/presets,logs/{audit,backup-verify}}
 
     # Copy bin scripts
     info "Installing scripts..."
@@ -243,6 +243,12 @@ install_files() {
         fi
     fi
 
+    # Copy optimization presets (always overwrite to get updates)
+    info "Installing optimization presets..."
+    if [[ -d "${source_dir}/config/presets" ]]; then
+        cp -v "${source_dir}/config/presets/"*.yaml "$INSTALL_DIR/config/presets/" 2>/dev/null || true
+    fi
+
     # Make scripts executable
     info "Setting permissions..."
     chmod +x "$INSTALL_DIR/bin/"* 2>/dev/null || true
@@ -272,6 +278,7 @@ create_wrappers() {
         "jps-monitor-install"
         "jps-dns-check"
         "jps-deploy-site"
+        "jps-optimize-site"
     )
 
     for script in "${scripts[@]}"; do
@@ -365,7 +372,9 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-monitor-install"
         "$INSTALL_DIR/bin/jps-dns-check"
         "$INSTALL_DIR/bin/jps-deploy-site"
+        "$INSTALL_DIR/bin/jps-optimize-site"
         "$INSTALL_DIR/lib/jps-common.sh"
+        "$INSTALL_DIR/lib/jps-optimize.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
     )
 
@@ -396,6 +405,7 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-monitor-install"
         "$BIN_LINKS_DIR/jps-dns-check"
         "$BIN_LINKS_DIR/jps-deploy-site"
+        "$BIN_LINKS_DIR/jps-optimize-site"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -500,6 +510,10 @@ ${BOLD}Available Commands:${RESET}
     Deploy a new WordPress site.
     Options: --help, --domain, --email, --progress, --skip-ssl
 
+  ${GREEN}jps-optimize-site${RESET}
+    Apply optimization presets to WordPress sites.
+    Options: --help, --preset, --audit, --json, --list-presets
+
 ${BOLD}Configuration:${RESET}
 
   Config file: $INSTALL_DIR/config/jps-tools.conf
@@ -545,6 +559,7 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-monitor-install"
     rm -f "$BIN_LINKS_DIR/jps-dns-check"
     rm -f "$BIN_LINKS_DIR/jps-deploy-site"
+    rm -f "$BIN_LINKS_DIR/jps-optimize-site"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response

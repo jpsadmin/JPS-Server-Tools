@@ -1,0 +1,50 @@
+# WooCommerce Optimization Preset
+# High-performance settings for e-commerce sites running WooCommerce
+# Optimized for: product catalogs, cart operations, checkout flows
+
+name: woo
+description: WooCommerce e-commerce sites
+type: ecommerce
+
+php:
+  memory_limit: 512M
+  max_execution_time: 300
+  upload_max_filesize: 64M
+  post_max_size: 64M
+  max_input_vars: 5000
+  max_input_time: 300
+
+lscache:
+  # Cache settings
+  browser_cache: true
+  mobile_cache: true
+  cache_logged_in: false
+  ttl_public: 604800
+  ttl_private: 1800
+
+  # Page optimization
+  css_minify: true
+  js_minify: true
+  html_minify: true
+  css_combine: false
+  js_combine: false
+
+  # Image optimization
+  lazy_load: true
+  webp: true
+
+  # WooCommerce specific
+  exclude_cookies:
+    - woocommerce_cart_hash
+    - woocommerce_items_in_cart
+    - wp_woocommerce_session
+  exclude_paths:
+    - /cart
+    - /checkout
+    - /my-account
+
+opcache:
+  enabled: true
+  memory_consumption: 256
+  max_accelerated_files: 20000
+  validate_timestamps: 0
