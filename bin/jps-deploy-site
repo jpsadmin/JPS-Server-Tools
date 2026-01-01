@@ -372,9 +372,8 @@ step_create_directories() {
     touch "${logs_dir}/access.log"
     touch "${logs_dir}/error.log"
 
-    # Set ownership IMMEDIATELY so wp-cli can work properly
-    # This is critical - wp-cli needs the directory owned by nobody
-    chown -R nobody:nogroup "$site_dir"
+    # Note: Ownership will be set AFTER WordPress is downloaded in step_install_wordpress
+    # wp core download runs as root, so files are created as root initially
 
     progress 2 "directories" "complete" "Directory structure created"
     return 0
@@ -418,14 +417,19 @@ step_create_database() {
 step_install_wordpress() {
     progress 4 "wordpress" "start" "Installing WordPress"
 
-    local doc_root="${WEBSITES_ROOT}/${DOMAIN}/html"
+    local site_dir="${WEBSITES_ROOT}/${DOMAIN}"
+    local doc_root="${site_dir}/html"
     ADMIN_PASS=$(random_string 16)
 
-    # Download WordPress
+    # Download WordPress (runs as root, files created as root)
     wp core download --path="$doc_root" --allow-root 2>/dev/null || {
         progress 4 "wordpress" "error" "Failed to download WordPress"
         return 1
     }
+
+    # CRITICAL: Set ownership AFTER download, BEFORE wp config create
+    # wp-cli needs the files to be owned by nobody for subsequent operations
+    chown -R nobody:nogroup "$site_dir"
 
     # Create wp-config.php
     wp config create \
