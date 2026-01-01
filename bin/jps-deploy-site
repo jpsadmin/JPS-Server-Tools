@@ -21,7 +21,7 @@
 #   2 - Invalid arguments
 #===============================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 # Script metadata
 readonly SCRIPT_NAME="jps-deploy-site"
@@ -74,7 +74,7 @@ OPTIONS:
     -h, --help              Show this help message
     -V, --version           Show version information
     -d, --domain DOMAIN     Domain name for the new site (required)
-    -e, --email EMAIL       Admin email address (default: admin@jpshosting.net)
+    -e, --email EMAIL       Admin email address (default: jayjay@jpshosting.com)
     -u, --username USER     WP admin username (auto-generated if not set)
     -t, --title TITLE       Site title (default: domain name)
     -p, --preset PRESET     Optimization preset to apply after deployment
@@ -131,7 +131,7 @@ show_version() {
 #===============================================================================
 
 DOMAIN=""
-ADMIN_EMAIL="admin@jpshosting.net"
+ADMIN_EMAIL="jayjay@jpshosting.com"
 ADMIN_USERNAME=""
 SITE_TITLE=""
 PRESET="blog"  # Default optimization preset
@@ -372,6 +372,10 @@ step_create_directories() {
     touch "${logs_dir}/access.log"
     touch "${logs_dir}/error.log"
 
+    # Set ownership IMMEDIATELY so wp-cli can work properly
+    # This is critical - wp-cli needs the directory owned by nobody
+    chown -R nobody:nogroup "$site_dir"
+
     progress 2 "directories" "complete" "Directory structure created"
     return 0
 }
@@ -546,43 +550,48 @@ EOF
 
     # Add listener mappings to httpd_config.conf
     # Each listener block (HTTP 80 and HTTPS 443) needs a 'map' entry for the domain
-    if ! grep -q "map.*${DOMAIN}.*${DOMAIN}" "$OLS_CONFIG" 2>/dev/null; then
+    if ! grep -q "map[[:space:]]*${DOMAIN}[[:space:]]" "$OLS_CONFIG" 2>/dev/null; then
         local map_line="  map                     ${DOMAIN} ${DOMAIN}, www.${DOMAIN}"
 
         # Create a backup before modifying
         cp "$OLS_CONFIG" "${OLS_CONFIG}.bak"
 
-        # Add mapping to HTTP listener (port 80)
-        # Use sed to insert the map line before the closing brace of the HTTP listener
-        # Find the pattern "listener HTTP 80 {" and then find the next "}" and insert before it
-        if grep -q "listener HTTP 80" "$OLS_CONFIG"; then
-            sed -i "/listener HTTP 80/,/^}/ {
-                /^}/ i\\${map_line}
-            }" "$OLS_CONFIG" 2>/dev/null || {
-                # BSD sed fallback (macOS)
-                sed -i '' "/listener HTTP 80/,/^}/ {
-                    /^}/ i\\
-${map_line}
-                }" "$OLS_CONFIG" 2>/dev/null || true
-            }
-        fi
+        # Use awk for reliable insertion into listener blocks
+        # This handles the config structure properly
+        awk -v domain="$DOMAIN" -v mapline="$map_line" '
+        BEGIN { in_http=0; in_https=0; http_done=0; https_done=0 }
 
-        # Add mapping to HTTPS listener (port 443)
-        if grep -q "listener HTTPS 443" "$OLS_CONFIG"; then
-            sed -i "/listener HTTPS 443/,/^}/ {
-                /^}/ i\\${map_line}
-            }" "$OLS_CONFIG" 2>/dev/null || {
-                # BSD sed fallback (macOS)
-                sed -i '' "/listener HTTPS 443/,/^}/ {
-                    /^}/ i\\
-${map_line}
-                }" "$OLS_CONFIG" 2>/dev/null || true
-            }
-        fi
+        # Detect entering HTTP listener block
+        /^listener[[:space:]]+HTTP[[:space:]]+80/ { in_http=1 }
 
-        # Validate the config wasn't corrupted
-        if ! grep -q "listener HTTP 80" "$OLS_CONFIG" 2>/dev/null; then
-            # Restore from backup if something went wrong
+        # Detect entering HTTPS listener block
+        /^listener[[:space:]]+HTTPS[[:space:]]+443/ { in_https=1 }
+
+        # When we hit closing brace and we are in a listener block, insert map before it
+        /^}/ {
+            if (in_http == 1 && http_done == 0) {
+                print mapline
+                http_done=1
+                in_http=0
+            }
+            if (in_https == 1 && https_done == 0) {
+                print mapline
+                https_done=1
+                in_https=0
+            }
+        }
+
+        # Print the current line
+        { print }
+        ' "$OLS_CONFIG" > "${OLS_CONFIG}.new"
+
+        # Validate the new config has the required content
+        if grep -q "listener HTTP 80" "${OLS_CONFIG}.new" && \
+           grep -q "map[[:space:]]*${DOMAIN}" "${OLS_CONFIG}.new"; then
+            mv "${OLS_CONFIG}.new" "$OLS_CONFIG"
+        else
+            # Something went wrong, restore backup
+            rm -f "${OLS_CONFIG}.new"
             cp "${OLS_CONFIG}.bak" "$OLS_CONFIG"
             warn "Failed to add listener mappings - config restored from backup"
         fi
@@ -701,9 +710,10 @@ IMPORTANT: Keep this file secure! It contains sensitive credentials.
 ================================================================================
 EOF
 
-    # Secure the credentials file (root read only)
-    chown root:root "$creds_file"
-    chmod 600 "$creds_file"
+    # Secure the credentials file
+    # Allow root to read/write, nobody (web server) to read only
+    chown root:nogroup "$creds_file"
+    chmod 640 "$creds_file"
 
     progress 7 "permissions" "complete" "Permissions set correctly"
     return 0
