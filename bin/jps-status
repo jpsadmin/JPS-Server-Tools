@@ -17,7 +17,7 @@
 #   2 - Error during execution
 #===============================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 # Script metadata
 readonly SCRIPT_NAME="jps-status"

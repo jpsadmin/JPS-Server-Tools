@@ -545,31 +545,47 @@ EOF
     fi
 
     # Add listener mappings to httpd_config.conf
-    # Add to HTTP listener (port 80)
+    # Each listener block (HTTP 80 and HTTPS 443) needs a 'map' entry for the domain
     if ! grep -q "map.*${DOMAIN}.*${DOMAIN}" "$OLS_CONFIG" 2>/dev/null; then
-        # Insert mapping before the closing brace of listener HTTP 80
-        # Find the last 'map' line in the HTTP listener block and add after it
         local map_line="  map                     ${DOMAIN} ${DOMAIN}, www.${DOMAIN}"
 
-        # Use awk to add the mapping to HTTP listener
-        awk -v domain="$DOMAIN" -v mapline="$map_line" '
-        /^listener HTTP 80/ { in_http=1 }
-        in_http && /^}/ {
-            print mapline
-            in_http=0
-        }
-        { print }
-        ' "$OLS_CONFIG" > "${OLS_CONFIG}.tmp" && mv "${OLS_CONFIG}.tmp" "$OLS_CONFIG"
+        # Create a backup before modifying
+        cp "$OLS_CONFIG" "${OLS_CONFIG}.bak"
 
-        # Use awk to add the mapping to HTTPS listener
-        awk -v domain="$DOMAIN" -v mapline="$map_line" '
-        /^listener HTTPS 443/ { in_https=1 }
-        in_https && /^}/ {
-            print mapline
-            in_https=0
-        }
-        { print }
-        ' "$OLS_CONFIG" > "${OLS_CONFIG}.tmp" && mv "${OLS_CONFIG}.tmp" "$OLS_CONFIG"
+        # Add mapping to HTTP listener (port 80)
+        # Use sed to insert the map line before the closing brace of the HTTP listener
+        # Find the pattern "listener HTTP 80 {" and then find the next "}" and insert before it
+        if grep -q "listener HTTP 80" "$OLS_CONFIG"; then
+            sed -i "/listener HTTP 80/,/^}/ {
+                /^}/ i\\${map_line}
+            }" "$OLS_CONFIG" 2>/dev/null || {
+                # BSD sed fallback (macOS)
+                sed -i '' "/listener HTTP 80/,/^}/ {
+                    /^}/ i\\
+${map_line}
+                }" "$OLS_CONFIG" 2>/dev/null || true
+            }
+        fi
+
+        # Add mapping to HTTPS listener (port 443)
+        if grep -q "listener HTTPS 443" "$OLS_CONFIG"; then
+            sed -i "/listener HTTPS 443/,/^}/ {
+                /^}/ i\\${map_line}
+            }" "$OLS_CONFIG" 2>/dev/null || {
+                # BSD sed fallback (macOS)
+                sed -i '' "/listener HTTPS 443/,/^}/ {
+                    /^}/ i\\
+${map_line}
+                }" "$OLS_CONFIG" 2>/dev/null || true
+            }
+        fi
+
+        # Validate the config wasn't corrupted
+        if ! grep -q "listener HTTP 80" "$OLS_CONFIG" 2>/dev/null; then
+            # Restore from backup if something went wrong
+            cp "${OLS_CONFIG}.bak" "$OLS_CONFIG"
+            warn "Failed to add listener mappings - config restored from backup"
+        fi
     fi
 
     progress 5 "vhost" "complete" "Virtual host configured"
@@ -626,7 +642,7 @@ EOF
     fi
 }
 
-# Step 7: Set permissions
+# Step 7: Set permissions and create credentials file
 step_set_permissions() {
     progress 7 "permissions" "start" "Setting file permissions"
 
@@ -647,6 +663,47 @@ step_set_permissions() {
 
     # Make wp-content writable
     chmod -R 775 "${doc_root}/wp-content" 2>/dev/null || true
+
+    # Create CREDENTIALS.txt file for easy reference
+    local creds_file="${site_dir}/CREDENTIALS.txt"
+    cat > "$creds_file" << EOF
+================================================================================
+Site Credentials: ${DOMAIN}
+Created: $(date '+%Y-%m-%d %H:%M:%S')
+================================================================================
+
+SITE URL
+--------
+URL:            https://${DOMAIN}
+Admin Panel:    https://${DOMAIN}/wp-admin/
+
+WORDPRESS ADMIN
+---------------
+Username:       ${ADMIN_USERNAME}
+Password:       ${ADMIN_PASS}
+Email:          ${ADMIN_EMAIL}
+
+DATABASE
+--------
+Database Name:  ${DB_NAME}
+Database User:  ${DB_USER}
+Database Pass:  ${DB_PASS}
+Database Host:  localhost
+
+PATHS
+-----
+Document Root:  ${doc_root}
+Logs:           ${site_dir}/logs/
+VHost Config:   ${VHOSTS_DIR}/${DOMAIN}/vhconf.conf
+
+================================================================================
+IMPORTANT: Keep this file secure! It contains sensitive credentials.
+================================================================================
+EOF
+
+    # Secure the credentials file (root read only)
+    chown root:root "$creds_file"
+    chmod 600 "$creds_file"
 
     progress 7 "permissions" "complete" "Permissions set correctly"
     return 0
