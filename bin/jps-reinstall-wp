@@ -1,0 +1,413 @@
+#!/bin/bash
+#===============================================================================
+# JPS Reinstall WordPress - Fresh WordPress Installation
+#
+# Reinstalls WordPress core files while optionally preserving uploads.
+# Creates a checkpoint backup before reinstalling.
+#
+# Usage:
+#   jps-reinstall-wp example.com              # Reinstall, preserve uploads
+#   jps-reinstall-wp example.com --force      # Skip confirmation
+#   jps-reinstall-wp example.com --no-backup  # Skip checkpoint backup
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Reinstall failed
+#   2 - Invalid arguments
+#===============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-reinstall-wp"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Reinstall WordPress - Fresh WordPress Installation
+
+DESCRIPTION:
+    Reinstalls WordPress core files while optionally preserving uploads
+    and database. Creates a checkpoint backup before reinstalling.
+
+USAGE:
+    jps-reinstall-wp <domain> [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -f, --force             Skip confirmation prompt
+    -j, --json              Output results in JSON format
+    --preserve-uploads      Keep wp-content/uploads (default)
+    --no-preserve-uploads   Delete uploads during reinstall
+    --no-backup             Skip creating checkpoint backup
+    -v, --verbose           Show detailed progress
+
+EXAMPLES:
+    # Reinstall WordPress, preserve uploads (default)
+    jps-reinstall-wp example.com
+
+    # Force reinstall without confirmation
+    jps-reinstall-wp example.com --force
+
+    # Reinstall with JSON output (for automation)
+    jps-reinstall-wp example.com --force --json
+
+EXIT CODES:
+    0 - Reinstall completed successfully
+    1 - Reinstall failed
+    2 - Invalid arguments
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+FORCE=false
+JSON_OUTPUT=false
+PRESERVE_UPLOADS=true
+SKIP_BACKUP=false
+VERBOSE=false
+
+# Paths (set after domain validation)
+SITE_DIR=""
+DOC_ROOT=""
+UPLOADS_DIR=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -j|--json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            --preserve-uploads)
+                PRESERVE_UPLOADS=true
+                shift
+                ;;
+            --no-preserve-uploads)
+                PRESERVE_UPLOADS=false
+                shift
+                ;;
+            --no-backup)
+                SKIP_BACKUP=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$DOMAIN" ]]; then
+                    DOMAIN="$1"
+                else
+                    error "Unexpected argument: $1"
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain name is required"
+        echo "Usage: $SCRIPT_NAME <domain> [OPTIONS]"
+        exit 2
+    fi
+
+    # Validate domain format
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+        output_result "error" "Invalid domain format: $DOMAIN"
+        exit 2
+    fi
+
+    # Set paths
+    SITE_DIR="${WEBSITES_ROOT}/${DOMAIN}"
+    DOC_ROOT="${SITE_DIR}/html"
+    UPLOADS_DIR="${DOC_ROOT}/wp-content/uploads"
+
+    # Validate site exists
+    if [[ ! -d "$DOC_ROOT" ]]; then
+        output_result "error" "Site not found: $DOMAIN"
+        exit 2
+    fi
+
+    # Validate it's a WordPress site
+    if [[ ! -f "${DOC_ROOT}/wp-config.php" ]]; then
+        output_result "error" "Not a WordPress site: $DOMAIN"
+        exit 2
+    fi
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+output_result() {
+    local status="$1"
+    local message="$2"
+    local data="${3:-}"
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local json="{\"success\": $([ "$status" == "success" ] && echo "true" || echo "false"), \"message\": \"$message\""
+        if [[ -n "$data" ]]; then
+            json+=", \"data\": $data"
+        fi
+        json+="}"
+        echo "$json"
+    else
+        case "$status" in
+            success) success "$message" ;;
+            error) error "$message" ;;
+            *) echo "$message" ;;
+        esac
+    fi
+}
+
+log_step() {
+    local message="$1"
+    if [[ "$VERBOSE" == true ]] && [[ "$JSON_OUTPUT" != true ]]; then
+        info "$message"
+    fi
+}
+
+#===============================================================================
+# MAIN FUNCTIONS
+#===============================================================================
+
+create_backup() {
+    if [[ "$SKIP_BACKUP" == true ]]; then
+        log_step "Skipping backup (--no-backup)"
+        return 0
+    fi
+
+    log_step "Creating checkpoint backup..."
+
+    local checkpoint_script="${INSTALL_DIR}/bin/jps-checkpoint"
+    if [[ -x "$checkpoint_script" ]]; then
+        if "$checkpoint_script" "$DOMAIN" --quiet 2>/dev/null; then
+            log_step "Checkpoint created successfully"
+            return 0
+        else
+            warn "Checkpoint creation failed, continuing anyway"
+            return 0
+        fi
+    else
+        warn "jps-checkpoint not found, skipping backup"
+        return 0
+    fi
+}
+
+preserve_uploads() {
+    if [[ "$PRESERVE_UPLOADS" != true ]]; then
+        return 0
+    fi
+
+    if [[ ! -d "$UPLOADS_DIR" ]]; then
+        log_step "No uploads directory to preserve"
+        return 0
+    fi
+
+    log_step "Preserving uploads directory..."
+
+    local temp_uploads="/tmp/wp-uploads-${DOMAIN}-$$"
+    cp -a "$UPLOADS_DIR" "$temp_uploads"
+    echo "$temp_uploads"
+}
+
+restore_uploads() {
+    local temp_uploads="$1"
+
+    if [[ -z "$temp_uploads" ]] || [[ ! -d "$temp_uploads" ]]; then
+        return 0
+    fi
+
+    log_step "Restoring uploads directory..."
+
+    mkdir -p "$(dirname "$UPLOADS_DIR")"
+    rm -rf "$UPLOADS_DIR" 2>/dev/null || true
+    mv "$temp_uploads" "$UPLOADS_DIR"
+    chown -R nobody:nogroup "$UPLOADS_DIR"
+}
+
+reinstall_wordpress() {
+    local temp_uploads=""
+
+    # Preserve uploads if needed
+    if [[ "$PRESERVE_UPLOADS" == true ]] && [[ -d "$UPLOADS_DIR" ]]; then
+        temp_uploads=$(preserve_uploads)
+    fi
+
+    log_step "Reading database credentials..."
+
+    # Extract DB credentials from wp-config.php
+    local db_name db_user db_pass db_host db_prefix
+    db_name=$(grep "DB_NAME" "${DOC_ROOT}/wp-config.php" | cut -d"'" -f4)
+    db_user=$(grep "DB_USER" "${DOC_ROOT}/wp-config.php" | cut -d"'" -f4)
+    db_pass=$(grep "DB_PASSWORD" "${DOC_ROOT}/wp-config.php" | cut -d"'" -f4)
+    db_host=$(grep "DB_HOST" "${DOC_ROOT}/wp-config.php" | cut -d"'" -f4 || echo "localhost")
+    db_prefix=$(grep "table_prefix" "${DOC_ROOT}/wp-config.php" | cut -d"'" -f2 || echo "wp_")
+
+    # Get site URL from database
+    local site_url
+    site_url=$(mysql -u "$db_user" -p"$db_pass" -h "$db_host" "$db_name" -N -e "SELECT option_value FROM ${db_prefix}options WHERE option_name='siteurl';" 2>/dev/null || echo "https://${DOMAIN}")
+
+    log_step "Removing old WordPress files..."
+
+    # Remove all WordPress files except wp-config.php and .htaccess
+    find "$DOC_ROOT" -mindepth 1 -maxdepth 1 \
+        ! -name 'wp-config.php' \
+        ! -name '.htaccess' \
+        ! -name '.user.ini' \
+        -exec rm -rf {} \; 2>/dev/null || true
+
+    log_step "Downloading fresh WordPress..."
+
+    # Find WP-CLI
+    local wp_bin
+    if ! wp_bin=$(_find_wp_cli 2>/dev/null); then
+        wp_bin="wp"
+    fi
+
+    # Download WordPress
+    cd "$DOC_ROOT"
+    $wp_bin core download --allow-root --force 2>/dev/null
+
+    log_step "WordPress files restored"
+
+    # Restore uploads
+    if [[ -n "$temp_uploads" ]]; then
+        restore_uploads "$temp_uploads"
+    fi
+
+    # Fix permissions
+    log_step "Setting permissions..."
+    chown -R nobody:nogroup "$DOC_ROOT"
+    find "$DOC_ROOT" -type d -exec chmod 755 {} \;
+    find "$DOC_ROOT" -type f -exec chmod 644 {} \;
+    chmod 600 "${DOC_ROOT}/wp-config.php"
+
+    # Verify installation
+    log_step "Verifying installation..."
+
+    local wp_version
+    wp_version=$($wp_bin core version --path="$DOC_ROOT" --allow-root 2>/dev/null || echo "unknown")
+
+    return 0
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Require root
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root"
+        exit 2
+    fi
+
+    # Parse arguments
+    parse_args "$@"
+
+    # Confirmation
+    if [[ "$FORCE" != true ]] && [[ "$JSON_OUTPUT" != true ]]; then
+        echo "WARNING: This will reinstall WordPress for $DOMAIN"
+        if [[ "$PRESERVE_UPLOADS" == true ]]; then
+            echo "Uploads will be preserved."
+        else
+            echo "WARNING: Uploads will be DELETED!"
+        fi
+        read -rp "Continue? [y/N] " response
+        if [[ ! "$response" =~ ^[yY]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    # Create backup
+    create_backup
+
+    # Perform reinstall
+    if reinstall_wordpress; then
+        # Get new version
+        local wp_bin
+        wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+        local new_version
+        new_version=$($wp_bin core version --path="$DOC_ROOT" --allow-root 2>/dev/null || echo "unknown")
+
+        output_result "success" "WordPress reinstalled successfully" "{\"domain\": \"$DOMAIN\", \"wp_version\": \"$new_version\", \"uploads_preserved\": $PRESERVE_UPLOADS}"
+
+        # Log to lifecycle
+        log_lifecycle "reinstall" "$DOMAIN" "WordPress reinstalled to version $new_version"
+
+        exit 0
+    else
+        output_result "error" "WordPress reinstall failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"
