@@ -218,6 +218,29 @@ EOF
     fi
 }
 
+# Known Cloudflare IP ranges (partial list of common ranges)
+# Full list: https://www.cloudflare.com/ips/
+is_cloudflare_ip() {
+    local ip="$1"
+
+    # Check common Cloudflare IP ranges
+    # These are the most commonly seen Cloudflare proxy IPs
+    case "$ip" in
+        104.16.*|104.17.*|104.18.*|104.19.*|104.20.*|104.21.*|104.22.*|104.23.*|104.24.*|104.25.*|104.26.*|104.27.*) return 0 ;;
+        172.64.*|172.65.*|172.66.*|172.67.*|172.68.*|172.69.*|172.70.*|172.71.*) return 0 ;;
+        173.245.48.*|173.245.49.*|173.245.50.*|173.245.51.*|173.245.52.*|173.245.53.*|173.245.54.*|173.245.55.*) return 0 ;;
+        103.21.244.*|103.22.200.*|103.31.4.*) return 0 ;;
+        141.101.64.*|141.101.65.*|141.101.66.*|141.101.67.*|141.101.68.*|141.101.69.*|141.101.96.*|141.101.97.*|141.101.98.*|141.101.99.*) return 0 ;;
+        108.162.192.*|108.162.193.*|108.162.194.*|108.162.195.*) return 0 ;;
+        190.93.240.*|190.93.241.*|190.93.242.*|190.93.243.*|190.93.244.*|190.93.245.*|190.93.246.*|190.93.247.*) return 0 ;;
+        188.114.96.*|188.114.97.*|188.114.98.*|188.114.99.*) return 0 ;;
+        197.234.240.*|197.234.241.*|197.234.242.*|197.234.243.*) return 0 ;;
+        198.41.128.*|198.41.129.*|198.41.130.*|198.41.131.*) return 0 ;;
+        162.158.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Check DNS A record for domain
 check_dns() {
     local resolved_ip=""
@@ -251,10 +274,18 @@ check_dns() {
     if [[ "$resolved_ip" == "$EXPECTED_IP" ]]; then
         output_result "ok" "$resolved_ip" "DNS configured correctly - $DOMAIN resolves to $resolved_ip"
         return 0
-    else
-        output_result "mismatch" "$resolved_ip" "DNS mismatch - $DOMAIN resolves to $resolved_ip (expected $EXPECTED_IP)"
-        return 1
     fi
+
+    # Check if the resolved IP is a Cloudflare proxy IP
+    # If so, DNS is configured (just proxied through Cloudflare)
+    if is_cloudflare_ip "$resolved_ip"; then
+        output_result "ok" "$resolved_ip" "DNS configured via Cloudflare proxy - $DOMAIN resolves to $resolved_ip (proxied)"
+        return 0
+    fi
+
+    # IP doesn't match and isn't Cloudflare - actual mismatch
+    output_result "mismatch" "$resolved_ip" "DNS mismatch - $DOMAIN resolves to $resolved_ip (expected $EXPECTED_IP)"
+    return 1
 }
 
 #===============================================================================
