@@ -96,6 +96,7 @@ DEPLOYMENT STEPS:
     7. Set file permissions
     8. Run validation checks
     9. Apply optimization preset
+   10. Install plugin/theme stack
 
 EXAMPLES:
     # Basic deployment (uses 'blog' optimization preset)
@@ -809,6 +810,48 @@ step_apply_optimization() {
     fi
 }
 
+# Step 10: Install plugin/theme stack
+step_install_stack() {
+    # Skip if --skip-plugins was specified
+    if [[ "$SKIP_PLUGINS" == true ]]; then
+        progress 10 "stack" "start" "Skipping plugin/theme stack (--skip-plugins)"
+        progress 10 "stack" "complete" "Plugin stack installation skipped"
+        return 0
+    fi
+
+    progress 10 "stack" "start" "Installing standard plugin/theme stack"
+
+    # Check if jps-install-stack is available
+    local stack_cmd="/usr/local/bin/jps-install-stack"
+    if [[ ! -x "$stack_cmd" ]]; then
+        # Try the local installation
+        stack_cmd="${INSTALL_DIR}/bin/jps-install-stack"
+    fi
+
+    if [[ ! -x "$stack_cmd" ]]; then
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            progress 10 "stack" "error" "jps-install-stack not found - plugin installation skipped"
+        else
+            warn "jps-install-stack not found. Skipping plugin/theme installation."
+        fi
+        return 0  # Don't fail deployment for missing stack installer
+    fi
+
+    # Install the stack (run quietly to avoid cluttering output)
+    if "$stack_cmd" "$DOMAIN" --quiet 2>/dev/null; then
+        progress 10 "stack" "complete" "Plugin/theme stack installed"
+        return 0
+    else
+        # Stack installation failed but don't fail deployment
+        if [[ "$PROGRESS_OUTPUT" == true ]]; then
+            progress 10 "stack" "error" "Some plugins/themes failed to install"
+        else
+            warn "Some plugins/themes failed to install. Check manually."
+        fi
+        return 0  # Don't fail the whole deployment
+    fi
+}
+
 # Log deployment to lifecycle log
 log_deployment() {
     local status="$1"
@@ -877,6 +920,10 @@ main() {
 
     if [[ "$failed" != true ]]; then
         step_apply_optimization || true  # Don't fail deployment for optimization issues
+    fi
+
+    if [[ "$failed" != true ]]; then
+        step_install_stack || true  # Don't fail deployment for stack installation issues
     fi
 
     # Output results
