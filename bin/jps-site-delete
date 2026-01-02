@@ -427,6 +427,10 @@ delete_database() {
         if [[ -n "$DB_USER" ]]; then
             echo "  [DRY-RUN] Would drop user: $DB_USER"
         fi
+        # Show orphaned users that would be cleaned up
+        local domain_pattern
+        domain_pattern=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-16)
+        echo "  [DRY-RUN] Would search for orphaned users matching: ${domain_pattern}%"
         return 0
     fi
 
@@ -468,10 +472,71 @@ delete_database() {
         fi
     fi
 
+    # Clean up orphaned database users from previous deployments
+    # These may exist if the site was deployed multiple times
+    cleanup_orphaned_users
+
     if [[ "$has_errors" == true ]]; then
         return 1
     fi
     return 0
+}
+
+# Clean up orphaned MySQL users matching the domain pattern
+cleanup_orphaned_users() {
+    # Create a pattern from the domain name
+    # e.g., docs.jpshosting.net -> docs_jpshosting
+    local domain_pattern
+    domain_pattern=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-16)
+
+    log_verbose "Searching for orphaned users matching: ${domain_pattern}%"
+
+    local mysql_cmd="mysql"
+    local orphaned_users=""
+
+    # Find users matching the domain pattern (excluding the one we already dropped)
+    if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
+        orphaned_users=$($mysql_cmd -N -e "SELECT user FROM mysql.user WHERE (user LIKE '${domain_pattern}%' OR user LIKE 'wp_${domain_pattern}%') AND user != '${DB_USER:-}';" 2>/dev/null)
+    else
+        local mysql_args=("-u" "${MYSQL_USER:-root}")
+        if [[ -n "${MYSQL_PASS:-}" ]]; then
+            mysql_args+=("-p${MYSQL_PASS}")
+        fi
+        mysql_args+=("-N" "-e" "SELECT user FROM mysql.user WHERE (user LIKE '${domain_pattern}%' OR user LIKE 'wp_${domain_pattern}%') AND user != '${DB_USER:-}';")
+        orphaned_users=$($mysql_cmd "${mysql_args[@]}" 2>/dev/null)
+    fi
+
+    if [[ -z "$orphaned_users" ]]; then
+        log_verbose "No orphaned users found"
+        return 0
+    fi
+
+    # Drop each orphaned user
+    local dropped_count=0
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+
+        log_verbose "Dropping orphaned user: $user"
+
+        if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
+            if $mysql_cmd -e "DROP USER IF EXISTS '$user'@'localhost';" 2>/dev/null; then
+                ((dropped_count++)) || true
+            fi
+        else
+            local mysql_args=("-u" "${MYSQL_USER:-root}")
+            if [[ -n "${MYSQL_PASS:-}" ]]; then
+                mysql_args+=("-p${MYSQL_PASS}")
+            fi
+            mysql_args+=("-e" "DROP USER IF EXISTS '$user'@'localhost';")
+            if $mysql_cmd "${mysql_args[@]}" 2>/dev/null; then
+                ((dropped_count++)) || true
+            fi
+        fi
+    done <<< "$orphaned_users"
+
+    if [[ $dropped_count -gt 0 ]]; then
+        success "Cleaned up $dropped_count orphaned MySQL user(s)"
+    fi
 }
 
 # Remove vhost configuration
