@@ -147,6 +147,7 @@ BACKUP_PATH=""
 # Site info
 IS_WORDPRESS=false
 DB_NAME=""
+DB_USER=""
 
 #===============================================================================
 # ARGUMENT PARSING
@@ -292,9 +293,12 @@ show_summary() {
         echo "  ${COLOR_RED}✗${COLOR_RESET} Site files: $SITE_DIR ($site_size)"
     fi
 
-    # Database
+    # Database and user
     if [[ "$IS_WORDPRESS" == true ]] && [[ "$NO_DB" != true ]] && [[ -n "$DB_NAME" ]]; then
         echo "  ${COLOR_RED}✗${COLOR_RESET} Database: $DB_NAME"
+        if [[ -n "$DB_USER" ]]; then
+            echo "  ${COLOR_RED}✗${COLOR_RESET} MySQL User: $DB_USER"
+        fi
     fi
 
     # Vhost config
@@ -402,7 +406,7 @@ delete_files() {
     fi
 }
 
-# Drop database
+# Drop database and user
 delete_database() {
     if [[ "$NO_DB" == true ]]; then
         log_verbose "Skipping database (--no-db specified)"
@@ -414,34 +418,60 @@ delete_database() {
         return 0
     fi
 
-    info "Dropping database..."
+    info "Dropping database and user..."
     log_verbose "Database: $DB_NAME"
+    log_verbose "User: ${DB_USER:-none}"
 
     if [[ "$DRY_RUN" == true ]]; then
         echo "  [DRY-RUN] Would drop database: $DB_NAME"
+        if [[ -n "$DB_USER" ]]; then
+            echo "  [DRY-RUN] Would drop user: $DB_USER"
+        fi
         return 0
     fi
 
     local mysql_cmd="mysql"
-    local mysql_args=()
+    local has_errors=false
 
+    # Build SQL commands
+    local sql_commands="DROP DATABASE IF EXISTS \`$DB_NAME\`;"
+    if [[ -n "$DB_USER" ]]; then
+        sql_commands+=" DROP USER IF EXISTS '$DB_USER'@'localhost';"
+    fi
+
+    # Execute MySQL commands
     if [[ "${MYSQL_USE_SOCKET:-true}" == true ]]; then
-        mysql_args+=("-e" "DROP DATABASE IF EXISTS \`$DB_NAME\`;")
+        if $mysql_cmd -e "$sql_commands" 2>/dev/null; then
+            success "Database dropped"
+            if [[ -n "$DB_USER" ]]; then
+                success "MySQL user dropped"
+            fi
+        else
+            warn "Failed to drop database/user (may not exist or permission denied)"
+            has_errors=true
+        fi
     else
-        mysql_args+=("-u" "${MYSQL_USER:-root}")
+        local mysql_args=("-u" "${MYSQL_USER:-root}")
         if [[ -n "${MYSQL_PASS:-}" ]]; then
             mysql_args+=("-p${MYSQL_PASS}")
         fi
-        mysql_args+=("-e" "DROP DATABASE IF EXISTS \`$DB_NAME\`;")
+        mysql_args+=("-e" "$sql_commands")
+
+        if $mysql_cmd "${mysql_args[@]}" 2>/dev/null; then
+            success "Database dropped"
+            if [[ -n "$DB_USER" ]]; then
+                success "MySQL user dropped"
+            fi
+        else
+            warn "Failed to drop database/user (may not exist or permission denied)"
+            has_errors=true
+        fi
     fi
 
-    if $mysql_cmd "${mysql_args[@]}" 2>/dev/null; then
-        success "Database dropped"
-        return 0
-    else
-        warn "Failed to drop database (may not exist or permission denied)"
+    if [[ "$has_errors" == true ]]; then
         return 1
     fi
+    return 0
 }
 
 # Remove vhost configuration
