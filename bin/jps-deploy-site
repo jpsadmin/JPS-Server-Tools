@@ -385,10 +385,11 @@ step_create_database() {
 
     # Generate database credentials
     # Use domain-based naming with underscores (MySQL-safe)
+    # Steps: replace non-alphanumeric with _, collapse multiple _, remove trailing _, truncate
     local safe_name
-    safe_name=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c1-16)
+    safe_name=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/__*/_/g' | sed 's/_$//' | cut -c1-16 | sed 's/_$//')
     DB_NAME="wp_${safe_name}"
-    DB_USER="${safe_name}_user"
+    DB_USER="${safe_name}_usr"
     DB_PASS=$(random_string 24)
 
     # Create database and user
