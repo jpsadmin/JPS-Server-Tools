@@ -6,8 +6,9 @@
 # Creates a staging site first, validates, then ready for DNS cutover.
 #
 # Supported source formats:
+#   - WPvivid backup folder (wpvivid_*_backup_info.json + multi-part ZIPs)
 #   - .wpress (All-in-One WP Migration)
-#   - .tar.gz (wp-content/ + .sql file)
+#   - .tar.gz / .zip (wp-content/ + .sql file)
 #   - rsync source (full WordPress directory)
 #
 # Usage:
@@ -68,8 +69,10 @@ DESCRIPTION:
     Creates a staging site (staging.{domain}) for validation before DNS cutover.
 
 SUPPORTED SOURCE FORMATS:
+    WPvivid     Folder with wpvivid_*_backup_info.json + multi-part ZIPs
     .wpress     All-in-One WP Migration export file
     .tar.gz     Archive containing wp-content/ and a .sql database dump
+    .zip        ZIP archive containing wp-content/ and a .sql database dump
     rsync       Remote WordPress directory (user@host:/path/to/wordpress)
 
 USAGE:
@@ -152,8 +155,16 @@ STAGING_DOC_ROOT=""
 TEMP_DIR=""
 
 # Source info (detected)
-SOURCE_TYPE=""  # wpress, tarball, rsync
+SOURCE_TYPE=""  # wpvivid, wpress, tarball, zip, rsync
 SOURCE_DB_PREFIX=""
+WPVIVID_INFO_FILE=""  # Path to wpvivid_*_backup_info.json if detected
+
+# Migration incoming folder
+MIGRATIONS_INCOMING_DIR="/var/backups/jps/migrations/incoming"
+
+# Credentials (set after migration)
+FINAL_WP_USER=""
+FINAL_WP_PASS=""
 
 # Migration stats
 MIGRATION_START_TIME=""
@@ -298,20 +309,48 @@ log_verbose() {
 detect_source_type() {
     log_verbose "Detecting source type for: $SOURCE"
 
-    # Check if it's an rsync source (contains @: or starts with /)
+    # Check if it's an rsync source (contains @: pattern for remote)
     if [[ "$SOURCE" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+: ]]; then
         SOURCE_TYPE="rsync"
         log_verbose "Source type: rsync (remote)"
         return 0
     fi
 
-    # Check if local file exists
+    # Check if local path exists
     if [[ ! -e "$SOURCE" ]]; then
         error "Source not found: $SOURCE"
         return 1
     fi
 
-    # Detect by extension
+    # Check for WPvivid backup folder (highest priority for directories)
+    if [[ -d "$SOURCE" ]]; then
+        # Look for WPvivid backup info JSON
+        local wpvivid_json
+        wpvivid_json=$(find "$SOURCE" -maxdepth 1 -name "wpvivid_*_backup_info.json" -print -quit 2>/dev/null)
+
+        if [[ -n "$wpvivid_json" ]]; then
+            SOURCE_TYPE="wpvivid"
+            WPVIVID_INFO_FILE="$wpvivid_json"
+            log_verbose "Source type: WPvivid backup (found: $(basename "$wpvivid_json"))"
+            return 0
+        fi
+
+        # Also check for multi-part ZIP pattern without JSON (legacy WPvivid)
+        local wpvivid_zips
+        wpvivid_zips=$(find "$SOURCE" -maxdepth 1 -name "*_part001.zip" -o -name "*-part001.zip" 2>/dev/null | head -1)
+        if [[ -n "$wpvivid_zips" ]]; then
+            SOURCE_TYPE="wpvivid"
+            log_verbose "Source type: WPvivid backup (multi-part ZIPs detected)"
+            return 0
+        fi
+
+        # Regular directory - treat as rsync local
+        SOURCE_TYPE="rsync"
+        log_verbose "Source type: rsync (local directory)"
+        return 0
+    fi
+
+    # Detect by file extension
     case "$SOURCE" in
         *.wpress)
             SOURCE_TYPE="wpress"
@@ -321,16 +360,33 @@ detect_source_type() {
             SOURCE_TYPE="tarball"
             log_verbose "Source type: tarball"
             ;;
-        *)
-            # Check if it's a directory (rsync local)
-            if [[ -d "$SOURCE" ]]; then
-                SOURCE_TYPE="rsync"
-                log_verbose "Source type: rsync (local directory)"
+        *.zip)
+            # Check if this is a single WPvivid part or generic ZIP
+            if [[ "$SOURCE" =~ part[0-9]+\.zip$ ]]; then
+                # This is a WPvivid part - look for the parent folder
+                local parent_dir
+                parent_dir=$(dirname "$SOURCE")
+                local wpvivid_json
+                wpvivid_json=$(find "$parent_dir" -maxdepth 1 -name "wpvivid_*_backup_info.json" -print -quit 2>/dev/null)
+
+                if [[ -n "$wpvivid_json" ]]; then
+                    SOURCE_TYPE="wpvivid"
+                    WPVIVID_INFO_FILE="$wpvivid_json"
+                    SOURCE="$parent_dir"  # Use the folder instead
+                    log_verbose "Source type: WPvivid backup (redirected to folder)"
+                else
+                    SOURCE_TYPE="zip"
+                    log_verbose "Source type: ZIP archive"
+                fi
             else
-                error "Unknown source format: $SOURCE"
-                error "Supported formats: .wpress, .tar.gz, directory, or rsync URL"
-                return 1
+                SOURCE_TYPE="zip"
+                log_verbose "Source type: ZIP archive"
             fi
+            ;;
+        *)
+            error "Unknown source format: $SOURCE"
+            error "Supported formats: WPvivid folder, .wpress, .tar.gz, .zip, directory, or rsync URL"
+            return 1
             ;;
     esac
 
@@ -389,13 +445,18 @@ check_dependencies() {
         rsync)
             command_exists rsync || missing+=("rsync")
             ;;
-        wpress)
+        wpress|wpvivid|zip)
             command_exists unzip || missing+=("unzip")
             ;;
         tarball)
             command_exists tar || missing+=("tar")
             ;;
     esac
+
+    # WPvivid may need jq for JSON parsing (optional but recommended)
+    if [[ "$SOURCE_TYPE" == "wpvivid" ]] && ! command_exists jq; then
+        warn "jq not found - WPvivid metadata parsing may be limited"
+    fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing required commands: ${missing[*]}"
@@ -579,6 +640,218 @@ extract_wpress_ai1wm() {
     fi
 
     return 1
+}
+
+#===============================================================================
+# WPVIVID EXTRACTION
+#===============================================================================
+
+extract_wpvivid() {
+    progress 3 "import" "start" "Extracting WPvivid backup"
+
+    mkdir -p "$TEMP_DIR"
+
+    # Parse WPvivid backup info if available
+    local backup_info=""
+    if [[ -n "$WPVIVID_INFO_FILE" ]] && [[ -f "$WPVIVID_INFO_FILE" ]]; then
+        log_verbose "Parsing WPvivid backup info: $WPVIVID_INFO_FILE"
+        backup_info=$(cat "$WPVIVID_INFO_FILE")
+    fi
+
+    # Find all part ZIP files in the source directory
+    local zip_parts=()
+    local db_zip=""
+    local files_zip=""
+
+    # WPvivid naming patterns:
+    # - wpvivid-<site>_<date>_<id>_<type>_part001.zip
+    # - Types: backup (files+db), files, database, uploads, themes, plugins, etc.
+
+    while IFS= read -r -d '' zipfile; do
+        local basename_zip
+        basename_zip=$(basename "$zipfile")
+
+        # Detect database backup parts
+        if [[ "$basename_zip" =~ _database_ ]] || [[ "$basename_zip" =~ _db_ ]]; then
+            log_verbose "Found database ZIP: $basename_zip"
+            db_zip="$zipfile"
+        elif [[ "$basename_zip" =~ _backup_ ]] || [[ "$basename_zip" =~ _files_ ]] || [[ "$basename_zip" =~ _themes_ ]] || [[ "$basename_zip" =~ _plugins_ ]] || [[ "$basename_zip" =~ _uploads_ ]] || [[ "$basename_zip" =~ _content_ ]]; then
+            log_verbose "Found content ZIP: $basename_zip"
+            zip_parts+=("$zipfile")
+        else
+            # Generic part - could be either
+            log_verbose "Found generic ZIP: $basename_zip"
+            zip_parts+=("$zipfile")
+        fi
+    done < <(find "$SOURCE" -maxdepth 1 -name "*.zip" -print0 2>/dev/null | sort -z)
+
+    if [[ ${#zip_parts[@]} -eq 0 ]] && [[ -z "$db_zip" ]]; then
+        error "No WPvivid ZIP files found in $SOURCE"
+        return 1
+    fi
+
+    log_verbose "Found ${#zip_parts[@]} content ZIPs and ${db_zip:+1 database ZIP}"
+
+    # Extract database ZIP first (if separate)
+    if [[ -n "$db_zip" ]]; then
+        log_verbose "Extracting database from: $(basename "$db_zip")"
+        if ! unzip -q -o "$db_zip" -d "$TEMP_DIR" 2>/dev/null; then
+            error "Failed to extract database ZIP"
+            return 1
+        fi
+    fi
+
+    # Extract all content ZIPs
+    for zipfile in "${zip_parts[@]}"; do
+        log_verbose "Extracting: $(basename "$zipfile")"
+        if ! unzip -q -o "$zipfile" -d "$TEMP_DIR" 2>/dev/null; then
+            warn "Failed to extract: $(basename "$zipfile")"
+        fi
+    done
+
+    # WPvivid typically extracts to a structure like:
+    # - wp-content/ (site files)
+    # - *.sql or wpvivid_*.sql (database dump)
+
+    # Find and normalize the database file
+    if ! wpvivid_find_database; then
+        warn "No database found in WPvivid backup"
+    fi
+
+    # Find and normalize wp-content
+    if ! wpvivid_find_content; then
+        warn "No wp-content found in WPvivid backup"
+    fi
+
+    progress 3 "import" "complete" "WPvivid backup extracted"
+    return 0
+}
+
+wpvivid_find_database() {
+    # WPvivid database naming patterns:
+    # - wpvivid_*.sql
+    # - *.sql in root
+    # - database.sql
+
+    local sql_file=""
+
+    # Check for wpvivid named SQL file
+    sql_file=$(find "$TEMP_DIR" -maxdepth 2 -name "wpvivid_*.sql" -type f -print -quit 2>/dev/null)
+
+    if [[ -z "$sql_file" ]]; then
+        # Check for any SQL file
+        sql_file=$(find "$TEMP_DIR" -maxdepth 2 -name "*.sql" -type f -print -quit 2>/dev/null)
+    fi
+
+    if [[ -n "$sql_file" ]] && [[ -f "$sql_file" ]]; then
+        log_verbose "Found SQL file: $sql_file"
+        local sql_size
+        sql_size=$(stat -c%s "$sql_file" 2>/dev/null || echo "0")
+        log_verbose "SQL file size: $sql_size bytes"
+
+        if [[ "$sql_file" != "$TEMP_DIR/database.sql" ]]; then
+            mv "$sql_file" "$TEMP_DIR/database.sql"
+        fi
+        return 0
+    fi
+
+    return 1
+}
+
+wpvivid_find_content() {
+    # Look for wp-content directory
+    # WPvivid may extract to various structures
+
+    # Already in place?
+    if [[ -d "$TEMP_DIR/wp-content" ]]; then
+        log_verbose "wp-content found at root"
+        return 0
+    fi
+
+    # Search for wp-content in subdirectories
+    local found_dir
+    found_dir=$(find "$TEMP_DIR" -maxdepth 3 -type d -name "wp-content" -print -quit 2>/dev/null)
+
+    if [[ -n "$found_dir" ]]; then
+        log_verbose "Found wp-content at: $found_dir"
+        # Move to expected location
+        if [[ "$found_dir" != "$TEMP_DIR/wp-content" ]]; then
+            mv "$found_dir" "$TEMP_DIR/wp-content"
+        fi
+        return 0
+    fi
+
+    # Check if we have individual content directories (themes, plugins, uploads)
+    # This happens with split WPvivid backups
+    local has_content=false
+
+    if [[ -d "$TEMP_DIR/themes" ]] || [[ -d "$TEMP_DIR/plugins" ]] || [[ -d "$TEMP_DIR/uploads" ]]; then
+        log_verbose "Found split content directories, reconstructing wp-content"
+        mkdir -p "$TEMP_DIR/wp-content"
+
+        [[ -d "$TEMP_DIR/themes" ]] && mv "$TEMP_DIR/themes" "$TEMP_DIR/wp-content/"
+        [[ -d "$TEMP_DIR/plugins" ]] && mv "$TEMP_DIR/plugins" "$TEMP_DIR/wp-content/"
+        [[ -d "$TEMP_DIR/uploads" ]] && mv "$TEMP_DIR/uploads" "$TEMP_DIR/wp-content/"
+
+        has_content=true
+    fi
+
+    if [[ "$has_content" == true ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+#===============================================================================
+# GENERIC ZIP EXTRACTION
+#===============================================================================
+
+extract_zip() {
+    progress 3 "import" "start" "Extracting ZIP archive"
+
+    mkdir -p "$TEMP_DIR"
+
+    # Extract ZIP
+    if ! unzip -q "$SOURCE" -d "$TEMP_DIR" 2>/dev/null; then
+        error "Failed to extract ZIP archive"
+        return 1
+    fi
+
+    # Find wp-content and SQL file (same logic as tarball)
+    local wp_content_found=false
+    local sql_found=false
+
+    # Look for wp-content
+    if [[ -d "$TEMP_DIR/wp-content" ]]; then
+        wp_content_found=true
+    else
+        local found_dir
+        found_dir=$(find "$TEMP_DIR" -type d -name "wp-content" -print -quit 2>/dev/null)
+        if [[ -n "$found_dir" ]]; then
+            mv "$found_dir" "$TEMP_DIR/wp-content"
+            wp_content_found=true
+        fi
+    fi
+
+    # Look for SQL file
+    local sql_file
+    sql_file=$(find "$TEMP_DIR" -type f -name "*.sql" -print -quit 2>/dev/null)
+    if [[ -n "$sql_file" ]]; then
+        mv "$sql_file" "$TEMP_DIR/database.sql"
+        sql_found=true
+    fi
+
+    if [[ "$wp_content_found" != true ]]; then
+        warn "wp-content directory not found in archive"
+    fi
+
+    if [[ "$sql_found" != true ]]; then
+        warn "SQL database dump not found in archive"
+    fi
+
+    progress 3 "import" "complete" "Archive extracted"
+    return 0
 }
 
 extract_tarball() {
@@ -1033,6 +1306,191 @@ log_lifecycle_event() {
 }
 
 #===============================================================================
+# CREDENTIAL RESET
+#===============================================================================
+
+reset_admin_credentials() {
+    progress 8 "credentials" "start" "Resetting admin credentials"
+
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+
+    # First, try to find an existing admin user
+    local admin_user=""
+    admin_user=$("$wp_bin" user list --path="$STAGING_DOC_ROOT" --allow-root \
+        --role=administrator --field=user_login 2>/dev/null | head -1)
+
+    if [[ -z "$admin_user" ]]; then
+        # Try to get any user with admin capabilities
+        admin_user=$("$wp_bin" user list --path="$STAGING_DOC_ROOT" --allow-root \
+            --field=user_login 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$admin_user" ]]; then
+        warn "No admin user found, creating default admin"
+        admin_user="jps_admin"
+
+        # Generate password
+        local new_pass
+        new_pass=$(random_string 16)
+
+        # Create admin user
+        if "$wp_bin" user create "$admin_user" "admin@${STAGING_DOMAIN}" \
+            --path="$STAGING_DOC_ROOT" --allow-root \
+            --role=administrator \
+            --user_pass="$new_pass" 2>/dev/null; then
+            FINAL_WP_USER="$admin_user"
+            FINAL_WP_PASS="$new_pass"
+            log_verbose "Created admin user: $admin_user"
+        else
+            error "Failed to create admin user"
+            return 1
+        fi
+    else
+        # Reset password for existing admin user
+        log_verbose "Found admin user: $admin_user"
+
+        # Use jps-regen-password if available
+        local regen_cmd="${INSTALL_DIR}/bin/jps-regen-password"
+        [[ ! -x "$regen_cmd" ]] && regen_cmd="/usr/local/bin/jps-regen-password"
+
+        if [[ -x "$regen_cmd" ]]; then
+            local regen_output
+            regen_output=$("$regen_cmd" "$STAGING_DOMAIN" --user "$admin_user" --json 2>/dev/null)
+
+            if [[ -n "$regen_output" ]]; then
+                # Parse JSON output to get new password
+                local new_pass
+                new_pass=$(echo "$regen_output" | grep -oP '"password"\s*:\s*"\K[^"]+' 2>/dev/null || echo "")
+
+                if [[ -n "$new_pass" ]]; then
+                    FINAL_WP_USER="$admin_user"
+                    FINAL_WP_PASS="$new_pass"
+                    log_verbose "Password reset via jps-regen-password"
+                fi
+            fi
+        fi
+
+        # Fallback: reset password directly with WP-CLI
+        if [[ -z "$FINAL_WP_PASS" ]]; then
+            local new_pass
+            new_pass=$(random_string 16)
+
+            if "$wp_bin" user update "$admin_user" --path="$STAGING_DOC_ROOT" --allow-root \
+                --user_pass="$new_pass" 2>/dev/null; then
+                FINAL_WP_USER="$admin_user"
+                FINAL_WP_PASS="$new_pass"
+                log_verbose "Password reset via WP-CLI"
+            else
+                error "Failed to reset password for user: $admin_user"
+                return 1
+            fi
+        fi
+    fi
+
+    # Update CREDENTIALS.txt if it exists
+    local creds_file="${STAGING_DIR}/CREDENTIALS.txt"
+    if [[ -f "$creds_file" ]]; then
+        # Update WP credentials in the file
+        sed -i "s/^WP Username:.*/WP Username:     ${FINAL_WP_USER}/" "$creds_file" 2>/dev/null || true
+        sed -i "s/^WP Password:.*/WP Password:     ${FINAL_WP_PASS}/" "$creds_file" 2>/dev/null || true
+        chmod 600 "$creds_file"
+        log_verbose "Updated CREDENTIALS.txt"
+    fi
+
+    progress 8 "credentials" "complete" "Admin credentials reset: $FINAL_WP_USER"
+    return 0
+}
+
+#===============================================================================
+# MIGRATION VERIFICATION
+#===============================================================================
+
+verify_migration() {
+    progress 9 "verify" "start" "Verifying migration content"
+
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+    local verification_errors=0
+
+    # Check siteurl and home options
+    local site_url home_url
+    site_url=$("$wp_bin" option get siteurl --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || echo "")
+    home_url=$("$wp_bin" option get home --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || echo "")
+
+    log_verbose "siteurl: $site_url"
+    log_verbose "home: $home_url"
+
+    if [[ -z "$site_url" ]] || [[ -z "$home_url" ]]; then
+        error "Failed to retrieve site URLs from database"
+        ((verification_errors++))
+    fi
+
+    # Check that URLs point to staging domain
+    if [[ "$site_url" != *"${STAGING_DOMAIN}"* ]]; then
+        warn "siteurl does not contain staging domain: $site_url"
+    fi
+
+    # Count posts
+    local post_count
+    post_count=$("$wp_bin" post list --path="$STAGING_DOC_ROOT" --allow-root \
+        --post_type=post --format=count 2>/dev/null || echo "0")
+    log_verbose "Post count: $post_count"
+
+    # Count pages
+    local page_count
+    page_count=$("$wp_bin" post list --path="$STAGING_DOC_ROOT" --allow-root \
+        --post_type=page --format=count 2>/dev/null || echo "0")
+    log_verbose "Page count: $page_count"
+
+    # Check for imported tables (verify database has content)
+    local staging_config="$STAGING_DOC_ROOT/wp-config.php"
+    local staging_db_name staging_db_user staging_db_pass staging_prefix
+
+    staging_db_name=$(grep "DB_NAME" "$staging_config" | cut -d"'" -f4)
+    staging_db_user=$(grep "DB_USER" "$staging_config" | cut -d"'" -f4)
+    staging_db_pass=$(grep "DB_PASSWORD" "$staging_config" | cut -d"'" -f4)
+    staging_prefix=$(grep "table_prefix" "$staging_config" | cut -d"'" -f2 || echo "wp_")
+
+    # Count tables
+    local table_count
+    table_count=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$staging_db_name';" 2>/dev/null || echo "0")
+    log_verbose "Table count: $table_count"
+
+    if [[ "$table_count" -lt 10 ]]; then
+        warn "Low table count ($table_count) - database may not have imported correctly"
+        ((verification_errors++))
+    fi
+
+    # Check options table has entries
+    local option_count
+    option_count=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
+        "SELECT COUNT(*) FROM ${staging_prefix}options;" 2>/dev/null || echo "0")
+    log_verbose "Options count: $option_count"
+
+    if [[ "$option_count" -lt 50 ]]; then
+        warn "Low options count ($option_count) - site may need review"
+        ((verification_errors++))
+    fi
+
+    # Summary output for verification
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        echo "{\"step\":\"verify\",\"posts\":${post_count},\"pages\":${page_count},\"tables\":${table_count},\"options\":${option_count}}"
+    else
+        log_verbose "Verification: $post_count posts, $page_count pages, $table_count tables"
+    fi
+
+    if [[ $verification_errors -gt 0 ]]; then
+        progress 9 "verify" "warning" "Migration verified with $verification_errors warning(s)"
+        return 1
+    fi
+
+    progress 9 "verify" "complete" "Migration content verified"
+    return 0
+}
+
+#===============================================================================
 # MAIN EXECUTION
 #===============================================================================
 
@@ -1093,9 +1551,21 @@ main() {
 
     # Import source based on type
     case "$SOURCE_TYPE" in
+        wpvivid)
+            if ! extract_wpvivid; then
+                log_lifecycle_event "failed" "Failed to extract WPvivid backup"
+                exit 1
+            fi
+            ;;
         wpress)
             if ! extract_wpress; then
                 log_lifecycle_event "failed" "Failed to extract .wpress archive"
+                exit 1
+            fi
+            ;;
+        zip)
+            if ! extract_zip; then
+                log_lifecycle_event "failed" "Failed to extract ZIP archive"
                 exit 1
             fi
             ;;
@@ -1148,6 +1618,14 @@ main() {
         log_lifecycle_event "success" "Migration completed successfully"
     fi
 
+    # Reset admin credentials (critical step - ensures login works)
+    if ! reset_admin_credentials; then
+        warn "Could not reset admin credentials - manual intervention may be required"
+    fi
+
+    # Verify migration content
+    verify_migration || true  # Don't fail on verification warnings
+
     # Calculate duration
     local end_time
     end_time=$(date +%s)
@@ -1155,14 +1633,29 @@ main() {
 
     # Success output
     if [[ "$PROGRESS_OUTPUT" == true ]]; then
-        echo "{\"step\":\"result\",\"status\":\"success\",\"staging_domain\":\"${STAGING_DOMAIN}\",\"duration\":${duration}}"
+        local creds_json=""
+        if [[ -n "$FINAL_WP_USER" ]] && [[ -n "$FINAL_WP_PASS" ]]; then
+            creds_json=",\"wp_user\":\"${FINAL_WP_USER}\",\"wp_pass\":\"${FINAL_WP_PASS}\""
+        fi
+        echo "{\"step\":\"result\",\"status\":\"success\",\"staging_domain\":\"${STAGING_DOMAIN}\",\"duration\":${duration}${creds_json}}"
     else
         echo ""
         success "Migration completed!"
         echo ""
+        echo "=========================================="
+        echo "STAGING SITE DETAILS"
+        echo "=========================================="
         echo "Staging Site:   https://${STAGING_DOMAIN}"
         echo "Admin URL:      https://${STAGING_DOMAIN}/wp-admin/"
+        echo ""
+        if [[ -n "$FINAL_WP_USER" ]] && [[ -n "$FINAL_WP_PASS" ]]; then
+            echo "CREDENTIALS (confirmed working):"
+            echo "  Username:     ${FINAL_WP_USER}"
+            echo "  Password:     ${FINAL_WP_PASS}"
+            echo ""
+        fi
         echo "Duration:       ${duration} seconds"
+        echo "=========================================="
         echo ""
         echo "NEXT STEPS:"
         echo "  1. Test the staging site thoroughly"

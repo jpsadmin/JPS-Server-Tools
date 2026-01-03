@@ -1,0 +1,572 @@
+#!/bin/bash
+#===============================================================================
+# JPS Migration Cleanup - Migration Backup Cleanup Tool
+#
+# Manages and cleans up migration backup files from the incoming folder.
+# Supports manual cleanup and automatic retention policy (7 days).
+#
+# Usage:
+#   jps-migration-cleanup                     # Show status and dry-run
+#   jps-migration-cleanup --delete            # Delete backups older than 7 days
+#   jps-migration-cleanup --delete --days 3   # Delete backups older than 3 days
+#   jps-migration-cleanup --delete --all      # Delete all backups
+#   jps-migration-cleanup --list              # List all migration backups
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Operation failed
+#   2 - Invalid arguments
+#===============================================================================
+
+set -eo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-migration-cleanup"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+MIGRATIONS_INCOMING_DIR="/var/backups/jps/migrations/incoming"
+MIGRATIONS_METADATA_DIR="/var/backups/jps/migrations/metadata"
+DEFAULT_RETENTION_DAYS=7
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Migration Cleanup - Migration Backup Cleanup Tool
+
+DESCRIPTION:
+    Manages and cleans up migration backup files from the incoming folder.
+    By default, uses a 7-day retention policy for successful migrations.
+
+USAGE:
+    jps-migration-cleanup [OPTIONS]
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -l, --list              List all migration backups with metadata
+    -d, --delete            Actually delete files (default is dry-run)
+    --days DAYS             Retention period in days (default: 7)
+    --all                   Delete all backups regardless of age
+    --domain DOMAIN         Only cleanup backups for specific domain
+    --json                  Output in JSON format
+    -v, --verbose           Show detailed output
+    -q, --quiet             Minimal output
+
+EXAMPLES:
+    # Show what would be deleted (dry-run)
+    jps-migration-cleanup
+
+    # Delete backups older than 7 days
+    jps-migration-cleanup --delete
+
+    # Delete backups older than 3 days
+    jps-migration-cleanup --delete --days 3
+
+    # Delete all backups
+    jps-migration-cleanup --delete --all
+
+    # List all backups with details
+    jps-migration-cleanup --list
+
+    # Delete backups for specific domain
+    jps-migration-cleanup --delete --domain example.com
+
+EXIT CODES:
+    0 - Cleanup completed successfully
+    1 - Cleanup failed
+    2 - Invalid arguments
+
+NOTES:
+    - Backups from failed migrations are NOT auto-deleted
+    - Use --all to force delete all backups including failed ones
+    - Metadata is stored in /var/backups/jps/migrations/metadata/
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DO_DELETE=false
+DELETE_ALL=false
+RETENTION_DAYS=$DEFAULT_RETENTION_DAYS
+TARGET_DOMAIN=""
+LIST_ONLY=false
+JSON_OUTPUT=false
+VERBOSE=false
+QUIET=false
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -l|--list)
+                LIST_ONLY=true
+                shift
+                ;;
+            -d|--delete)
+                DO_DELETE=true
+                shift
+                ;;
+            --days)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --days requires an argument"
+                    exit 2
+                fi
+                if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    error "Days must be a positive integer"
+                    exit 2
+                fi
+                RETENTION_DAYS="$2"
+                shift 2
+                ;;
+            --all)
+                DELETE_ALL=true
+                shift
+                ;;
+            --domain)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --domain requires an argument"
+                    exit 2
+                fi
+                TARGET_DOMAIN="$2"
+                shift 2
+                ;;
+            --json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                error "Unexpected argument: $1"
+                exit 2
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]] && [[ "$JSON_OUTPUT" != true ]]; then
+        echo "  [DEBUG] $*"
+    fi
+}
+
+output_message() {
+    if [[ "$QUIET" != true ]] && [[ "$JSON_OUTPUT" != true ]]; then
+        echo "$*"
+    fi
+}
+
+#===============================================================================
+# METADATA FUNCTIONS
+#===============================================================================
+
+# Read metadata for a migration backup
+read_metadata() {
+    local backup_path="$1"
+    local basename_path
+    basename_path=$(basename "$backup_path")
+
+    local metadata_file="${MIGRATIONS_METADATA_DIR}/${basename_path}.json"
+
+    if [[ -f "$metadata_file" ]]; then
+        cat "$metadata_file"
+    else
+        echo "{}"
+    fi
+}
+
+# Write metadata for a migration backup
+write_metadata() {
+    local backup_path="$1"
+    local domain="$2"
+    local status="$3"
+    local source_type="$4"
+
+    mkdir -p "$MIGRATIONS_METADATA_DIR"
+
+    local basename_path
+    basename_path=$(basename "$backup_path")
+    local metadata_file="${MIGRATIONS_METADATA_DIR}/${basename_path}.json"
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local epoch
+    epoch=$(date +%s)
+
+    cat > "$metadata_file" << EOF
+{
+    "backup_path": "$backup_path",
+    "domain": "$domain",
+    "status": "$status",
+    "source_type": "$source_type",
+    "created": "$timestamp",
+    "created_epoch": $epoch
+}
+EOF
+
+    chmod 600 "$metadata_file"
+}
+
+# Get metadata status
+get_metadata_status() {
+    local backup_path="$1"
+    local metadata
+    metadata=$(read_metadata "$backup_path")
+
+    if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+        echo "$metadata" | grep -oP '"status"\s*:\s*"\K[^"]+' 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+# Get metadata domain
+get_metadata_domain() {
+    local backup_path="$1"
+    local metadata
+    metadata=$(read_metadata "$backup_path")
+
+    if [[ -n "$metadata" ]] && [[ "$metadata" != "{}" ]]; then
+        echo "$metadata" | grep -oP '"domain"\s*:\s*"\K[^"]+' 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+#===============================================================================
+# CLEANUP FUNCTIONS
+#===============================================================================
+
+# Get list of all migration backups
+list_backups() {
+    local backups=()
+
+    if [[ ! -d "$MIGRATIONS_INCOMING_DIR" ]]; then
+        return
+    fi
+
+    # Find all items in incoming directory
+    while IFS= read -r -d '' item; do
+        backups+=("$item")
+    done < <(find "$MIGRATIONS_INCOMING_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+    echo "${backups[@]}"
+}
+
+# Get age of backup in days
+get_backup_age_days() {
+    local backup_path="$1"
+    local mtime
+    mtime=$(stat -c %Y "$backup_path" 2>/dev/null || echo "0")
+    local now
+    now=$(date +%s)
+    local age_seconds=$((now - mtime))
+    local age_days=$((age_seconds / 86400))
+    echo "$age_days"
+}
+
+# Get size of backup
+get_backup_size() {
+    local backup_path="$1"
+    if [[ -d "$backup_path" ]]; then
+        du -sh "$backup_path" 2>/dev/null | cut -f1
+    elif [[ -f "$backup_path" ]]; then
+        du -h "$backup_path" 2>/dev/null | cut -f1
+    else
+        echo "0"
+    fi
+}
+
+# Check if backup should be deleted
+should_delete() {
+    local backup_path="$1"
+    local age_days
+    age_days=$(get_backup_age_days "$backup_path")
+    local status
+    status=$(get_metadata_status "$backup_path")
+    local domain
+    domain=$(get_metadata_domain "$backup_path")
+
+    # Filter by domain if specified
+    if [[ -n "$TARGET_DOMAIN" ]] && [[ "$domain" != "$TARGET_DOMAIN" ]]; then
+        return 1  # Don't delete - wrong domain
+    fi
+
+    # Delete all mode
+    if [[ "$DELETE_ALL" == true ]]; then
+        return 0  # Delete
+    fi
+
+    # Don't delete failed migrations (need manual review)
+    if [[ "$status" == "failed" ]]; then
+        log_verbose "Skipping failed migration: $backup_path"
+        return 1  # Don't delete
+    fi
+
+    # Check age
+    if [[ "$age_days" -ge "$RETENTION_DAYS" ]]; then
+        return 0  # Delete
+    fi
+
+    return 1  # Don't delete
+}
+
+# Delete a backup and its metadata
+delete_backup() {
+    local backup_path="$1"
+    local basename_path
+    basename_path=$(basename "$backup_path")
+
+    log_verbose "Deleting: $backup_path"
+
+    # Delete the backup
+    if [[ -d "$backup_path" ]]; then
+        rm -rf "$backup_path"
+    elif [[ -f "$backup_path" ]]; then
+        rm -f "$backup_path"
+    fi
+
+    # Delete metadata
+    local metadata_file="${MIGRATIONS_METADATA_DIR}/${basename_path}.json"
+    if [[ -f "$metadata_file" ]]; then
+        rm -f "$metadata_file"
+    fi
+}
+
+# List all backups with details
+do_list() {
+    output_message "Migration Backups in: $MIGRATIONS_INCOMING_DIR"
+    output_message "=========================================="
+    output_message ""
+
+    if [[ ! -d "$MIGRATIONS_INCOMING_DIR" ]]; then
+        output_message "No migration backups found (directory does not exist)"
+        return 0
+    fi
+
+    local total_count=0
+    local total_size=0
+    local json_items=()
+
+    while IFS= read -r -d '' backup; do
+        ((total_count++)) || true
+
+        local basename_item
+        basename_item=$(basename "$backup")
+        local size
+        size=$(get_backup_size "$backup")
+        local age_days
+        age_days=$(get_backup_age_days "$backup")
+        local status
+        status=$(get_metadata_status "$backup")
+        local domain
+        domain=$(get_metadata_domain "$backup")
+
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            json_items+=("{\"name\":\"$basename_item\",\"size\":\"$size\",\"age_days\":$age_days,\"status\":\"$status\",\"domain\":\"$domain\"}")
+        else
+            local type_indicator=""
+            [[ -d "$backup" ]] && type_indicator="[DIR]" || type_indicator="[FILE]"
+
+            output_message "$type_indicator $basename_item"
+            output_message "  Size: $size | Age: ${age_days} days | Status: $status | Domain: ${domain:-unknown}"
+            output_message ""
+        fi
+    done < <(find "$MIGRATIONS_INCOMING_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | sort -z)
+
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local json_array
+        json_array=$(printf '%s,' "${json_items[@]}" | sed 's/,$//')
+        echo "{\"count\":$total_count,\"backups\":[$json_array]}"
+    else
+        output_message "=========================================="
+        output_message "Total: $total_count backup(s)"
+    fi
+}
+
+# Main cleanup operation
+do_cleanup() {
+    if [[ ! -d "$MIGRATIONS_INCOMING_DIR" ]]; then
+        output_message "No migration backups found (directory does not exist)"
+        return 0
+    fi
+
+    local to_delete=()
+    local to_keep=()
+    local deleted_count=0
+    local deleted_size=0
+
+    # Identify backups to delete
+    while IFS= read -r -d '' backup; do
+        if should_delete "$backup"; then
+            to_delete+=("$backup")
+        else
+            to_keep+=("$backup")
+        fi
+    done < <(find "$MIGRATIONS_INCOMING_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+    # Report what will be deleted
+    if [[ "$DO_DELETE" != true ]]; then
+        output_message "DRY RUN - No files will be deleted"
+        output_message "Use --delete to actually remove files"
+        output_message ""
+    fi
+
+    if [[ ${#to_delete[@]} -eq 0 ]]; then
+        output_message "No backups to delete"
+        output_message "Keeping ${#to_keep[@]} backup(s)"
+        return 0
+    fi
+
+    output_message "Backups to delete: ${#to_delete[@]}"
+    output_message "Backups to keep: ${#to_keep[@]}"
+    output_message ""
+
+    local json_deleted=()
+
+    for backup in "${to_delete[@]}"; do
+        local basename_item
+        basename_item=$(basename "$backup")
+        local size
+        size=$(get_backup_size "$backup")
+        local age_days
+        age_days=$(get_backup_age_days "$backup")
+
+        if [[ "$DO_DELETE" == true ]]; then
+            if delete_backup "$backup"; then
+                ((deleted_count++)) || true
+                if [[ "$JSON_OUTPUT" != true ]]; then
+                    success "Deleted: $basename_item ($size, ${age_days} days old)"
+                fi
+                json_deleted+=("{\"name\":\"$basename_item\",\"size\":\"$size\",\"age_days\":$age_days}")
+            else
+                if [[ "$JSON_OUTPUT" != true ]]; then
+                    error "Failed to delete: $basename_item"
+                fi
+            fi
+        else
+            output_message "Would delete: $basename_item ($size, ${age_days} days old)"
+        fi
+    done
+
+    # Log cleanup action
+    if [[ "$DO_DELETE" == true ]] && [[ $deleted_count -gt 0 ]]; then
+        log_to_file "cleanup" "Deleted $deleted_count migration backup(s)" "${LOG_DIR}/lifecycle/migrate.log"
+    fi
+
+    # JSON output
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        local json_array
+        json_array=$(printf '%s,' "${json_deleted[@]}" | sed 's/,$//')
+        echo "{\"deleted\":$deleted_count,\"kept\":${#to_keep[@]},\"items\":[$json_array]}"
+    else
+        output_message ""
+        if [[ "$DO_DELETE" == true ]]; then
+            output_message "Deleted: $deleted_count backup(s)"
+        else
+            output_message "Would delete: ${#to_delete[@]} backup(s)"
+        fi
+        output_message "Kept: ${#to_keep[@]} backup(s)"
+    fi
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Parse arguments
+    parse_args "$@"
+
+    # Ensure incoming directory exists
+    mkdir -p "$MIGRATIONS_INCOMING_DIR" 2>/dev/null || true
+    mkdir -p "$MIGRATIONS_METADATA_DIR" 2>/dev/null || true
+
+    # Execute appropriate action
+    if [[ "$LIST_ONLY" == true ]]; then
+        do_list
+    else
+        if [[ "$JSON_OUTPUT" != true ]] && [[ "$QUIET" != true ]]; then
+            header "JPS Migration Cleanup"
+            echo "Retention: ${RETENTION_DAYS} days"
+            [[ -n "$TARGET_DOMAIN" ]] && echo "Domain filter: $TARGET_DOMAIN"
+            [[ "$DELETE_ALL" == true ]] && echo "Mode: Delete ALL"
+            echo ""
+        fi
+
+        do_cleanup
+    fi
+
+    exit 0
+}
+
+# Run main function
+main "$@"
