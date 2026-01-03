@@ -1,0 +1,29 @@
+# ============================
+# VPS runtime artifacts
+# ============================
+
+# Logs (runtime only)
+logs/
+!logs/.keep
+
+# Generated audit & monitor output
+logs/**/*.json
+logs/**/latest.json
+
+# Lifecycle logs
+logs/lifecycle/
+logs/audit/
+logs/daily-monitor/
+
+# Generated example configs
+config/*.example
+
+# Backups / temp files
+*.bak
+*.tmp
+*.swp
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
