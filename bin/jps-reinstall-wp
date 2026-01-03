@@ -357,6 +357,45 @@ reinstall_wordpress() {
     return 0
 }
 
+install_stack() {
+    log_step "Installing plugin/theme stack..."
+
+    # Check if jps-install-stack is available
+    local stack_cmd="${INSTALL_DIR}/bin/jps-install-stack"
+    if [[ ! -x "$stack_cmd" ]]; then
+        stack_cmd="/usr/local/bin/jps-install-stack"
+    fi
+
+    if [[ ! -x "$stack_cmd" ]]; then
+        warn "jps-install-stack not found, skipping plugin/theme restoration"
+        return 0
+    fi
+
+    # Install the stack
+    if "$stack_cmd" "$DOMAIN" --quiet 2>/dev/null; then
+        log_step "Plugin/theme stack installed successfully"
+        return 0
+    else
+        warn "Some plugins/themes failed to install"
+        return 0  # Don't fail the whole reinstall for this
+    fi
+}
+
+# Log lifecycle event
+log_lifecycle_event() {
+    local action="$1"
+    local message="$2"
+    local log_file="${LOG_DIR}/lifecycle/reinstall.log"
+
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    echo "[$timestamp] action=${action} domain=${DOMAIN} message=\"${message}\" user=$(whoami)" >> "$log_file"
+}
+
 #===============================================================================
 # MAIN EXECUTION
 #===============================================================================
@@ -397,10 +436,13 @@ main() {
         local new_version
         new_version=$($wp_bin core version --path="$DOC_ROOT" --allow-root 2>/dev/null || echo "unknown")
 
+        # Install plugin/theme stack to restore themes
+        install_stack
+
         output_result "success" "WordPress reinstalled successfully" "{\"domain\": \"$DOMAIN\", \"wp_version\": \"$new_version\", \"uploads_preserved\": $PRESERVE_UPLOADS}"
 
         # Log to lifecycle
-        log_lifecycle "reinstall" "$DOMAIN" "WordPress reinstalled to version $new_version"
+        log_lifecycle_event "reinstall" "WordPress reinstalled to version $new_version"
 
         exit 0
     else
