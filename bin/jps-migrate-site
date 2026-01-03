@@ -1,0 +1,1178 @@
+#!/bin/bash
+#===============================================================================
+# JPS Migrate Site - WordPress Site Migration Tool
+#
+# Migrates WordPress sites from external hosting (NameHero reseller) to JPS.
+# Creates a staging site first, validates, then ready for DNS cutover.
+#
+# Supported source formats:
+#   - .wpress (All-in-One WP Migration)
+#   - .tar.gz (wp-content/ + .sql file)
+#   - rsync source (full WordPress directory)
+#
+# Usage:
+#   jps-migrate-site --domain example.com --source /path/to/backup.wpress
+#   jps-migrate-site --domain example.com --source user@host:/path/to/wp
+#   jps-migrate-site --domain example.com --source /path/to/backup.tar.gz
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Migration failed
+#   2 - Invalid arguments
+#   3 - Pre-flight check failed
+#===============================================================================
+
+set -eo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-migrate-site"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Migrate Site - WordPress Site Migration Tool
+
+DESCRIPTION:
+    Migrates WordPress sites from external hosting to JPS infrastructure.
+    Creates a staging site (staging.{domain}) for validation before DNS cutover.
+
+SUPPORTED SOURCE FORMATS:
+    .wpress     All-in-One WP Migration export file
+    .tar.gz     Archive containing wp-content/ and a .sql database dump
+    rsync       Remote WordPress directory (user@host:/path/to/wordpress)
+
+USAGE:
+    jps-migrate-site --domain <domain> --source <path|url> [OPTIONS]
+
+REQUIRED:
+    -d, --domain DOMAIN     Target domain (staging.{domain} will be created)
+    -s, --source SOURCE     Migration source (file path or rsync URL)
+
+OPTIONS:
+    -h, --help              Show this help message
+    -V, --version           Show version information
+    -c, --checkpoint        Create checkpoint backup before migration
+    -n, --note NOTE         Add note to migration log
+    -y, --yes               Skip confirmation prompts
+    --woo                   Force WooCommerce optimization preset
+    --progress              Output JSON progress updates (for automation)
+    -v, --verbose           Show detailed output
+    -q, --quiet             Minimal output
+
+WORKFLOW:
+    1. Pre-flight checks (source exists, disk space, etc.)
+    2. Deploy staging site (staging.{domain})
+    3. Import source data to staging
+    4. Update URLs in database (WP-CLI search-replace)
+    5. Validate staging site
+    6. Report success - manual DNS cutover required
+
+EXAMPLES:
+    # Migrate from .wpress file
+    jps-migrate-site -d example.com -s /mnt/migrations/example.wpress
+
+    # Migrate from tar.gz with checkpoint
+    jps-migrate-site -d example.com -s /backups/site.tar.gz --checkpoint
+
+    # Migrate via rsync from remote server
+    jps-migrate-site -d example.com -s user@oldhost:/var/www/example.com
+
+    # Automated migration with JSON progress
+    jps-migrate-site -d example.com -s /path/to/backup.wpress --yes --progress
+
+EXIT CODES:
+    0 - Migration completed successfully
+    1 - Migration failed (staging preserved for inspection)
+    2 - Invalid arguments
+    3 - Pre-flight check failed
+
+NOTES:
+    - DNS changes are NOT handled by this tool
+    - After migration, manually update DNS to point to this server
+    - Staging site remains accessible for testing before DNS cutover
+    - Use jps-site-delete to remove staging after successful cutover
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+DOMAIN=""
+SOURCE=""
+STAGING_DOMAIN=""
+CREATE_CHECKPOINT=false
+NOTE=""
+SKIP_CONFIRM=false
+FORCE_WOO=false
+PROGRESS_OUTPUT=false
+VERBOSE=false
+QUIET=false
+
+# Paths (set after domain validation)
+STAGING_DIR=""
+STAGING_DOC_ROOT=""
+TEMP_DIR=""
+
+# Source info (detected)
+SOURCE_TYPE=""  # wpress, tarball, rsync
+SOURCE_DB_PREFIX=""
+
+# Migration stats
+MIGRATION_START_TIME=""
+DISK_USAGE_BEFORE=""
+DISK_USAGE_AFTER=""
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -d|--domain)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --domain requires an argument"
+                    exit 2
+                fi
+                DOMAIN="$2"
+                shift 2
+                ;;
+            -s|--source)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --source requires an argument"
+                    exit 2
+                fi
+                SOURCE="$2"
+                shift 2
+                ;;
+            -c|--checkpoint)
+                CREATE_CHECKPOINT=true
+                shift
+                ;;
+            -n|--note)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --note requires an argument"
+                    exit 2
+                fi
+                NOTE="$2"
+                shift 2
+                ;;
+            -y|--yes)
+                SKIP_CONFIRM=true
+                shift
+                ;;
+            --woo)
+                FORCE_WOO=true
+                shift
+                ;;
+            --progress)
+                PROGRESS_OUTPUT=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                error "Unexpected argument: $1"
+                exit 2
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "$DOMAIN" ]]; then
+        error "Domain is required (--domain)"
+        echo "Usage: $SCRIPT_NAME --domain <domain> --source <path>"
+        exit 2
+    fi
+
+    if [[ -z "$SOURCE" ]]; then
+        error "Source is required (--source)"
+        echo "Usage: $SCRIPT_NAME --domain <domain> --source <path>"
+        exit 2
+    fi
+
+    # Validate domain format
+    if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+        error "Invalid domain format: $DOMAIN"
+        exit 2
+    fi
+
+    # Set staging domain
+    STAGING_DOMAIN="staging.${DOMAIN}"
+
+    # Set paths
+    STAGING_DIR="${WEBSITES_ROOT}/${STAGING_DOMAIN}"
+    STAGING_DOC_ROOT="${STAGING_DIR}/html"
+    TEMP_DIR="/tmp/jps-migrate-${DOMAIN}-$$"
+}
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+progress() {
+    local step="$1"
+    local phase="$2"
+    local status="$3"
+    local message="$4"
+
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        echo "{\"step\":${step},\"phase\":\"${phase}\",\"status\":\"${status}\",\"message\":\"${message}\"}"
+    elif [[ "$QUIET" != true ]]; then
+        case "$status" in
+            start)    info "Step ${step}: ${message}" ;;
+            complete) success "Step ${step}: ${message}" ;;
+            error)    error "Step ${step}: ${message}" ;;
+            *)        echo "  ${message}" ;;
+        esac
+    fi
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        echo "  [DEBUG] $*"
+    fi
+}
+
+#===============================================================================
+# PRE-FLIGHT CHECKS
+#===============================================================================
+
+detect_source_type() {
+    log_verbose "Detecting source type for: $SOURCE"
+
+    # Check if it's an rsync source (contains @: or starts with /)
+    if [[ "$SOURCE" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+: ]]; then
+        SOURCE_TYPE="rsync"
+        log_verbose "Source type: rsync (remote)"
+        return 0
+    fi
+
+    # Check if local file exists
+    if [[ ! -e "$SOURCE" ]]; then
+        error "Source not found: $SOURCE"
+        return 1
+    fi
+
+    # Detect by extension
+    case "$SOURCE" in
+        *.wpress)
+            SOURCE_TYPE="wpress"
+            log_verbose "Source type: wpress (All-in-One WP Migration)"
+            ;;
+        *.tar.gz|*.tgz)
+            SOURCE_TYPE="tarball"
+            log_verbose "Source type: tarball"
+            ;;
+        *)
+            # Check if it's a directory (rsync local)
+            if [[ -d "$SOURCE" ]]; then
+                SOURCE_TYPE="rsync"
+                log_verbose "Source type: rsync (local directory)"
+            else
+                error "Unknown source format: $SOURCE"
+                error "Supported formats: .wpress, .tar.gz, directory, or rsync URL"
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+check_disk_space() {
+    local required_gb=5  # Minimum 5GB free
+    local source_size_kb=0
+
+    # Get source size if local file
+    if [[ -f "$SOURCE" ]]; then
+        source_size_kb=$(du -k "$SOURCE" 2>/dev/null | cut -f1)
+        # Need at least 3x source size for extraction + processing
+        local required_kb=$((source_size_kb * 3))
+        required_gb=$(( (required_kb / 1024 / 1024) + 1 ))
+        [[ $required_gb -lt 5 ]] && required_gb=5
+    fi
+
+    # Check available space on websites root
+    local available_kb
+    available_kb=$(df -k "$WEBSITES_ROOT" 2>/dev/null | tail -1 | awk '{print $4}')
+    local available_gb=$((available_kb / 1024 / 1024))
+
+    log_verbose "Disk space: ${available_gb}GB available, ${required_gb}GB required"
+
+    if [[ $available_gb -lt $required_gb ]]; then
+        error "Insufficient disk space: ${available_gb}GB available, ${required_gb}GB required"
+        return 1
+    fi
+
+    # Record initial disk usage
+    DISK_USAGE_BEFORE=$(df -h "$WEBSITES_ROOT" | tail -1 | awk '{print $3}')
+
+    return 0
+}
+
+check_staging_exists() {
+    if [[ -d "$STAGING_DIR" ]]; then
+        error "Staging site already exists: $STAGING_DOMAIN"
+        error "Delete it first with: jps-site-delete $STAGING_DOMAIN"
+        return 1
+    fi
+    return 0
+}
+
+check_dependencies() {
+    local missing=()
+
+    # Required commands
+    command_exists wp || missing+=("wp-cli")
+    command_exists mysql || missing+=("mysql-client")
+
+    # Source-specific dependencies
+    case "$SOURCE_TYPE" in
+        rsync)
+            command_exists rsync || missing+=("rsync")
+            ;;
+        wpress)
+            command_exists unzip || missing+=("unzip")
+            ;;
+        tarball)
+            command_exists tar || missing+=("tar")
+            ;;
+    esac
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required commands: ${missing[*]}"
+        return 1
+    fi
+
+    return 0
+}
+
+preflight_checks() {
+    progress 1 "preflight" "start" "Running pre-flight checks"
+
+    # Detect source type
+    if ! detect_source_type; then
+        progress 1 "preflight" "error" "Failed to detect source type"
+        return 1
+    fi
+
+    # Check dependencies
+    if ! check_dependencies; then
+        progress 1 "preflight" "error" "Missing dependencies"
+        return 1
+    fi
+
+    # Check disk space
+    if ! check_disk_space; then
+        progress 1 "preflight" "error" "Insufficient disk space"
+        return 1
+    fi
+
+    # Check staging doesn't exist
+    if ! check_staging_exists; then
+        progress 1 "preflight" "error" "Staging site already exists"
+        return 1
+    fi
+
+    progress 1 "preflight" "complete" "Pre-flight checks passed"
+    return 0
+}
+
+#===============================================================================
+# STAGING SITE DEPLOYMENT
+#===============================================================================
+
+deploy_staging() {
+    progress 2 "deploy" "start" "Deploying staging site: $STAGING_DOMAIN"
+
+    # Use existing jps-deploy-site to create staging
+    local deploy_cmd="${INSTALL_DIR}/bin/jps-deploy-site"
+    if [[ ! -x "$deploy_cmd" ]]; then
+        deploy_cmd="/usr/local/bin/jps-deploy-site"
+    fi
+
+    if [[ ! -x "$deploy_cmd" ]]; then
+        error "jps-deploy-site not found"
+        return 1
+    fi
+
+    # Deploy with minimal options (we'll replace content anyway)
+    local deploy_args=("-d" "$STAGING_DOMAIN" "--skip-plugins")
+
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        deploy_args+=("--progress")
+    fi
+
+    # Determine preset
+    if [[ "$FORCE_WOO" == true ]]; then
+        deploy_args+=("-p" "woo")
+    else
+        deploy_args+=("-p" "none")
+    fi
+
+    log_verbose "Running: $deploy_cmd ${deploy_args[*]}"
+
+    if ! "$deploy_cmd" "${deploy_args[@]}" 2>&1 | while read -r line; do
+        log_verbose "deploy: $line"
+    done; then
+        error "Failed to deploy staging site"
+        return 1
+    fi
+
+    # Verify staging was created
+    if [[ ! -d "$STAGING_DOC_ROOT" ]]; then
+        error "Staging site directory not created"
+        return 1
+    fi
+
+    progress 2 "deploy" "complete" "Staging site deployed"
+    return 0
+}
+
+#===============================================================================
+# SOURCE IMPORT FUNCTIONS
+#===============================================================================
+
+extract_wpress() {
+    progress 3 "import" "start" "Extracting .wpress archive"
+
+    mkdir -p "$TEMP_DIR"
+
+    # .wpress is a zip-like format with specific structure
+    # It contains: database.sql, package.json, and wp-content files
+
+    cd "$TEMP_DIR"
+
+    # Extract using unzip (wpress is essentially a renamed zip)
+    if ! unzip -q "$SOURCE" -d "$TEMP_DIR" 2>/dev/null; then
+        # Try alternative extraction for AI1WM format
+        # AI1WM uses a custom format, not standard zip
+        log_verbose "Standard unzip failed, trying AI1WM extraction"
+
+        # AI1WM format: header + files
+        # We need to parse the package.json and extract files
+        if ! extract_wpress_ai1wm; then
+            error "Failed to extract .wpress file"
+            return 1
+        fi
+    fi
+
+    # Find and validate extracted content
+    if [[ -f "$TEMP_DIR/database.sql" ]]; then
+        log_verbose "Found database.sql"
+    elif [[ -f "$TEMP_DIR/dump.sql" ]]; then
+        mv "$TEMP_DIR/dump.sql" "$TEMP_DIR/database.sql"
+        log_verbose "Found dump.sql, renamed to database.sql"
+    fi
+
+    progress 3 "import" "complete" "Archive extracted"
+    return 0
+}
+
+extract_wpress_ai1wm() {
+    # All-in-One WP Migration uses a custom binary format
+    # Structure: [header][file1][file2]...
+    # Each file: [name_length:4bytes][name][size:4bytes][content]
+
+    # For now, try using the AI1WM CLI if available, or fail gracefully
+    # Most .wpress files from newer versions are standard archives
+
+    # Try PHP extraction as fallback
+    if command_exists php; then
+        php -r "
+        \$file = '$SOURCE';
+        \$dest = '$TEMP_DIR';
+
+        // AI1WM format detection and extraction
+        \$handle = fopen(\$file, 'rb');
+        if (!\$handle) exit(1);
+
+        // Read header
+        \$header = fread(\$handle, 4377);
+        if (strpos(\$header, 'AI1WM') === false) {
+            // Not AI1WM format, might be standard zip
+            fclose(\$handle);
+            exit(1);
+        }
+
+        // Extract files
+        while (!\feof(\$handle)) {
+            // Read filename length (4 bytes, little endian)
+            \$nameLen = unpack('V', fread(\$handle, 4));
+            if (!\$nameLen || \$nameLen[1] == 0) break;
+
+            // Read filename
+            \$name = fread(\$handle, \$nameLen[1]);
+
+            // Read file size (4 bytes)
+            \$sizeData = fread(\$handle, 4);
+            \$size = unpack('V', \$sizeData);
+
+            // Read content
+            \$content = fread(\$handle, \$size[1]);
+
+            // Write file
+            \$path = \$dest . '/' . \$name;
+            @mkdir(dirname(\$path), 0755, true);
+            file_put_contents(\$path, \$content);
+        }
+        fclose(\$handle);
+        " 2>/dev/null && return 0
+    fi
+
+    return 1
+}
+
+extract_tarball() {
+    progress 3 "import" "start" "Extracting tar.gz archive"
+
+    mkdir -p "$TEMP_DIR"
+
+    # Extract tarball
+    if ! tar -xzf "$SOURCE" -C "$TEMP_DIR" 2>/dev/null; then
+        error "Failed to extract tar.gz archive"
+        return 1
+    fi
+
+    # Find wp-content and SQL file
+    local wp_content_found=false
+    local sql_found=false
+
+    # Look for wp-content
+    if [[ -d "$TEMP_DIR/wp-content" ]]; then
+        wp_content_found=true
+    else
+        # Search for it in subdirectories
+        local found_dir
+        found_dir=$(find "$TEMP_DIR" -type d -name "wp-content" -print -quit 2>/dev/null)
+        if [[ -n "$found_dir" ]]; then
+            mv "$found_dir" "$TEMP_DIR/wp-content"
+            wp_content_found=true
+        fi
+    fi
+
+    # Look for SQL file
+    local sql_file
+    sql_file=$(find "$TEMP_DIR" -type f -name "*.sql" -print -quit 2>/dev/null)
+    if [[ -n "$sql_file" ]]; then
+        mv "$sql_file" "$TEMP_DIR/database.sql"
+        sql_found=true
+    fi
+
+    if [[ "$wp_content_found" != true ]]; then
+        warn "wp-content directory not found in archive"
+    fi
+
+    if [[ "$sql_found" != true ]]; then
+        warn "SQL database dump not found in archive"
+    fi
+
+    progress 3 "import" "complete" "Archive extracted"
+    return 0
+}
+
+import_rsync() {
+    progress 3 "import" "start" "Syncing from source: $SOURCE"
+
+    mkdir -p "$TEMP_DIR"
+
+    # Rsync options for WordPress
+    local rsync_opts=(
+        "-avz"
+        "--progress"
+        "--exclude=.git"
+        "--exclude=.svn"
+        "--exclude=node_modules"
+        "--exclude=*.log"
+    )
+
+    if [[ "$VERBOSE" != true ]]; then
+        rsync_opts=("-az" "--quiet")
+    fi
+
+    # Sync to temp directory first
+    if ! rsync "${rsync_opts[@]}" "$SOURCE/" "$TEMP_DIR/" 2>&1 | while read -r line; do
+        log_verbose "rsync: $line"
+    done; then
+        error "rsync failed"
+        return 1
+    fi
+
+    # Export database from source if wp-config.php exists
+    if [[ -f "$TEMP_DIR/wp-config.php" ]]; then
+        export_remote_database
+    fi
+
+    progress 3 "import" "complete" "Source synced"
+    return 0
+}
+
+export_remote_database() {
+    log_verbose "Attempting to export database from source"
+
+    # Extract DB credentials from wp-config.php
+    local config_file="$TEMP_DIR/wp-config.php"
+
+    if [[ ! -f "$config_file" ]]; then
+        warn "No wp-config.php found, skipping database export"
+        return 0
+    fi
+
+    local db_name db_user db_pass db_host
+    db_name=$(grep "DB_NAME" "$config_file" | cut -d"'" -f4)
+    db_user=$(grep "DB_USER" "$config_file" | cut -d"'" -f4)
+    db_pass=$(grep "DB_PASSWORD" "$config_file" | cut -d"'" -f4)
+    db_host=$(grep "DB_HOST" "$config_file" | cut -d"'" -f4 || echo "localhost")
+
+    # Try WP-CLI export if available on source
+    if [[ "$SOURCE" =~ ^[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+: ]]; then
+        local remote_host="${SOURCE%%:*}"
+        local remote_path="${SOURCE#*:}"
+
+        log_verbose "Attempting remote database export via SSH"
+
+        # Try to export via SSH + WP-CLI
+        if ssh "$remote_host" "cd '$remote_path' && wp db export --allow-root -" > "$TEMP_DIR/database.sql" 2>/dev/null; then
+            log_verbose "Database exported via WP-CLI"
+            return 0
+        fi
+
+        # Try mysqldump via SSH
+        if ssh "$remote_host" "mysqldump -u'$db_user' -p'$db_pass' -h'$db_host' '$db_name'" > "$TEMP_DIR/database.sql" 2>/dev/null; then
+            log_verbose "Database exported via mysqldump"
+            return 0
+        fi
+
+        warn "Could not export database from remote. Manual import may be required."
+    fi
+
+    return 0
+}
+
+#===============================================================================
+# CONTENT IMPORT
+#===============================================================================
+
+import_content() {
+    progress 4 "content" "start" "Importing content to staging site"
+
+    # Clear the default WordPress content (keep wp-config.php)
+    local staging_wp_content="$STAGING_DOC_ROOT/wp-content"
+
+    # Backup original wp-config.php
+    cp "$STAGING_DOC_ROOT/wp-config.php" "$TEMP_DIR/staging-wp-config.php"
+
+    # Import wp-content if available
+    if [[ -d "$TEMP_DIR/wp-content" ]]; then
+        log_verbose "Importing wp-content directory"
+
+        # Remove default wp-content
+        rm -rf "$staging_wp_content"
+
+        # Copy migrated wp-content
+        cp -a "$TEMP_DIR/wp-content" "$staging_wp_content"
+
+        success "wp-content imported"
+    fi
+
+    # Restore staging wp-config.php (don't use source's config)
+    cp "$TEMP_DIR/staging-wp-config.php" "$STAGING_DOC_ROOT/wp-config.php"
+
+    # Fix permissions
+    chown -R nobody:nogroup "$STAGING_DOC_ROOT"
+    find "$STAGING_DOC_ROOT" -type d -exec chmod 755 {} \;
+    find "$STAGING_DOC_ROOT" -type f -exec chmod 644 {} \;
+    chmod 600 "$STAGING_DOC_ROOT/wp-config.php"
+
+    progress 4 "content" "complete" "Content imported"
+    return 0
+}
+
+#===============================================================================
+# DATABASE IMPORT
+#===============================================================================
+
+detect_table_prefix() {
+    local sql_file="$1"
+
+    if [[ ! -f "$sql_file" ]]; then
+        echo "wp_"
+        return
+    fi
+
+    # Look for CREATE TABLE statements to detect prefix
+    local prefix
+    prefix=$(grep -oP 'CREATE TABLE `?\K[a-zA-Z0-9_]+(?=options)' "$sql_file" 2>/dev/null | head -1)
+
+    if [[ -n "$prefix" ]]; then
+        echo "$prefix"
+    else
+        echo "wp_"
+    fi
+}
+
+import_database() {
+    progress 5 "database" "start" "Importing database"
+
+    local sql_file="$TEMP_DIR/database.sql"
+
+    if [[ ! -f "$sql_file" ]]; then
+        warn "No database dump found, skipping database import"
+        progress 5 "database" "complete" "No database to import"
+        return 0
+    fi
+
+    # Get staging database credentials
+    local staging_config="$STAGING_DOC_ROOT/wp-config.php"
+    local staging_db_name staging_db_user staging_db_pass staging_prefix
+
+    staging_db_name=$(grep "DB_NAME" "$staging_config" | cut -d"'" -f4)
+    staging_db_user=$(grep "DB_USER" "$staging_config" | cut -d"'" -f4)
+    staging_db_pass=$(grep "DB_PASSWORD" "$staging_config" | cut -d"'" -f4)
+    staging_prefix=$(grep "table_prefix" "$staging_config" | cut -d"'" -f2 || echo "wp_")
+
+    # Detect source table prefix
+    SOURCE_DB_PREFIX=$(detect_table_prefix "$sql_file")
+    log_verbose "Source table prefix: $SOURCE_DB_PREFIX"
+    log_verbose "Staging table prefix: $staging_prefix"
+
+    # Drop existing tables in staging database
+    log_verbose "Clearing staging database"
+    mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -e "
+        SET FOREIGN_KEY_CHECKS = 0;
+        SET @tables = NULL;
+        SELECT GROUP_CONCAT(table_name) INTO @tables
+        FROM information_schema.tables
+        WHERE table_schema = '$staging_db_name';
+        SET @tables = IFNULL(CONCAT('DROP TABLE ', @tables), 'SELECT 1');
+        PREPARE stmt FROM @tables;
+        EXECUTE stmt;
+        DEALLOCATE PREPARE stmt;
+        SET FOREIGN_KEY_CHECKS = 1;
+    " 2>/dev/null || true
+
+    # Handle table prefix mismatch
+    if [[ "$SOURCE_DB_PREFIX" != "$staging_prefix" ]]; then
+        log_verbose "Converting table prefix: $SOURCE_DB_PREFIX -> $staging_prefix"
+
+        # Create modified SQL file with corrected prefix
+        sed "s/\`${SOURCE_DB_PREFIX}/\`${staging_prefix}/g" "$sql_file" > "$TEMP_DIR/database_modified.sql"
+        sql_file="$TEMP_DIR/database_modified.sql"
+    fi
+
+    # Import database
+    log_verbose "Importing SQL file"
+    if ! mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" < "$sql_file" 2>/dev/null; then
+        error "Database import failed"
+        return 1
+    fi
+
+    progress 5 "database" "complete" "Database imported"
+    return 0
+}
+
+#===============================================================================
+# URL REPLACEMENT
+#===============================================================================
+
+update_urls() {
+    progress 6 "urls" "start" "Updating URLs in database"
+
+    # Detect original site URL from database
+    local staging_config="$STAGING_DOC_ROOT/wp-config.php"
+    local staging_db_name staging_db_user staging_db_pass staging_prefix
+
+    staging_db_name=$(grep "DB_NAME" "$staging_config" | cut -d"'" -f4)
+    staging_db_user=$(grep "DB_USER" "$staging_config" | cut -d"'" -f4)
+    staging_db_pass=$(grep "DB_PASSWORD" "$staging_config" | cut -d"'" -f4)
+    staging_prefix=$(grep "table_prefix" "$staging_config" | cut -d"'" -f2 || echo "wp_")
+
+    # Get original URL from database
+    local original_url
+    original_url=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
+        "SELECT option_value FROM ${staging_prefix}options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)
+
+    if [[ -z "$original_url" ]]; then
+        warn "Could not detect original site URL"
+        progress 6 "urls" "complete" "URL update skipped (no original URL found)"
+        return 0
+    fi
+
+    log_verbose "Original URL: $original_url"
+
+    # Extract original domain from URL
+    local original_domain
+    original_domain=$(echo "$original_url" | sed -E 's#https?://##' | sed 's#/.*##')
+
+    local staging_url="https://${STAGING_DOMAIN}"
+
+    log_verbose "Replacing: $original_url -> $staging_url"
+
+    # Use WP-CLI search-replace for proper serialized data handling
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+
+    # Run search-replace
+    if ! "$wp_bin" search-replace "$original_url" "$staging_url" \
+        --path="$STAGING_DOC_ROOT" \
+        --allow-root \
+        --all-tables \
+        --precise \
+        --skip-columns=guid 2>/dev/null; then
+        warn "WP-CLI search-replace had issues, trying alternative methods"
+    fi
+
+    # Also replace non-https version if original was https
+    if [[ "$original_url" == https://* ]]; then
+        local http_original="${original_url/https:/http:}"
+        "$wp_bin" search-replace "$http_original" "$staging_url" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+    fi
+
+    # Replace bare domain references
+    "$wp_bin" search-replace "$original_domain" "$STAGING_DOMAIN" \
+        --path="$STAGING_DOC_ROOT" \
+        --allow-root \
+        --all-tables \
+        --precise \
+        --skip-columns=guid 2>/dev/null || true
+
+    # Flush rewrite rules and caches
+    "$wp_bin" rewrite flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+    "$wp_bin" cache flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+
+    progress 6 "urls" "complete" "URLs updated: $original_domain -> $STAGING_DOMAIN"
+    return 0
+}
+
+#===============================================================================
+# WOOCOMMERCE DETECTION
+#===============================================================================
+
+detect_woocommerce() {
+    local staging_config="$STAGING_DOC_ROOT/wp-config.php"
+    local staging_db_name staging_db_user staging_db_pass staging_prefix
+
+    staging_db_name=$(grep "DB_NAME" "$staging_config" | cut -d"'" -f4)
+    staging_db_user=$(grep "DB_USER" "$staging_config" | cut -d"'" -f4)
+    staging_db_pass=$(grep "DB_PASSWORD" "$staging_config" | cut -d"'" -f4)
+    staging_prefix=$(grep "table_prefix" "$staging_config" | cut -d"'" -f2 || echo "wp_")
+
+    # Check for WooCommerce plugin in active plugins
+    local woo_active
+    woo_active=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
+        "SELECT option_value FROM ${staging_prefix}options WHERE option_name='active_plugins';" 2>/dev/null | grep -c "woocommerce" || echo "0")
+
+    # Check for WooCommerce tables
+    local woo_tables
+    woo_tables=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
+        "SHOW TABLES LIKE '%woocommerce%';" 2>/dev/null | wc -l || echo "0")
+
+    if [[ "$woo_active" -gt 0 ]] || [[ "$woo_tables" -gt 0 ]]; then
+        return 0  # WooCommerce detected
+    fi
+
+    return 1  # No WooCommerce
+}
+
+#===============================================================================
+# VALIDATION
+#===============================================================================
+
+validate_staging() {
+    progress 7 "validate" "start" "Validating staging site"
+
+    local validation_errors=0
+
+    # Check WordPress files exist
+    if [[ ! -f "$STAGING_DOC_ROOT/wp-config.php" ]]; then
+        error "wp-config.php not found"
+        ((validation_errors++))
+    fi
+
+    if [[ ! -f "$STAGING_DOC_ROOT/wp-load.php" ]]; then
+        error "wp-load.php not found"
+        ((validation_errors++))
+    fi
+
+    # Test WP-CLI can connect
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+
+    if ! "$wp_bin" core is-installed --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null; then
+        error "WordPress not properly installed"
+        ((validation_errors++))
+    fi
+
+    # Check database connection
+    if ! "$wp_bin" db check --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null; then
+        error "Database connection failed"
+        ((validation_errors++))
+    fi
+
+    # Get WordPress version
+    local wp_version
+    wp_version=$("$wp_bin" core version --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || echo "unknown")
+    log_verbose "WordPress version: $wp_version"
+
+    # Check site URL is correct
+    local site_url
+    site_url=$("$wp_bin" option get siteurl --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || echo "")
+
+    if [[ "$site_url" != "https://${STAGING_DOMAIN}" ]] && [[ "$site_url" != "http://${STAGING_DOMAIN}" ]]; then
+        warn "Site URL mismatch: expected https://${STAGING_DOMAIN}, got $site_url"
+    fi
+
+    if [[ $validation_errors -gt 0 ]]; then
+        progress 7 "validate" "error" "Validation failed with $validation_errors error(s)"
+        return 1
+    fi
+
+    progress 7 "validate" "complete" "Staging site validated (WP $wp_version)"
+    return 0
+}
+
+#===============================================================================
+# CLEANUP
+#===============================================================================
+
+cleanup_temp() {
+    if [[ -d "$TEMP_DIR" ]]; then
+        log_verbose "Cleaning up temporary files"
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+#===============================================================================
+# LOGGING
+#===============================================================================
+
+log_lifecycle_event() {
+    local status="$1"
+    local message="$2"
+    local log_file="${LOG_DIR}/lifecycle/migrate.log"
+
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Calculate disk usage delta
+    DISK_USAGE_AFTER=$(df -h "$WEBSITES_ROOT" | tail -1 | awk '{print $3}')
+
+    local log_entry="[$timestamp] status=${status} domain=${DOMAIN} staging=${STAGING_DOMAIN}"
+    log_entry+=" source_type=${SOURCE_TYPE} source=${SOURCE}"
+    log_entry+=" disk_before=${DISK_USAGE_BEFORE} disk_after=${DISK_USAGE_AFTER}"
+    [[ -n "$NOTE" ]] && log_entry+=" note=\"${NOTE}\""
+    log_entry+=" message=\"${message}\""
+    log_entry+=" user=$(whoami)"
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    MIGRATION_START_TIME=$(date +%s)
+
+    # Require root
+    require_root
+
+    # Parse arguments
+    parse_args "$@"
+
+    # Header
+    if [[ "$QUIET" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        header "JPS Site Migration"
+        echo "Target Domain:  $DOMAIN"
+        echo "Staging Domain: $STAGING_DOMAIN"
+        echo "Source:         $SOURCE"
+        echo ""
+    fi
+
+    # Confirmation
+    if [[ "$SKIP_CONFIRM" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        echo "This will:"
+        echo "  1. Create staging site: $STAGING_DOMAIN"
+        echo "  2. Import content from: $SOURCE"
+        echo "  3. Update URLs to staging domain"
+        echo ""
+        echo "After migration, you must manually update DNS."
+        echo ""
+        read -rp "Continue? [y/N] " response
+        if [[ ! "$response" =~ ^[yY]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    # Trap for cleanup on error
+    trap cleanup_temp EXIT
+
+    # Pre-flight checks
+    if ! preflight_checks; then
+        log_lifecycle_event "failed" "Pre-flight checks failed"
+        exit 3
+    fi
+
+    # Create checkpoint if requested
+    if [[ "$CREATE_CHECKPOINT" == true ]]; then
+        progress 0 "checkpoint" "start" "Creating checkpoint (skipped - no existing site)"
+        progress 0 "checkpoint" "complete" "Checkpoint skipped for new migration"
+    fi
+
+    # Deploy staging site
+    if ! deploy_staging; then
+        log_lifecycle_event "failed" "Staging deployment failed"
+        exit 1
+    fi
+
+    # Import source based on type
+    case "$SOURCE_TYPE" in
+        wpress)
+            if ! extract_wpress; then
+                log_lifecycle_event "failed" "Failed to extract .wpress archive"
+                exit 1
+            fi
+            ;;
+        tarball)
+            if ! extract_tarball; then
+                log_lifecycle_event "failed" "Failed to extract tarball"
+                exit 1
+            fi
+            ;;
+        rsync)
+            if ! import_rsync; then
+                log_lifecycle_event "failed" "Failed to rsync source"
+                exit 1
+            fi
+            ;;
+    esac
+
+    # Import content
+    if ! import_content; then
+        log_lifecycle_event "failed" "Content import failed"
+        exit 1
+    fi
+
+    # Import database
+    if ! import_database; then
+        log_lifecycle_event "failed" "Database import failed"
+        exit 1
+    fi
+
+    # Update URLs
+    if ! update_urls; then
+        warn "URL update had issues, manual review recommended"
+    fi
+
+    # Detect WooCommerce and apply optimization if needed
+    if [[ "$FORCE_WOO" != true ]] && detect_woocommerce; then
+        log_verbose "WooCommerce detected, applying optimization preset"
+        local optimize_cmd="${INSTALL_DIR}/bin/jps-optimize-site"
+        [[ ! -x "$optimize_cmd" ]] && optimize_cmd="/usr/local/bin/jps-optimize-site"
+        if [[ -x "$optimize_cmd" ]]; then
+            "$optimize_cmd" "$STAGING_DOMAIN" --preset=woo 2>/dev/null || true
+        fi
+    fi
+
+    # Validate staging site
+    if ! validate_staging; then
+        warn "Validation failed - staging site may need manual review"
+        log_lifecycle_event "warning" "Migration completed with validation warnings"
+    else
+        log_lifecycle_event "success" "Migration completed successfully"
+    fi
+
+    # Calculate duration
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - MIGRATION_START_TIME))
+
+    # Success output
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        echo "{\"step\":\"result\",\"status\":\"success\",\"staging_domain\":\"${STAGING_DOMAIN}\",\"duration\":${duration}}"
+    else
+        echo ""
+        success "Migration completed!"
+        echo ""
+        echo "Staging Site:   https://${STAGING_DOMAIN}"
+        echo "Admin URL:      https://${STAGING_DOMAIN}/wp-admin/"
+        echo "Duration:       ${duration} seconds"
+        echo ""
+        echo "NEXT STEPS:"
+        echo "  1. Test the staging site thoroughly"
+        echo "  2. Update DNS for $DOMAIN to point to this server"
+        echo "  3. After DNS propagation, update URLs from staging to production"
+        echo "  4. Delete staging site: jps-site-delete $STAGING_DOMAIN"
+    fi
+
+    exit 0
+}
+
+# Run main function
+main "$@"

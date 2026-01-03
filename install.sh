@@ -282,6 +282,7 @@ create_wrappers() {
         "jps-perf-audit"
         "jps-reinstall-wp"
         "jps-regen-password"
+        "jps-migrate-site"
     )
 
     for script in "${scripts[@]}"; do
@@ -379,6 +380,7 @@ verify_installation() {
         "$INSTALL_DIR/bin/jps-perf-audit"
         "$INSTALL_DIR/bin/jps-reinstall-wp"
         "$INSTALL_DIR/bin/jps-regen-password"
+        "$INSTALL_DIR/bin/jps-migrate-site"
         "$INSTALL_DIR/lib/jps-common.sh"
         "$INSTALL_DIR/lib/jps-optimize.sh"
         "$INSTALL_DIR/config/jps-tools.conf"
@@ -415,6 +417,7 @@ verify_installation() {
         "$BIN_LINKS_DIR/jps-perf-audit"
         "$BIN_LINKS_DIR/jps-reinstall-wp"
         "$BIN_LINKS_DIR/jps-regen-password"
+        "$BIN_LINKS_DIR/jps-migrate-site"
     )
 
     for wrapper in "${wrappers[@]}"; do
@@ -576,6 +579,7 @@ uninstall() {
     rm -f "$BIN_LINKS_DIR/jps-perf-audit"
     rm -f "$BIN_LINKS_DIR/jps-reinstall-wp"
     rm -f "$BIN_LINKS_DIR/jps-regen-password"
+    rm -f "$BIN_LINKS_DIR/jps-migrate-site"
 
     # Ask about logs
     read -rp "Remove log files as well? [y/N] " response
