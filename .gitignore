@@ -40,3 +40,19 @@ Thumbs.db
 
 # Log files anywhere
 *.log
+
+cat >> .gitignore << 'EOF'
+
+# ============================
+# Additional safety entries
+# ============================
+# Never track secrets
+config/notify.conf
+config/*.local
+
+# OS noise (Windows)
+Thumbs.db
+
+# Log files anywhere
+*.log
+EOF
