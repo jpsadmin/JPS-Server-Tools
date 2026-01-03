@@ -76,11 +76,15 @@ SUPPORTED SOURCE FORMATS:
     rsync       Remote WordPress directory (user@host:/path/to/wordpress)
 
 USAGE:
-    jps-migrate-site --domain <domain> --source <path|url> [OPTIONS]
+    jps-migrate-site --domain <domain> [--source <path|url>] [OPTIONS]
 
 REQUIRED:
     -d, --domain DOMAIN     Target domain (staging.{domain} will be created)
+
+OPTIONAL:
     -s, --source SOURCE     Migration source (file path or rsync URL)
+                            If not provided, uses default: $MIGRATION_INCOMING_DIR
+                            (configurable in jps-tools.conf)
 
 OPTIONS:
     -h, --help              Show this help message
@@ -159,8 +163,13 @@ SOURCE_TYPE=""  # wpvivid, wpress, tarball, zip, rsync
 SOURCE_DB_PREFIX=""
 WPVIVID_INFO_FILE=""  # Path to wpvivid_*_backup_info.json if detected
 
-# Migration incoming folder
-MIGRATIONS_INCOMING_DIR="/var/backups/jps/migrations/incoming"
+# Migration paths (loaded from config, with fallback defaults)
+# These are set after load_config() is called
+MIGRATIONS_INCOMING_DIR=""
+MIGRATIONS_METADATA_DIR=""
+
+# Track whether source was explicitly provided or defaulted
+SOURCE_EXPLICIT=false
 
 # Credentials (set after migration)
 FINAL_WP_USER=""
@@ -170,6 +179,80 @@ FINAL_WP_PASS=""
 MIGRATION_START_TIME=""
 DISK_USAGE_BEFORE=""
 DISK_USAGE_AFTER=""
+
+# Database import tracking - MANDATORY for successful migration
+DB_IMPORTED=false
+
+#===============================================================================
+# MIGRATION PATH INITIALIZATION
+#===============================================================================
+
+# Initialize migration paths from configuration
+# Must be called after load_config()
+init_migration_paths() {
+    # Load from config with fallback defaults
+    MIGRATIONS_INCOMING_DIR="${MIGRATION_INCOMING_DIR:-/var/backups/jps/migrations/incoming}"
+    MIGRATIONS_METADATA_DIR="${MIGRATION_METADATA_DIR:-/var/backups/jps/migrations/metadata}"
+
+    # Log where paths came from
+    if [[ -n "${MIGRATION_INCOMING_DIR:-}" ]]; then
+        log_verbose "Migration incoming dir (from config): $MIGRATIONS_INCOMING_DIR"
+    else
+        log_verbose "Migration incoming dir (default): $MIGRATIONS_INCOMING_DIR"
+    fi
+
+    if [[ -n "${MIGRATION_METADATA_DIR:-}" ]]; then
+        log_verbose "Migration metadata dir (from config): $MIGRATIONS_METADATA_DIR"
+    else
+        log_verbose "Migration metadata dir (default): $MIGRATIONS_METADATA_DIR"
+    fi
+}
+
+# Resolve source path - uses default if not explicitly provided
+# Called after argument parsing to resolve SOURCE
+resolve_source_path() {
+    # If source was explicitly provided, use it as-is
+    if [[ "$SOURCE_EXPLICIT" == true ]]; then
+        log_verbose "Using explicit source: $SOURCE"
+        return 0
+    fi
+
+    # Check if default source is allowed
+    local allow_default="${MIGRATION_ALLOW_DEFAULT_SOURCE:-true}"
+    if [[ "$allow_default" != "true" ]]; then
+        error "No source provided and MIGRATION_ALLOW_DEFAULT_SOURCE is disabled"
+        error "Use --source to specify migration source path"
+        return 1
+    fi
+
+    # Use default incoming directory
+    SOURCE="$MIGRATIONS_INCOMING_DIR"
+    log_verbose "Using default migration source: $SOURCE"
+
+    # Validate default directory exists and is usable
+    if [[ ! -d "$SOURCE" ]]; then
+        warn "Default migration directory does not exist: $SOURCE"
+        warn "Creating directory..."
+        mkdir -p "$SOURCE" 2>/dev/null || {
+            error "Cannot create default migration directory: $SOURCE"
+            return 1
+        }
+    fi
+
+    # Check if directory contains any migration content
+    local content_count
+    content_count=$(find "$SOURCE" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
+
+    if [[ "$content_count" -eq 0 ]]; then
+        error "Default migration directory is empty: $SOURCE"
+        error "Please place migration backup in: $SOURCE"
+        error "Or use --source to specify an explicit path"
+        return 1
+    fi
+
+    info "Found $content_count item(s) in default migration directory"
+    return 0
+}
 
 #===============================================================================
 # ARGUMENT PARSING
@@ -200,6 +283,7 @@ parse_args() {
                     exit 2
                 fi
                 SOURCE="$2"
+                SOURCE_EXPLICIT=true
                 shift 2
                 ;;
             -c|--checkpoint)
@@ -249,15 +333,12 @@ parse_args() {
     # Validate required arguments
     if [[ -z "$DOMAIN" ]]; then
         error "Domain is required (--domain)"
-        echo "Usage: $SCRIPT_NAME --domain <domain> --source <path>"
+        echo "Usage: $SCRIPT_NAME --domain <domain> [--source <path>]"
         exit 2
     fi
 
-    if [[ -z "$SOURCE" ]]; then
-        error "Source is required (--source)"
-        echo "Usage: $SCRIPT_NAME --domain <domain> --source <path>"
-        exit 2
-    fi
+    # Note: SOURCE is optional - will use default MIGRATION_INCOMING_DIR if not provided
+    # This is validated later by resolve_source_path()
 
     # Validate domain format
     if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
@@ -300,6 +381,21 @@ log_verbose() {
     if [[ "$VERBOSE" == true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
         echo "  [DEBUG] $*"
     fi
+}
+
+# Fatal error handler - exits with error and logs failure
+error_exit() {
+    local message="$1"
+    local exit_code="${2:-1}"
+
+    error "$message"
+    progress 0 "fatal" "error" "$message"
+    log_lifecycle_event "failed" "$message"
+
+    # Clean up temp directory
+    cleanup_temp
+
+    exit "$exit_code"
 }
 
 #===============================================================================
@@ -713,17 +809,24 @@ extract_wpvivid() {
     # - wp-content/ (site files)
     # - *.sql or wpvivid_*.sql (database dump)
 
-    # Find and normalize the database file
+    # Find and normalize the database file - MANDATORY
     if ! wpvivid_find_database; then
-        warn "No database found in WPvivid backup"
+        error_exit "FATAL: No database dump found in WPvivid backup. Migration cannot proceed without a database."
     fi
+
+    # Verify database file has content
+    if [[ ! -f "$TEMP_DIR/database.sql" ]] || [[ ! -s "$TEMP_DIR/database.sql" ]]; then
+        error_exit "FATAL: Database file is empty or missing. WPvivid backup must contain a valid database dump."
+    fi
+
+    log_verbose "Database file size: $(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "unknown") bytes"
 
     # Find and normalize wp-content
     if ! wpvivid_find_content; then
         warn "No wp-content found in WPvivid backup"
     fi
 
-    progress 3 "import" "complete" "WPvivid backup extracted"
+    progress 3 "import" "complete" "WPvivid backup extracted (database found)"
     return 0
 }
 
@@ -834,7 +937,7 @@ extract_zip() {
         fi
     fi
 
-    # Look for SQL file
+    # Look for SQL file - MANDATORY
     local sql_file
     sql_file=$(find "$TEMP_DIR" -type f -name "*.sql" -print -quit 2>/dev/null)
     if [[ -n "$sql_file" ]]; then
@@ -846,11 +949,19 @@ extract_zip() {
         warn "wp-content directory not found in archive"
     fi
 
+    # Database is MANDATORY - fail if not found
     if [[ "$sql_found" != true ]]; then
-        warn "SQL database dump not found in archive"
+        error_exit "FATAL: No SQL database dump found in ZIP archive. Migration cannot proceed without a database."
     fi
 
-    progress 3 "import" "complete" "Archive extracted"
+    # Verify database file has content
+    if [[ ! -s "$TEMP_DIR/database.sql" ]]; then
+        error_exit "FATAL: Database file is empty. ZIP archive must contain a valid database dump."
+    fi
+
+    log_verbose "Database file size: $(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "unknown") bytes"
+
+    progress 3 "import" "complete" "Archive extracted (database found)"
     return 0
 }
 
@@ -882,7 +993,7 @@ extract_tarball() {
         fi
     fi
 
-    # Look for SQL file
+    # Look for SQL file - MANDATORY
     local sql_file
     sql_file=$(find "$TEMP_DIR" -type f -name "*.sql" -print -quit 2>/dev/null)
     if [[ -n "$sql_file" ]]; then
@@ -894,11 +1005,19 @@ extract_tarball() {
         warn "wp-content directory not found in archive"
     fi
 
+    # Database is MANDATORY - fail if not found
     if [[ "$sql_found" != true ]]; then
-        warn "SQL database dump not found in archive"
+        error_exit "FATAL: No SQL database dump found in tarball. Migration cannot proceed without a database."
     fi
 
-    progress 3 "import" "complete" "Archive extracted"
+    # Verify database file has content
+    if [[ ! -s "$TEMP_DIR/database.sql" ]]; then
+        error_exit "FATAL: Database file is empty. Tarball must contain a valid database dump."
+    fi
+
+    log_verbose "Database file size: $(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "unknown") bytes"
+
+    progress 3 "import" "complete" "Archive extracted (database found)"
     return 0
 }
 
@@ -934,7 +1053,14 @@ import_rsync() {
         export_remote_database
     fi
 
-    progress 3 "import" "complete" "Source synced"
+    # Database is MANDATORY - fail if not obtained
+    if [[ ! -f "$TEMP_DIR/database.sql" ]] || [[ ! -s "$TEMP_DIR/database.sql" ]]; then
+        error_exit "FATAL: No database dump obtained from rsync source. Migration cannot proceed without a database. Ensure the source has wp-config.php and database access, or provide a separate SQL dump."
+    fi
+
+    log_verbose "Database file size: $(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "unknown") bytes"
+
+    progress 3 "import" "complete" "Source synced (database exported)"
     return 0
 }
 
@@ -1047,10 +1173,13 @@ import_database() {
 
     local sql_file="$TEMP_DIR/database.sql"
 
+    # Database file MUST exist at this point - extraction should have enforced this
     if [[ ! -f "$sql_file" ]]; then
-        warn "No database dump found, skipping database import"
-        progress 5 "database" "complete" "No database to import"
-        return 0
+        error_exit "FATAL: No database dump found. This should not happen - extraction should have caught this."
+    fi
+
+    if [[ ! -s "$sql_file" ]]; then
+        error_exit "FATAL: Database dump file is empty. Cannot import an empty database."
     fi
 
     # Get staging database credentials
@@ -1094,11 +1223,14 @@ import_database() {
     # Import database
     log_verbose "Importing SQL file"
     if ! mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" < "$sql_file" 2>/dev/null; then
-        error "Database import failed"
-        return 1
+        error_exit "FATAL: Database import failed. MySQL returned an error."
     fi
 
-    progress 5 "database" "complete" "Database imported"
+    # Mark database as successfully imported
+    DB_IMPORTED=true
+    log_verbose "DB_IMPORTED flag set to true"
+
+    progress 5 "database" "complete" "Database imported successfully"
     return 0
 }
 
@@ -1108,6 +1240,11 @@ import_database() {
 
 update_urls() {
     progress 6 "urls" "start" "Updating URLs in database"
+
+    # CRITICAL GUARD: Do not proceed if database was not imported
+    if [[ "$DB_IMPORTED" != "true" ]]; then
+        error_exit "FATAL: Cannot update URLs - database was not imported. DB_IMPORTED=$DB_IMPORTED"
+    fi
 
     # Detect original site URL from database
     local staging_config="$STAGING_DOC_ROOT/wp-config.php"
@@ -1409,9 +1546,15 @@ reset_admin_credentials() {
 verify_migration() {
     progress 9 "verify" "start" "Verifying migration content"
 
+    # CRITICAL: Verify database was imported
+    if [[ "$DB_IMPORTED" != "true" ]]; then
+        error_exit "FATAL: Migration verification failed - database was never imported. DB_IMPORTED=$DB_IMPORTED"
+    fi
+
     local wp_bin
     wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
     local verification_errors=0
+    local is_fresh_install=false
 
     # Check siteurl and home options
     local site_url home_url
@@ -1431,16 +1574,16 @@ verify_migration() {
         warn "siteurl does not contain staging domain: $site_url"
     fi
 
-    # Count posts
+    # Count posts (excluding auto-drafts and revisions)
     local post_count
     post_count=$("$wp_bin" post list --path="$STAGING_DOC_ROOT" --allow-root \
-        --post_type=post --format=count 2>/dev/null || echo "0")
+        --post_type=post --post_status=publish,draft,private,pending --format=count 2>/dev/null || echo "0")
     log_verbose "Post count: $post_count"
 
-    # Count pages
+    # Count pages (excluding auto-drafts and revisions)
     local page_count
     page_count=$("$wp_bin" post list --path="$STAGING_DOC_ROOT" --allow-root \
-        --post_type=page --format=count 2>/dev/null || echo "0")
+        --post_type=page --post_status=publish,draft,private,pending --format=count 2>/dev/null || echo "0")
     log_verbose "Page count: $page_count"
 
     # Check for imported tables (verify database has content)
@@ -1458,35 +1601,56 @@ verify_migration() {
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$staging_db_name';" 2>/dev/null || echo "0")
     log_verbose "Table count: $table_count"
 
-    if [[ "$table_count" -lt 10 ]]; then
-        warn "Low table count ($table_count) - database may not have imported correctly"
-        ((verification_errors++))
-    fi
-
     # Check options table has entries
     local option_count
     option_count=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
         "SELECT COUNT(*) FROM ${staging_prefix}options;" 2>/dev/null || echo "0")
     log_verbose "Options count: $option_count"
 
-    if [[ "$option_count" -lt 50 ]]; then
-        warn "Low options count ($option_count) - site may need review"
+    # STRICT THRESHOLDS - Detect fresh WordPress installs (which should FAIL)
+    # A fresh WP install has: ~1 post ("Hello World"), 1-2 pages ("Sample Page", "Privacy Policy")
+    # ~12 tables (core WP tables), ~150-200 options
+
+    # Fresh install detection criteria (ALL must be true to flag as fresh)
+    if [[ "$post_count" -le 1 ]] && [[ "$page_count" -le 2 ]] && [[ "$table_count" -lt 12 ]] && [[ "$option_count" -lt 200 ]]; then
+        is_fresh_install=true
+    fi
+
+    # FATAL: Fresh WordPress installs should NEVER pass validation
+    # This means the database import didn't actually bring in real content
+    if [[ "$is_fresh_install" == true ]]; then
+        error_exit "FATAL: Migration verification detected a FRESH WORDPRESS INSTALL, not migrated content. posts=$post_count, pages=$page_count, tables=$table_count, options=$option_count. The database import did not contain real site data."
+    fi
+
+    # Individual threshold checks (warnings that become errors)
+    if [[ "$table_count" -lt 12 ]]; then
+        error "FAIL: Table count ($table_count) is below minimum threshold (12). Database likely not imported correctly."
         ((verification_errors++))
+    fi
+
+    if [[ "$option_count" -lt 200 ]]; then
+        error "FAIL: Options count ($option_count) is below minimum threshold (200). Database likely not imported correctly."
+        ((verification_errors++))
+    fi
+
+    # Check for very low content (could be valid for some sites, but worth flagging)
+    if [[ "$post_count" -le 1 ]] && [[ "$page_count" -le 1 ]]; then
+        warn "LOW CONTENT: posts=$post_count, pages=$page_count - verify this matches the source site"
     fi
 
     # Summary output for verification
     if [[ "$PROGRESS_OUTPUT" == true ]]; then
-        echo "{\"step\":\"verify\",\"posts\":${post_count},\"pages\":${page_count},\"tables\":${table_count},\"options\":${option_count}}"
+        echo "{\"step\":\"verify\",\"posts\":${post_count},\"pages\":${page_count},\"tables\":${table_count},\"options\":${option_count},\"db_imported\":${DB_IMPORTED}}"
     else
-        log_verbose "Verification: $post_count posts, $page_count pages, $table_count tables"
+        log_verbose "Verification: $post_count posts, $page_count pages, $table_count tables, $option_count options"
     fi
 
+    # STRICT: Any verification errors should fail the migration
     if [[ $verification_errors -gt 0 ]]; then
-        progress 9 "verify" "warning" "Migration verified with $verification_errors warning(s)"
-        return 1
+        error_exit "FATAL: Migration verification failed with $verification_errors critical error(s). The migrated site does not contain valid imported data."
     fi
 
-    progress 9 "verify" "complete" "Migration content verified"
+    progress 9 "verify" "complete" "Migration content verified (posts=$post_count, pages=$page_count, tables=$table_count)"
     return 0
 }
 
@@ -1503,12 +1667,23 @@ main() {
     # Parse arguments
     parse_args "$@"
 
+    # Initialize migration paths from configuration
+    init_migration_paths
+
+    # Resolve source path (uses default if not explicitly provided)
+    if ! resolve_source_path; then
+        exit 2
+    fi
+
     # Header
     if [[ "$QUIET" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
         header "JPS Site Migration"
         echo "Target Domain:  $DOMAIN"
         echo "Staging Domain: $STAGING_DOMAIN"
         echo "Source:         $SOURCE"
+        if [[ "$SOURCE_EXPLICIT" != true ]]; then
+            echo "                (default migration directory)"
+        fi
         echo ""
     fi
 
@@ -1623,8 +1798,8 @@ main() {
         warn "Could not reset admin credentials - manual intervention may be required"
     fi
 
-    # Verify migration content
-    verify_migration || true  # Don't fail on verification warnings
+    # Verify migration content - MANDATORY, will fail migration if content doesn't pass
+    verify_migration
 
     # Calculate duration
     local end_time

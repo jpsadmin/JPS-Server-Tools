@@ -52,12 +52,20 @@ fi
 load_config
 
 #===============================================================================
-# CONFIGURATION
+# CONFIGURATION (loaded from jps-tools.conf with fallback defaults)
 #===============================================================================
 
-MIGRATIONS_INCOMING_DIR="/var/backups/jps/migrations/incoming"
-MIGRATIONS_METADATA_DIR="/var/backups/jps/migrations/metadata"
-DEFAULT_RETENTION_DAYS=7
+# Initialize paths from config - NEVER hard-code
+MIGRATIONS_INCOMING_DIR="${MIGRATION_INCOMING_DIR:-/var/backups/jps/migrations/incoming}"
+MIGRATIONS_METADATA_DIR="${MIGRATION_METADATA_DIR:-/var/backups/jps/migrations/metadata}"
+DEFAULT_RETENTION_DAYS="${MIGRATION_RETENTION_DAYS:-7}"
+
+# Log configuration source for debugging
+if [[ -n "${MIGRATION_INCOMING_DIR:-}" ]]; then
+    : # Config loaded
+else
+    echo "[DEBUG] Using default migration paths (config not found or values not set)" >&2
+fi
 
 #===============================================================================
 # HELP AND VERSION
@@ -110,10 +118,16 @@ EXIT CODES:
     1 - Cleanup failed
     2 - Invalid arguments
 
+CONFIGURATION:
+    Paths and retention are configured in /opt/jps-server-tools/config/jps-tools.conf:
+    - MIGRATION_INCOMING_DIR   (default: /var/backups/jps/migrations/incoming)
+    - MIGRATION_METADATA_DIR   (default: /var/backups/jps/migrations/metadata)
+    - MIGRATION_RETENTION_DAYS (default: 7)
+
 NOTES:
     - Backups from failed migrations are NOT auto-deleted
     - Use --all to force delete all backups including failed ones
-    - Metadata is stored in /var/backups/jps/migrations/metadata/
+    - This tool always operates on the configured MIGRATION_INCOMING_DIR
 
 For more information, see: https://github.com/yourusername/jps-server-tools
 EOF

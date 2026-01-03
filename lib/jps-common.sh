@@ -453,6 +453,12 @@ load_config() {
         SEND_ALERTS="${SEND_ALERTS:-false}"
         AUDIT_RETENTION_DAYS="${AUDIT_RETENTION_DAYS:-90}"
 
+        # Migration system defaults
+        MIGRATION_INCOMING_DIR="${MIGRATION_INCOMING_DIR:-/var/backups/jps/migrations/incoming}"
+        MIGRATION_METADATA_DIR="${MIGRATION_METADATA_DIR:-/var/backups/jps/migrations/metadata}"
+        MIGRATION_RETENTION_DAYS="${MIGRATION_RETENTION_DAYS:-7}"
+        MIGRATION_ALLOW_DEFAULT_SOURCE="${MIGRATION_ALLOW_DEFAULT_SOURCE:-true}"
+
         return 0
     fi
 }
