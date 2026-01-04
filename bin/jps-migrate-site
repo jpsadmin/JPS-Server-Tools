@@ -1461,7 +1461,41 @@ update_urls() {
     local wp_bin
     wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
 
-    # Run search-replace
+    # IMPORTANT: Check if original already IS the staging domain (or contains staging.)
+    # This prevents doubling: staging.domain.com -> staging.staging.domain.com
+    if [[ "$original_domain" == "$STAGING_DOMAIN" ]]; then
+        log_verbose "Original domain already matches staging domain, skipping URL replacement"
+        progress 6 "urls" "complete" "URLs already correct (staging domain)"
+        return 0
+    fi
+
+    # Check if original domain already has staging. prefix (backup was from a staging site)
+    if [[ "$original_domain" == staging.* ]]; then
+        log_verbose "Original domain already has staging. prefix: $original_domain"
+        # Just update to our staging domain directly
+        "$wp_bin" search-replace "$original_url" "$staging_url" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+
+        "$wp_bin" search-replace "$original_domain" "$STAGING_DOMAIN" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+
+        # Flush and return early
+        "$wp_bin" rewrite flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+        "$wp_bin" cache flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+
+        progress 6 "urls" "complete" "URLs updated: $original_domain -> $STAGING_DOMAIN"
+        return 0
+    fi
+
+    # Run search-replace for full URLs first (most specific)
     if ! "$wp_bin" search-replace "$original_url" "$staging_url" \
         --path="$STAGING_DOC_ROOT" \
         --allow-root \
@@ -1482,13 +1516,65 @@ update_urls() {
             --skip-columns=guid 2>/dev/null || true
     fi
 
-    # Replace bare domain references
-    "$wp_bin" search-replace "$original_domain" "$STAGING_DOMAIN" \
-        --path="$STAGING_DOC_ROOT" \
-        --allow-root \
-        --all-tables \
-        --precise \
-        --skip-columns=guid 2>/dev/null || true
+    # Replace bare domain references ONLY if it won't cause doubling
+    # The issue: replacing "domain.com" with "staging.domain.com" will ALSO match
+    # "staging.domain.com" and turn it into "staging.staging.domain.com"
+    #
+    # Solution: First protect existing staging references, then replace, then unprotect
+    # OR: Use a more targeted replacement that excludes already-staged URLs
+
+    # Check if STAGING_DOMAIN contains original_domain as a substring
+    # e.g., staging.ralphshouse.net contains ralphshouse.net
+    if [[ "$STAGING_DOMAIN" == *"$original_domain"* ]]; then
+        log_verbose "Staging domain contains original domain - using protected replacement"
+
+        # Use a unique placeholder to protect existing staging URLs
+        local placeholder="__STAGING_PROTECTED_$(date +%s)__"
+
+        # Step 1: Protect existing staging domain references
+        "$wp_bin" search-replace "$STAGING_DOMAIN" "$placeholder" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+
+        # Step 2: Replace original domain with staging domain
+        "$wp_bin" search-replace "$original_domain" "$STAGING_DOMAIN" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+
+        # Step 3: Restore protected staging URLs
+        "$wp_bin" search-replace "$placeholder" "$STAGING_DOMAIN" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+    else
+        # Simple case: staging domain doesn't contain original domain
+        "$wp_bin" search-replace "$original_domain" "$STAGING_DOMAIN" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+    fi
+
+    # Final cleanup: Fix any accidental staging.staging. doubling that may have occurred
+    if [[ "$STAGING_DOMAIN" == staging.* ]]; then
+        local doubled_staging="staging.$STAGING_DOMAIN"
+        "$wp_bin" search-replace "$doubled_staging" "$STAGING_DOMAIN" \
+            --path="$STAGING_DOC_ROOT" \
+            --allow-root \
+            --all-tables \
+            --precise \
+            --skip-columns=guid 2>/dev/null || true
+        log_verbose "Cleaned up any staging.staging. occurrences"
+    fi
 
     # Flush rewrite rules and caches
     "$wp_bin" rewrite flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
