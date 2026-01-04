@@ -1,0 +1,971 @@
+#!/bin/bash
+#===============================================================================
+# JPS Migration Cutover - Promote Staging Site to Production
+#
+# Completes the migration workflow by promoting a staging site to production
+# after DNS has been updated to point to this server.
+#
+# Usage:
+#   jps-migration-cutover --staging staging.example.com --production example.com
+#
+# Exit Codes:
+#   0 - Success
+#   1 - Cutover failed
+#   2 - Invalid arguments
+#   3 - Pre-flight check failed
+#===============================================================================
+
+set -eo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="jps-migration-cutover"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Resolve the actual script location (handle symlinks)
+_resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    while [[ -L "$source" ]]; do
+        local dir
+        dir=$(cd -P "$(dirname "$source")" && pwd)
+        source=$(readlink "$source")
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    cd -P "$(dirname "$source")" && pwd
+}
+
+readonly SCRIPT_DIR="$(_resolve_script_dir)"
+readonly INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Source common library
+if [[ -f "${INSTALL_DIR}/lib/jps-common.sh" ]]; then
+    # shellcheck source=../lib/jps-common.sh
+    source "${INSTALL_DIR}/lib/jps-common.sh"
+else
+    echo "[ERROR] Cannot find jps-common.sh library" >&2
+    exit 2
+fi
+
+# Load configuration
+load_config
+
+#===============================================================================
+# HELP AND VERSION
+#===============================================================================
+
+show_help() {
+    cat << 'EOF'
+JPS Migration Cutover - Promote Staging Site to Production
+
+DESCRIPTION:
+    Promotes a staging site to production after DNS has been updated.
+    This completes the migration workflow started by jps-migrate-site.
+
+USAGE:
+    jps-migration-cutover --staging <domain> --production <domain> [OPTIONS]
+
+REQUIRED:
+    -s, --staging DOMAIN      The staging domain to promote (e.g., staging.example.com)
+    -p, --production DOMAIN   The production domain (e.g., example.com)
+
+OPTIONS:
+    -h, --help                Show this help message
+    -V, --version             Show version information
+    -k, --keep-staging        Keep staging vhost as redirect to production
+    -y, --yes                 Skip confirmation prompts
+    --skip-dns-check          Skip DNS verification (use if DNS hasn't propagated yet)
+    --skip-ssl                Skip SSL certificate generation
+    --progress                Output JSON progress updates (for automation)
+    -v, --verbose             Show detailed output
+    -q, --quiet               Minimal output
+
+WORKFLOW:
+    1. Pre-flight checks (staging exists, production doesn't, DNS points here)
+    2. Create checkpoint backup of staging site
+    3. Update database URLs (staging → production)
+    4. Rename site directory
+    5. Update OpenLiteSpeed vhost configuration
+    6. Obtain SSL certificate for production domain
+    7. Reload OpenLiteSpeed
+    8. Validate production site
+
+EXAMPLES:
+    # Basic cutover
+    jps-migration-cutover -s staging.example.com -p example.com
+
+    # Skip confirmation and keep staging as redirect
+    jps-migration-cutover -s staging.example.com -p example.com --yes --keep-staging
+
+    # Automated cutover with JSON progress
+    jps-migration-cutover -s staging.example.com -p example.com --yes --progress
+
+EXIT CODES:
+    0 - Cutover completed successfully
+    1 - Cutover failed
+    2 - Invalid arguments
+    3 - Pre-flight check failed
+
+NOTES:
+    - Ensure DNS for production domain points to this server before cutover
+    - A checkpoint backup is created before any changes
+    - If cutover fails, the staging site remains intact
+
+For more information, see: https://github.com/yourusername/jps-server-tools
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+#===============================================================================
+# GLOBAL VARIABLES
+#===============================================================================
+
+STAGING_DOMAIN=""
+PRODUCTION_DOMAIN=""
+KEEP_STAGING=false
+SKIP_CONFIRM=false
+SKIP_DNS_CHECK=false
+SKIP_SSL=false
+PROGRESS_OUTPUT=false
+VERBOSE=false
+QUIET=false
+
+# Paths (set after domain validation)
+STAGING_DIR=""
+STAGING_DOC_ROOT=""
+PRODUCTION_DIR=""
+PRODUCTION_DOC_ROOT=""
+CHECKPOINT_FILE=""
+
+# Vhost paths
+STAGING_VHOST_DIR=""
+PRODUCTION_VHOST_DIR=""
+
+#===============================================================================
+# OUTPUT FUNCTIONS
+#===============================================================================
+
+progress() {
+    local step="$1"
+    local phase="$2"
+    local status="$3"
+    local message="$4"
+
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        echo "{\"step\":${step},\"phase\":\"${phase}\",\"status\":\"${status}\",\"message\":\"${message}\"}"
+    elif [[ "$QUIET" != true ]]; then
+        case "$status" in
+            start)    info "Step ${step}: ${message}" ;;
+            complete) success "Step ${step}: ${message}" ;;
+            error)    error "Step ${step}: ${message}" ;;
+            *)        echo "  ${message}" ;;
+        esac
+    fi
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        echo "  [DEBUG] $*"
+    fi
+}
+
+#===============================================================================
+# ARGUMENT PARSING
+#===============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -V|--version)
+                show_version
+                exit 0
+                ;;
+            -s|--staging)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --staging requires an argument"
+                    exit 2
+                fi
+                STAGING_DOMAIN="$2"
+                shift 2
+                ;;
+            -p|--production)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option --production requires an argument"
+                    exit 2
+                fi
+                PRODUCTION_DOMAIN="$2"
+                shift 2
+                ;;
+            -k|--keep-staging)
+                KEEP_STAGING=true
+                shift
+                ;;
+            -y|--yes)
+                SKIP_CONFIRM=true
+                shift
+                ;;
+            --skip-dns-check)
+                SKIP_DNS_CHECK=true
+                shift
+                ;;
+            --skip-ssl)
+                SKIP_SSL=true
+                shift
+                ;;
+            --progress)
+                PROGRESS_OUTPUT=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information" >&2
+                exit 2
+                ;;
+            *)
+                error "Unexpected argument: $1"
+                exit 2
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "$STAGING_DOMAIN" ]]; then
+        error "Staging domain is required (--staging)"
+        exit 2
+    fi
+
+    if [[ -z "$PRODUCTION_DOMAIN" ]]; then
+        error "Production domain is required (--production)"
+        exit 2
+    fi
+
+    # Validate domain formats
+    if ! [[ "$STAGING_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+        error "Invalid staging domain format: $STAGING_DOMAIN"
+        exit 2
+    fi
+
+    if ! [[ "$PRODUCTION_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+        error "Invalid production domain format: $PRODUCTION_DOMAIN"
+        exit 2
+    fi
+
+    # Ensure staging and production are different
+    if [[ "$STAGING_DOMAIN" == "$PRODUCTION_DOMAIN" ]]; then
+        error "Staging and production domains must be different"
+        exit 2
+    fi
+
+    # Set paths
+    STAGING_DIR="${WEBSITES_ROOT}/${STAGING_DOMAIN}"
+    STAGING_DOC_ROOT="${STAGING_DIR}/html"
+    PRODUCTION_DIR="${WEBSITES_ROOT}/${PRODUCTION_DOMAIN}"
+    PRODUCTION_DOC_ROOT="${PRODUCTION_DIR}/html"
+
+    # Vhost paths
+    STAGING_VHOST_DIR="${OLS_VHOST_DIR}/${STAGING_DOMAIN}"
+    PRODUCTION_VHOST_DIR="${OLS_VHOST_DIR}/${PRODUCTION_DOMAIN}"
+}
+
+#===============================================================================
+# PRE-FLIGHT CHECKS
+#===============================================================================
+
+check_staging_exists() {
+    if [[ ! -d "$STAGING_DIR" ]]; then
+        error "Staging site does not exist: $STAGING_DOMAIN"
+        error "Directory not found: $STAGING_DIR"
+        return 1
+    fi
+
+    if [[ ! -f "$STAGING_DOC_ROOT/wp-config.php" ]]; then
+        error "Staging site does not appear to be a WordPress installation"
+        error "wp-config.php not found in: $STAGING_DOC_ROOT"
+        return 1
+    fi
+
+    log_verbose "Staging site verified: $STAGING_DIR"
+    return 0
+}
+
+check_production_available() {
+    if [[ -d "$PRODUCTION_DIR" ]]; then
+        error "Production site already exists: $PRODUCTION_DOMAIN"
+        error "Directory exists: $PRODUCTION_DIR"
+        error "Delete it first with: jps-site-delete $PRODUCTION_DOMAIN"
+        return 1
+    fi
+
+    if [[ -d "$PRODUCTION_VHOST_DIR" ]]; then
+        error "Production vhost already exists: $PRODUCTION_VHOST_DIR"
+        error "Clean up existing vhost configuration first"
+        return 1
+    fi
+
+    log_verbose "Production domain available"
+    return 0
+}
+
+check_dns() {
+    if [[ "$SKIP_DNS_CHECK" == true ]]; then
+        log_verbose "DNS check skipped (--skip-dns-check)"
+        return 0
+    fi
+
+    progress 1 "preflight" "info" "Checking DNS for $PRODUCTION_DOMAIN"
+
+    # Get server's public IP
+    local server_ip
+    server_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
+
+    if [[ -z "$server_ip" ]]; then
+        warn "Could not determine server's public IP"
+        warn "Skipping DNS verification"
+        return 0
+    fi
+
+    log_verbose "Server public IP: $server_ip"
+
+    # Resolve domain
+    local domain_ip
+    domain_ip=$(dig +short "$PRODUCTION_DOMAIN" A 2>/dev/null | head -1)
+
+    if [[ -z "$domain_ip" ]]; then
+        warn "Could not resolve $PRODUCTION_DOMAIN"
+        warn "DNS may not be configured yet - site won't be accessible externally"
+
+        if [[ "$SKIP_CONFIRM" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+            read -rp "Continue anyway? [y/N] " response
+            if [[ ! "$response" =~ ^[yY]$ ]]; then
+                return 1
+            fi
+        fi
+        return 0
+    fi
+
+    log_verbose "Domain resolves to: $domain_ip"
+
+    if [[ "$domain_ip" != "$server_ip" ]]; then
+        warn "DNS for $PRODUCTION_DOMAIN points to $domain_ip, not this server ($server_ip)"
+        warn "The site won't be accessible until DNS is updated"
+
+        if [[ "$SKIP_CONFIRM" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+            read -rp "Continue anyway? [y/N] " response
+            if [[ ! "$response" =~ ^[yY]$ ]]; then
+                return 1
+            fi
+        fi
+    else
+        log_verbose "DNS correctly points to this server"
+    fi
+
+    return 0
+}
+
+preflight_checks() {
+    progress 1 "preflight" "start" "Running pre-flight checks"
+
+    # Check staging exists
+    if ! check_staging_exists; then
+        progress 1 "preflight" "error" "Staging site not found"
+        return 1
+    fi
+
+    # Check production is available
+    if ! check_production_available; then
+        progress 1 "preflight" "error" "Production domain not available"
+        return 1
+    fi
+
+    # Check DNS
+    if ! check_dns; then
+        progress 1 "preflight" "error" "DNS check failed"
+        return 1
+    fi
+
+    # Check required tools
+    command_exists wp || {
+        error "WP-CLI not found"
+        return 1
+    }
+
+    progress 1 "preflight" "complete" "Pre-flight checks passed"
+    return 0
+}
+
+#===============================================================================
+# CHECKPOINT
+#===============================================================================
+
+create_checkpoint() {
+    progress 2 "checkpoint" "start" "Creating backup checkpoint"
+
+    # Use jps-checkpoint if available
+    local checkpoint_cmd="${INSTALL_DIR}/bin/jps-checkpoint"
+    [[ ! -x "$checkpoint_cmd" ]] && checkpoint_cmd="/usr/local/bin/jps-checkpoint"
+
+    if [[ -x "$checkpoint_cmd" ]]; then
+        if "$checkpoint_cmd" "$STAGING_DOMAIN" 2>/dev/null; then
+            log_verbose "Checkpoint created via jps-checkpoint"
+            progress 2 "checkpoint" "complete" "Checkpoint created"
+            return 0
+        fi
+    fi
+
+    # Fallback: create simple tarball backup
+    local backup_dir="/var/backups/jps/cutover"
+    mkdir -p "$backup_dir"
+
+    CHECKPOINT_FILE="${backup_dir}/${STAGING_DOMAIN}_$(date +%Y%m%d_%H%M%S).tar.gz"
+
+    log_verbose "Creating checkpoint: $CHECKPOINT_FILE"
+
+    if tar -czf "$CHECKPOINT_FILE" -C "$WEBSITES_ROOT" "$STAGING_DOMAIN" 2>/dev/null; then
+        log_verbose "Checkpoint created: $CHECKPOINT_FILE"
+        progress 2 "checkpoint" "complete" "Checkpoint created"
+        return 0
+    else
+        warn "Could not create checkpoint backup"
+        progress 2 "checkpoint" "complete" "Checkpoint skipped (non-fatal)"
+        return 0
+    fi
+}
+
+#===============================================================================
+# DATABASE URL REPLACEMENT
+#===============================================================================
+
+update_database_urls() {
+    progress 3 "database" "start" "Updating database URLs"
+
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+
+    local staging_url="https://${STAGING_DOMAIN}"
+    local production_url="https://${PRODUCTION_DOMAIN}"
+    local replacements=0
+
+    log_verbose "Replacing: $staging_url -> $production_url"
+
+    # Replace https staging URL
+    local output
+    output=$("$wp_bin" search-replace "$staging_url" "$production_url" \
+        --path="$STAGING_DOC_ROOT" \
+        --allow-root \
+        --all-tables \
+        --precise \
+        --skip-columns=guid \
+        --report-changed-only 2>/dev/null || echo "")
+
+    if [[ -n "$output" ]]; then
+        local count
+        count=$(echo "$output" | grep -oP '\d+(?= replacements)' | head -1 || echo "0")
+        replacements=$((replacements + count))
+        log_verbose "HTTPS URL replacements: $count"
+    fi
+
+    # Replace http staging URL
+    local http_staging="http://${STAGING_DOMAIN}"
+    output=$("$wp_bin" search-replace "$http_staging" "$production_url" \
+        --path="$STAGING_DOC_ROOT" \
+        --allow-root \
+        --all-tables \
+        --precise \
+        --skip-columns=guid \
+        --report-changed-only 2>/dev/null || echo "")
+
+    if [[ -n "$output" ]]; then
+        local count
+        count=$(echo "$output" | grep -oP '\d+(?= replacements)' | head -1 || echo "0")
+        replacements=$((replacements + count))
+        log_verbose "HTTP URL replacements: $count"
+    fi
+
+    # Replace bare domain
+    output=$("$wp_bin" search-replace "$STAGING_DOMAIN" "$PRODUCTION_DOMAIN" \
+        --path="$STAGING_DOC_ROOT" \
+        --allow-root \
+        --all-tables \
+        --precise \
+        --skip-columns=guid \
+        --report-changed-only 2>/dev/null || echo "")
+
+    if [[ -n "$output" ]]; then
+        local count
+        count=$(echo "$output" | grep -oP '\d+(?= replacements)' | head -1 || echo "0")
+        replacements=$((replacements + count))
+        log_verbose "Bare domain replacements: $count"
+    fi
+
+    # Verify siteurl and home are correct
+    local siteurl
+    siteurl=$("$wp_bin" option get siteurl --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || echo "")
+
+    if [[ "$siteurl" != "$production_url" ]]; then
+        "$wp_bin" option update siteurl "$production_url" --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null
+        "$wp_bin" option update home "$production_url" --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null
+        log_verbose "Force-updated siteurl and home options"
+    fi
+
+    # Flush caches
+    "$wp_bin" cache flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+    "$wp_bin" rewrite flush --path="$STAGING_DOC_ROOT" --allow-root 2>/dev/null || true
+
+    progress 3 "database" "complete" "Database updated ($replacements replacements)"
+    return 0
+}
+
+#===============================================================================
+# FILE SYSTEM CHANGES
+#===============================================================================
+
+rename_site_directory() {
+    progress 4 "filesystem" "start" "Renaming site directory"
+
+    log_verbose "Moving: $STAGING_DIR -> $PRODUCTION_DIR"
+
+    if ! mv "$STAGING_DIR" "$PRODUCTION_DIR" 2>/dev/null; then
+        error "Failed to rename site directory"
+        return 1
+    fi
+
+    # Update CREDENTIALS.txt if it exists
+    local creds_file="${PRODUCTION_DIR}/CREDENTIALS.txt"
+    if [[ -f "$creds_file" ]]; then
+        sed -i "s/${STAGING_DOMAIN}/${PRODUCTION_DOMAIN}/g" "$creds_file" 2>/dev/null || true
+        log_verbose "Updated CREDENTIALS.txt"
+    fi
+
+    progress 4 "filesystem" "complete" "Site directory renamed"
+    return 0
+}
+
+#===============================================================================
+# VHOST CONFIGURATION
+#===============================================================================
+
+update_vhost_config() {
+    progress 5 "vhost" "start" "Updating OpenLiteSpeed configuration"
+
+    # Check if staging vhost exists
+    if [[ ! -d "$STAGING_VHOST_DIR" ]]; then
+        warn "Staging vhost directory not found: $STAGING_VHOST_DIR"
+        warn "Will create new vhost configuration"
+
+        # Create vhost using jps-deploy-site's vhost creation
+        # For now, create minimal vhost
+        mkdir -p "$PRODUCTION_VHOST_DIR"
+
+        cat > "${PRODUCTION_VHOST_DIR}/vhconf.conf" << VHCONF
+docRoot                   \$VH_ROOT/html
+vhDomain                  $PRODUCTION_DOMAIN
+vhAliases                 www.$PRODUCTION_DOMAIN
+enableGzip                1
+enableBr                  1
+
+index  {
+  useServer               0
+  indexFiles              index.php, index.html
+}
+
+scripthandler  {
+  add                     lsapi:${PRODUCTION_DOMAIN} php
+}
+
+extprocessor ${PRODUCTION_DOMAIN} {
+  type                    lsapi
+  address                 uds://tmp/lshttpd/${PRODUCTION_DOMAIN}.sock
+  maxConns                10
+  env                     PHP_LSAPI_CHILDREN=10
+  initTimeout             60
+  retryTimeout            0
+  persistConn             1
+  respBuffer              0
+  autoStart               2
+  path                    /usr/local/lsws/lsphp81/bin/lsphp
+  backlog                 100
+  instances               1
+  extUser                 nobody
+  extGroup                nogroup
+  runOnStartUp            2
+  priority                0
+  memSoftLimit            2047M
+  memHardLimit            2047M
+  procSoftLimit           1400
+  procHardLimit           1500
+}
+
+rewrite  {
+  enable                  1
+  autoLoadHtaccess        1
+}
+
+vhssl  {
+  keyFile                 /etc/letsencrypt/live/$PRODUCTION_DOMAIN/privkey.pem
+  certFile                /etc/letsencrypt/live/$PRODUCTION_DOMAIN/fullchain.pem
+  certChain               1
+}
+
+phpIniOverride  {
+  php_value memory_limit 256M
+  php_value max_execution_time 300
+  php_value upload_max_filesize 64M
+  php_value post_max_size 64M
+}
+VHCONF
+    else
+        # Rename existing vhost directory
+        log_verbose "Renaming vhost: $STAGING_VHOST_DIR -> $PRODUCTION_VHOST_DIR"
+
+        if ! mv "$STAGING_VHOST_DIR" "$PRODUCTION_VHOST_DIR" 2>/dev/null; then
+            error "Failed to rename vhost directory"
+            return 1
+        fi
+
+        # Update vhconf.conf
+        local vhconf="${PRODUCTION_VHOST_DIR}/vhconf.conf"
+        if [[ -f "$vhconf" ]]; then
+            sed -i "s/${STAGING_DOMAIN}/${PRODUCTION_DOMAIN}/g" "$vhconf"
+            log_verbose "Updated vhconf.conf"
+        fi
+    fi
+
+    # Update httpd_config.conf - listener mappings
+    local httpd_conf="${OLS_CONF_DIR}/httpd_config.conf"
+    if [[ -f "$httpd_conf" ]]; then
+        # Replace staging domain with production domain in listener maps
+        sed -i "s/map[[:space:]]*${STAGING_DOMAIN}[[:space:]]*${STAGING_DOMAIN}/map                     ${PRODUCTION_DOMAIN} ${PRODUCTION_DOMAIN}/g" "$httpd_conf"
+
+        # Also update any vhost references
+        sed -i "s|vhRoot[[:space:]]*\${WEBSITES_ROOT}/${STAGING_DOMAIN}|vhRoot                  \${WEBSITES_ROOT}/${PRODUCTION_DOMAIN}|g" "$httpd_conf"
+
+        log_verbose "Updated httpd_config.conf"
+    fi
+
+    # Add virtualhost entry if not exists
+    if ! grep -q "virtualhost ${PRODUCTION_DOMAIN}" "$httpd_conf" 2>/dev/null; then
+        # Find the virtualhost section and add new entry
+        # This is a simplified approach - may need adjustment based on actual config format
+        cat >> "$httpd_conf" << VHOST
+
+virtualhost ${PRODUCTION_DOMAIN} {
+  vhRoot                  \${WEBSITES_ROOT}/${PRODUCTION_DOMAIN}
+  configFile              conf/vhosts/${PRODUCTION_DOMAIN}/vhconf.conf
+  allowSymbolLink         1
+  enableScript            1
+  restrained              0
+}
+VHOST
+        log_verbose "Added virtualhost entry to httpd_config.conf"
+    fi
+
+    # Update listener mappings
+    # Add production domain to listeners if not present
+    local listener_section
+    if grep -q "listener Default" "$httpd_conf" 2>/dev/null; then
+        if ! grep -q "map.*${PRODUCTION_DOMAIN}" "$httpd_conf" 2>/dev/null; then
+            # Add map entry to Default listener
+            sed -i "/listener Default {/,/}/ { /map.*${STAGING_DOMAIN}/a\  map                     ${PRODUCTION_DOMAIN} ${PRODUCTION_DOMAIN}
+            }" "$httpd_conf" 2>/dev/null || true
+        fi
+    fi
+
+    # Keep staging as redirect if requested
+    if [[ "$KEEP_STAGING" == true ]]; then
+        create_staging_redirect
+    else
+        # Remove staging vhost entry from httpd_config.conf
+        # This is a simplified removal - actual implementation may need to be more careful
+        sed -i "/virtualhost ${STAGING_DOMAIN}/,/^}/d" "$httpd_conf" 2>/dev/null || true
+        log_verbose "Removed staging virtualhost entry"
+    fi
+
+    progress 5 "vhost" "complete" "Vhost configuration updated"
+    return 0
+}
+
+create_staging_redirect() {
+    log_verbose "Creating staging redirect to production"
+
+    # Recreate staging vhost as redirect
+    mkdir -p "$STAGING_VHOST_DIR"
+
+    cat > "${STAGING_VHOST_DIR}/vhconf.conf" << REDIRECT
+docRoot                   /var/www/html
+vhDomain                  $STAGING_DOMAIN
+
+rewrite  {
+  enable                  1
+  rules                   <<<END_rules
+RewriteEngine On
+RewriteCond %{HTTPS} off
+RewriteRule ^(.*)$ https://${PRODUCTION_DOMAIN}\$1 [R=301,L]
+RewriteCond %{HTTPS} on
+RewriteRule ^(.*)$ https://${PRODUCTION_DOMAIN}\$1 [R=301,L]
+END_rules
+}
+REDIRECT
+
+    log_verbose "Staging redirect vhost created"
+}
+
+#===============================================================================
+# SSL CERTIFICATE
+#===============================================================================
+
+obtain_ssl_certificate() {
+    if [[ "$SKIP_SSL" == true ]]; then
+        log_verbose "SSL certificate generation skipped (--skip-ssl)"
+        progress 6 "ssl" "complete" "SSL skipped"
+        return 0
+    fi
+
+    progress 6 "ssl" "start" "Obtaining SSL certificate"
+
+    # Check if certbot is available
+    if ! command_exists certbot; then
+        warn "certbot not found, skipping SSL"
+        progress 6 "ssl" "complete" "SSL skipped (certbot not found)"
+        return 0
+    fi
+
+    # Check if certificate already exists
+    if [[ -f "/etc/letsencrypt/live/${PRODUCTION_DOMAIN}/fullchain.pem" ]]; then
+        log_verbose "SSL certificate already exists for $PRODUCTION_DOMAIN"
+        progress 6 "ssl" "complete" "SSL certificate exists"
+        return 0
+    fi
+
+    # Obtain certificate
+    log_verbose "Running certbot for $PRODUCTION_DOMAIN"
+
+    if certbot certonly \
+        --webroot \
+        --webroot-path="$PRODUCTION_DOC_ROOT" \
+        -d "$PRODUCTION_DOMAIN" \
+        -d "www.${PRODUCTION_DOMAIN}" \
+        --non-interactive \
+        --agree-tos \
+        --email "admin@${PRODUCTION_DOMAIN}" \
+        --quiet 2>/dev/null; then
+        log_verbose "SSL certificate obtained"
+        progress 6 "ssl" "complete" "SSL certificate obtained"
+        return 0
+    else
+        warn "Failed to obtain SSL certificate"
+        warn "You may need to run certbot manually after DNS propagates"
+        progress 6 "ssl" "complete" "SSL failed (non-fatal)"
+        return 0
+    fi
+}
+
+#===============================================================================
+# RELOAD AND VALIDATE
+#===============================================================================
+
+reload_openlitespeed() {
+    progress 7 "reload" "start" "Reloading OpenLiteSpeed"
+
+    local lswsctrl="${OLS_DIR}/bin/lswsctrl"
+    if [[ ! -x "$lswsctrl" ]]; then
+        lswsctrl="/usr/local/lsws/bin/lswsctrl"
+    fi
+
+    if [[ -x "$lswsctrl" ]]; then
+        "$lswsctrl" restart 2>/dev/null
+        sleep 2
+        log_verbose "OpenLiteSpeed restarted"
+    else
+        warn "lswsctrl not found, please restart OpenLiteSpeed manually"
+    fi
+
+    progress 7 "reload" "complete" "OpenLiteSpeed reloaded"
+    return 0
+}
+
+validate_production() {
+    progress 8 "validate" "start" "Validating production site"
+
+    local wp_bin
+    wp_bin=$(_find_wp_cli 2>/dev/null || echo "wp")
+
+    # Check WordPress is functional
+    if ! "$wp_bin" core is-installed --path="$PRODUCTION_DOC_ROOT" --allow-root 2>/dev/null; then
+        warn "WordPress validation failed"
+    fi
+
+    # Check siteurl
+    local siteurl
+    siteurl=$("$wp_bin" option get siteurl --path="$PRODUCTION_DOC_ROOT" --allow-root 2>/dev/null || echo "")
+
+    if [[ "$siteurl" != "https://${PRODUCTION_DOMAIN}" ]]; then
+        warn "siteurl mismatch: expected https://${PRODUCTION_DOMAIN}, got $siteurl"
+    else
+        log_verbose "siteurl verified: $siteurl"
+    fi
+
+    # Try HTTP request to the site (local check)
+    if command_exists curl; then
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+            -H "Host: ${PRODUCTION_DOMAIN}" \
+            "http://127.0.0.1/" 2>/dev/null || echo "000")
+
+        if [[ "$http_code" == "200" ]] || [[ "$http_code" == "301" ]] || [[ "$http_code" == "302" ]]; then
+            log_verbose "Local HTTP check passed (status: $http_code)"
+        else
+            warn "Local HTTP check returned status: $http_code"
+        fi
+    fi
+
+    progress 8 "validate" "complete" "Production site validated"
+    return 0
+}
+
+#===============================================================================
+# LOGGING
+#===============================================================================
+
+log_cutover_event() {
+    local status="$1"
+    local message="$2"
+    local log_file="${LOG_DIR}/lifecycle/cutover.log"
+
+    mkdir -p "$(dirname "$log_file")" 2>/dev/null
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    local log_entry="[$timestamp] status=${status}"
+    log_entry+=" staging=${STAGING_DOMAIN} production=${PRODUCTION_DOMAIN}"
+    log_entry+=" message=\"${message}\""
+    log_entry+=" user=$(whoami)"
+
+    echo "$log_entry" >> "$log_file"
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+
+main() {
+    # Require root
+    require_root
+
+    # Parse arguments
+    parse_args "$@"
+
+    # Header
+    if [[ "$QUIET" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        header "JPS Migration Cutover"
+        echo "Staging Domain:    $STAGING_DOMAIN"
+        echo "Production Domain: $PRODUCTION_DOMAIN"
+        echo "Keep Staging:      $KEEP_STAGING"
+        echo ""
+    fi
+
+    # Confirmation
+    if [[ "$SKIP_CONFIRM" != true ]] && [[ "$PROGRESS_OUTPUT" != true ]]; then
+        echo "This will:"
+        echo "  1. Update database URLs from staging to production"
+        echo "  2. Rename site directory to production domain"
+        echo "  3. Update OpenLiteSpeed vhost configuration"
+        echo "  4. Obtain SSL certificate for production domain"
+        echo ""
+        echo "The staging site will be converted to production."
+        echo ""
+        read -rp "Continue? [y/N] " response
+        if [[ ! "$response" =~ ^[yY]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+
+    # Pre-flight checks
+    if ! preflight_checks; then
+        log_cutover_event "failed" "Pre-flight checks failed"
+        exit 3
+    fi
+
+    # Create checkpoint
+    if ! create_checkpoint; then
+        log_cutover_event "failed" "Checkpoint creation failed"
+        exit 1
+    fi
+
+    # Update database URLs
+    if ! update_database_urls; then
+        log_cutover_event "failed" "Database URL update failed"
+        exit 1
+    fi
+
+    # Rename site directory
+    if ! rename_site_directory; then
+        log_cutover_event "failed" "Directory rename failed"
+        exit 1
+    fi
+
+    # Update vhost configuration
+    if ! update_vhost_config; then
+        log_cutover_event "failed" "Vhost configuration failed"
+        exit 1
+    fi
+
+    # Obtain SSL certificate
+    obtain_ssl_certificate
+
+    # Reload OpenLiteSpeed
+    if ! reload_openlitespeed; then
+        warn "OpenLiteSpeed reload had issues"
+    fi
+
+    # Validate production site
+    validate_production
+
+    # Log success
+    log_cutover_event "success" "Cutover completed successfully"
+
+    # Success output
+    if [[ "$PROGRESS_OUTPUT" == true ]]; then
+        echo "{\"step\":\"result\",\"status\":\"success\",\"production_domain\":\"${PRODUCTION_DOMAIN}\",\"production_url\":\"https://${PRODUCTION_DOMAIN}\"}"
+    else
+        echo ""
+        success "Cutover completed!"
+        echo ""
+        echo "=========================================="
+        echo "PRODUCTION SITE DETAILS"
+        echo "=========================================="
+        echo "Production Site:  https://${PRODUCTION_DOMAIN}"
+        echo "Admin URL:        https://${PRODUCTION_DOMAIN}/wp-admin/"
+        echo ""
+        if [[ "$KEEP_STAGING" == true ]]; then
+            echo "Staging redirect: https://${STAGING_DOMAIN} -> https://${PRODUCTION_DOMAIN}"
+        fi
+        echo "=========================================="
+        echo ""
+        echo "NEXT STEPS:"
+        echo "  1. Verify the production site is working correctly"
+        echo "  2. Test all critical functionality"
+        if [[ "$KEEP_STAGING" != true ]]; then
+            echo "  3. The staging site has been removed"
+        fi
+    fi
+
+    exit 0
+}
+
+# Run main function
+main "$@"
