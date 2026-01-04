@@ -394,29 +394,31 @@ step_create_database() {
     DB_PASS=$(random_string 24)
 
     # Create database and user
-    # Note: Using heredoc syntax to avoid shell quoting issues with @ symbol
-    # The @ in 'user'@'localhost' can be misinterpreted in some shell contexts
+    # Note: Using printf to build SQL statements avoids both:
+    # 1. Heredoc backtick interpretation issues
+    # 2. Shell quoting issues with @ in 'user'@'localhost'
 
-    mysql <<EOF 2>/dev/null || {
+    local sql_create_db sql_create_user sql_grant
+
+    # Build SQL statements with printf (handles special chars safely)
+    sql_create_db=$(printf "CREATE DATABASE IF NOT EXISTS \`%s\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" "$DB_NAME")
+    sql_create_user=$(printf "CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY '%s';" "$DB_USER" "$DB_PASS")
+    sql_grant=$(printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'localhost';" "$DB_NAME" "$DB_USER")
+
+    mysql -e "$sql_create_db" 2>/dev/null || {
         progress 3 "database" "error" "Failed to create database"
         return 1
     }
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-EOF
 
-    mysql <<EOF 2>/dev/null || {
+    mysql -e "$sql_create_user" 2>/dev/null || {
         progress 3 "database" "error" "Failed to create database user"
         return 1
     }
-CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
-EOF
 
-    mysql <<EOF 2>/dev/null || {
+    mysql -e "$sql_grant" 2>/dev/null || {
         progress 3 "database" "error" "Failed to grant privileges"
         return 1
     }
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
-EOF
 
     mysql -e "FLUSH PRIVILEGES;" 2>/dev/null
 
