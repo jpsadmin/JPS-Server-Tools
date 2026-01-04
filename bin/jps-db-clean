@@ -27,10 +27,17 @@ readonly SCRIPT_VERSION="1.0.0"
 # CONFIGURATION
 #===============================================================================
 
-# Paths
-readonly WEBSITES_ROOT="/usr/local/websites"
-readonly WP_CLI="/usr/local/bin/wp"
-readonly LOG_DIR="/opt/jps-server-tools/logs/db-clean"
+# Load config file if it exists (allows overriding defaults)
+CONFIG_FILE="/opt/jps-server-tools/config/jps-tools.conf"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Paths (use config values or defaults)
+readonly WEBSITES_ROOT="${WEBSITES_ROOT:-/usr/local/websites}"
+readonly WP_CLI="${WP_CLI:-/usr/local/bin/wp}"
+readonly LOG_DIR="${LOG_DIR:-/opt/jps-server-tools/logs}/db-clean"
 
 # Cleanup settings
 readonly REVISIONS_TO_KEEP=5

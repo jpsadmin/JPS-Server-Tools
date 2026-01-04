@@ -22,9 +22,6 @@ set -euo pipefail
 readonly SCRIPT_NAME="jps-dns-check"
 readonly SCRIPT_VERSION="1.0.0"
 
-# Default VPS IP (can be overridden via --ip or config)
-readonly DEFAULT_VPS_IP="69.62.67.12"
-
 # Resolve the actual script location (handle symlinks)
 _resolve_script_dir() {
     local source="${BASH_SOURCE[0]}"
@@ -51,6 +48,9 @@ fi
 
 # Load configuration
 load_config
+
+# Default VPS IP (uses config value or fallback default)
+readonly DEFAULT_VPS_IP="${VPS_IP:-69.62.67.12}"
 
 #===============================================================================
 # HELP AND VERSION
