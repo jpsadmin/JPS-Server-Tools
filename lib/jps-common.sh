@@ -797,3 +797,78 @@ help_footer() {
     echo "Part of JPS Server Tools - https://github.com/yourusername/jps-server-tools"
     echo "Report issues at https://github.com/yourusername/jps-server-tools/issues"
 }
+
+#===============================================================================
+# RCLONE/GOOGLE DRIVE HELPERS
+#===============================================================================
+
+# rclone_installed() - Check if rclone is installed
+# Usage: if rclone_installed; then echo "rclone is available"; fi
+rclone_installed() {
+    command -v rclone &>/dev/null
+}
+
+# rclone_remote_exists() - Check if an rclone remote is configured
+# Usage: if rclone_remote_exists "gdrive"; then echo "gdrive remote exists"; fi
+rclone_remote_exists() {
+    local remote="$1"
+
+    if ! rclone_installed; then
+        return 1
+    fi
+
+    rclone listremotes 2>/dev/null | grep -q "^${remote}:$"
+}
+
+# rclone_test_connection() - Test connection to an rclone remote
+# Usage: if rclone_test_connection "gdrive" "backups"; then echo "connected"; fi
+rclone_test_connection() {
+    local remote="$1"
+    local path="${2:-}"
+
+    if ! rclone_installed; then
+        return 1
+    fi
+
+    if ! rclone_remote_exists "$remote"; then
+        return 1
+    fi
+
+    # Try to list the path (with timeout)
+    local target="${remote}:"
+    [[ -n "$path" ]] && target="${remote}:${path}"
+
+    timeout 30 rclone lsd "$target" &>/dev/null 2>&1
+}
+
+# get_rclone_status() - Get rclone configuration status as JSON
+# Usage: status=$(get_rclone_status "gdrive" "backups/_jps.migration.backups")
+get_rclone_status() {
+    local remote="${1:-gdrive}"
+    local path="${2:-}"
+
+    local installed="false"
+    local configured="false"
+    local connected="false"
+    local error=""
+
+    if rclone_installed; then
+        installed="true"
+
+        if rclone_remote_exists "$remote"; then
+            configured="true"
+
+            if rclone_test_connection "$remote" "$path"; then
+                connected="true"
+            else
+                error="Cannot connect to Google Drive"
+            fi
+        else
+            error="Remote '${remote}' not configured"
+        fi
+    else
+        error="rclone not installed"
+    fi
+
+    echo "{\"installed\":${installed},\"configured\":${configured},\"connected\":${connected},\"error\":\"${error}\"}"
+}
