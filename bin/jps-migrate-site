@@ -1256,16 +1256,22 @@ import_database() {
         SET FOREIGN_KEY_CHECKS = 1;
     " 2>/dev/null || true
 
-    # Handle table prefix mismatch
+    # Handle table prefix mismatch by updating wp-config.php
+    # This is more reliable than trying to sed-replace all table names in SQL
     if [[ "$SOURCE_DB_PREFIX" != "$staging_prefix" ]]; then
-        log_verbose "Converting table prefix: $SOURCE_DB_PREFIX -> $staging_prefix"
+        log_verbose "Updating wp-config.php to use source table prefix: $SOURCE_DB_PREFIX"
 
-        # Create modified SQL file with corrected prefix
-        sed "s/\`${SOURCE_DB_PREFIX}/\`${staging_prefix}/g" "$sql_file" > "$TEMP_DIR/database_modified.sql"
-        sql_file="$TEMP_DIR/database_modified.sql"
+        # Update $table_prefix in wp-config.php to match source database
+        if sed -i "s/\\\$table_prefix *= *['\"][^'\"]*['\"]/\$table_prefix = '${SOURCE_DB_PREFIX}'/" "$staging_config"; then
+            log_verbose "Successfully updated table_prefix in wp-config.php"
+            # Update our local variable to reflect the change
+            staging_prefix="$SOURCE_DB_PREFIX"
+        else
+            warn "Could not update table_prefix in wp-config.php - manual fix may be required"
+        fi
     fi
 
-    # Import database
+    # Import database as-is (no prefix rewriting needed)
     log_verbose "Importing SQL file"
     if ! mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" < "$sql_file" 2>/dev/null; then
         error_exit "FATAL: Database import failed. MySQL returned an error."
@@ -1379,11 +1385,13 @@ detect_woocommerce() {
     local woo_active
     woo_active=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
         "SELECT option_value FROM ${staging_prefix}options WHERE option_name='active_plugins';" 2>/dev/null | grep -c "woocommerce" || echo "0")
+    woo_active=$(echo "$woo_active" | tr -d '[:space:]')
 
     # Check for WooCommerce tables
     local woo_tables
     woo_tables=$(mysql -u"$staging_db_user" -p"$staging_db_pass" "$staging_db_name" -N -e \
-        "SHOW TABLES LIKE '%woocommerce%';" 2>/dev/null | wc -l || echo "0")
+        "SHOW TABLES LIKE '%woocommerce%';" 2>/dev/null | wc -l)
+    woo_tables=$(echo "${woo_tables:-0}" | tr -d '[:space:]')
 
     if [[ "$woo_active" -gt 0 ]] || [[ "$woo_tables" -gt 0 ]]; then
         return 0  # WooCommerce detected
