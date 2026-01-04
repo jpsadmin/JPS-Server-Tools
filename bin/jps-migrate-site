@@ -69,10 +69,11 @@ DESCRIPTION:
     Creates a staging site (staging.{domain}) for validation before DNS cutover.
 
 SUPPORTED SOURCE FORMATS:
-    WPvivid     Folder with wpvivid_*_backup_info.json + multi-part ZIPs
+    Directory   Folder containing ZIP backup files (WPvivid, WPMU DEV, ManageWP, etc.)
+                Automatically detects and extracts nested ZIPs, finds database and content
     .wpress     All-in-One WP Migration export file
     .tar.gz     Archive containing wp-content/ and a .sql database dump
-    .zip        ZIP archive containing wp-content/ and a .sql database dump
+    .zip        Single ZIP archive containing wp-content/ and a .sql database dump
     rsync       Remote WordPress directory (user@host:/path/to/wordpress)
 
 USAGE:
@@ -159,9 +160,8 @@ STAGING_DOC_ROOT=""
 TEMP_DIR=""
 
 # Source info (detected)
-SOURCE_TYPE=""  # wpvivid, wpress, tarball, zip, rsync
+SOURCE_TYPE=""  # zip_backup, wpress, tarball, zip, rsync
 SOURCE_DB_PREFIX=""
-WPVIVID_INFO_FILE=""  # Path to wpvivid_*_backup_info.json if detected
 
 # Migration paths (loaded from config, with fallback defaults)
 # These are set after load_config() is called
@@ -418,35 +418,39 @@ detect_source_type() {
         return 1
     fi
 
-    # Check for WPvivid backup folder (highest priority for directories)
+    # Directory detection - plugin-agnostic approach
     if [[ -d "$SOURCE" ]]; then
-        # Look for WPvivid backup info JSON
-        local wpvivid_json
-        wpvivid_json=$(find "$SOURCE" -maxdepth 1 -name "wpvivid_*_backup_info.json" -print -quit 2>/dev/null)
+        # Check for ZIP files in directory (any backup plugin: WPvivid, WPMU DEV, ManageWP, etc.)
+        local zip_count
+        zip_count=$(find "$SOURCE" -maxdepth 1 -name "*.zip" -type f 2>/dev/null | wc -l)
 
-        if [[ -n "$wpvivid_json" ]]; then
-            SOURCE_TYPE="wpvivid"
-            WPVIVID_INFO_FILE="$wpvivid_json"
-            log_verbose "Source type: WPvivid backup (found: $(basename "$wpvivid_json"))"
+        # Check for manifest/info files (various backup plugins use different names)
+        local has_manifest=false
+        if find "$SOURCE" -maxdepth 1 \( -name "*backup_info*.json" -o -name "*manifest*.json" -o -name "*.json" \) -type f 2>/dev/null | grep -q .; then
+            has_manifest=true
+        fi
+
+        if [[ "$zip_count" -gt 0 ]]; then
+            SOURCE_TYPE="zip_backup"
+            log_verbose "Source type: ZIP backup directory ($zip_count ZIP files found, manifest: $has_manifest)"
+            log_verbose "Plugin-agnostic mode: will extract all ZIPs and search for database/content"
             return 0
         fi
 
-        # Also check for multi-part ZIP pattern without JSON (legacy WPvivid)
-        local wpvivid_zips
-        wpvivid_zips=$(find "$SOURCE" -maxdepth 1 -name "*_part001.zip" -o -name "*-part001.zip" 2>/dev/null | head -1)
-        if [[ -n "$wpvivid_zips" ]]; then
-            SOURCE_TYPE="wpvivid"
-            log_verbose "Source type: WPvivid backup (multi-part ZIPs detected)"
+        # Check if directory contains WordPress files directly (wp-config.php)
+        if [[ -f "$SOURCE/wp-config.php" ]]; then
+            SOURCE_TYPE="rsync"
+            log_verbose "Source type: rsync (local WordPress directory)"
             return 0
         fi
 
-        # Regular directory - treat as rsync local
-        SOURCE_TYPE="rsync"
-        log_verbose "Source type: rsync (local directory)"
-        return 0
+        # Empty or unrecognized directory
+        error "Directory does not contain ZIP files or WordPress installation: $SOURCE"
+        error "Place backup ZIP files in the directory, or point to a WordPress installation"
+        return 1
     fi
 
-    # Detect by file extension
+    # Detect by file extension for single files
     case "$SOURCE" in
         *.wpress)
             SOURCE_TYPE="wpress"
@@ -457,31 +461,22 @@ detect_source_type() {
             log_verbose "Source type: tarball"
             ;;
         *.zip)
-            # Check if this is a single WPvivid part or generic ZIP
-            if [[ "$SOURCE" =~ part[0-9]+\.zip$ ]]; then
-                # This is a WPvivid part - look for the parent folder
+            # Single ZIP file - check if it's a multi-part backup
+            if [[ "$SOURCE" =~ part[0-9]+\.zip$ ]] || [[ "$SOURCE" =~ \.part[0-9]+\.zip$ ]]; then
+                # Multi-part ZIP - use the parent folder instead
                 local parent_dir
                 parent_dir=$(dirname "$SOURCE")
-                local wpvivid_json
-                wpvivid_json=$(find "$parent_dir" -maxdepth 1 -name "wpvivid_*_backup_info.json" -print -quit 2>/dev/null)
-
-                if [[ -n "$wpvivid_json" ]]; then
-                    SOURCE_TYPE="wpvivid"
-                    WPVIVID_INFO_FILE="$wpvivid_json"
-                    SOURCE="$parent_dir"  # Use the folder instead
-                    log_verbose "Source type: WPvivid backup (redirected to folder)"
-                else
-                    SOURCE_TYPE="zip"
-                    log_verbose "Source type: ZIP archive"
-                fi
+                SOURCE="$parent_dir"
+                SOURCE_TYPE="zip_backup"
+                log_verbose "Source type: ZIP backup directory (redirected from multi-part ZIP)"
             else
                 SOURCE_TYPE="zip"
-                log_verbose "Source type: ZIP archive"
+                log_verbose "Source type: single ZIP archive"
             fi
             ;;
         *)
             error "Unknown source format: $SOURCE"
-            error "Supported formats: WPvivid folder, .wpress, .tar.gz, .zip, directory, or rsync URL"
+            error "Supported formats: directory with ZIPs, .wpress, .tar.gz, .zip, or rsync URL"
             return 1
             ;;
     esac
@@ -541,18 +536,13 @@ check_dependencies() {
         rsync)
             command_exists rsync || missing+=("rsync")
             ;;
-        wpress|wpvivid|zip)
+        wpress|zip_backup|zip)
             command_exists unzip || missing+=("unzip")
             ;;
         tarball)
             command_exists tar || missing+=("tar")
             ;;
     esac
-
-    # WPvivid may need jq for JSON parsing (optional but recommended)
-    if [[ "$SOURCE_TYPE" == "wpvivid" ]] && ! command_exists jq; then
-        warn "jq not found - WPvivid metadata parsing may be limited"
-    fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing required commands: ${missing[*]}"
@@ -739,198 +729,116 @@ extract_wpress_ai1wm() {
 }
 
 #===============================================================================
-# WPVIVID EXTRACTION
+# ZIP BACKUP EXTRACTION (Plugin-Agnostic)
+# Supports: WPvivid, WPMU DEV, ManageWP, and other ZIP-based backup plugins
 #===============================================================================
 
-# Extract nested ZIPs from WPvivid _backup_all type backups
-# WPvivid _backup_all contains inner ZIPs like:
-#   - wpvivid-..._backup_db.zip (contains the .sql file)
-#   - wpvivid-..._backup_themes.zip
-#   - wpvivid-..._backup_plugins.zip
-#   - wpvivid-..._backup_uploads.zip
-#   - wpvivid-..._backup_content.zip
-wpvivid_extract_nested_zips() {
-    log_verbose "Checking for nested WPvivid ZIPs in $TEMP_DIR"
+# Extract all nested ZIPs found after initial extraction
+# Many backup plugins use nested ZIPs (outer archive contains inner archives)
+extract_nested_zips() {
+    local max_depth="${1:-3}"
+    local pass=1
+    local total_extracted=0
 
-    local nested_count=0
-    local nested_zips=()
+    log_verbose "Searching for nested ZIPs (max depth: $max_depth)"
 
-    # Find all nested ZIPs that match WPvivid patterns
-    # These are the inner content/db ZIPs inside _backup_all outer ZIPs
-    while IFS= read -r -d '' nested_zip; do
-        local basename_zip
-        basename_zip=$(basename "$nested_zip")
+    # Keep extracting until no more nested ZIPs are found
+    while true; do
+        local nested_zips=()
 
-        # Match WPvivid inner ZIP patterns
-        if [[ "$basename_zip" =~ _backup_db\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_themes\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_plugins\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_uploads\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_content\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_core\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_mu-plugins\.zip$ ]] || \
-           [[ "$basename_zip" =~ _backup_others\.zip$ ]]; then
+        # Find all ZIP files in TEMP_DIR
+        while IFS= read -r -d '' nested_zip; do
             nested_zips+=("$nested_zip")
+        done < <(find "$TEMP_DIR" -maxdepth "$max_depth" -name "*.zip" -type f -print0 2>/dev/null)
+
+        if [[ ${#nested_zips[@]} -eq 0 ]]; then
+            log_verbose "Pass $pass: No more nested ZIPs found"
+            break
         fi
-    done < <(find "$TEMP_DIR" -maxdepth 2 -name "*.zip" -type f -print0 2>/dev/null)
 
-    if [[ ${#nested_zips[@]} -eq 0 ]]; then
-        log_verbose "No nested WPvivid ZIPs found"
-        return 0
-    fi
+        log_verbose "Pass $pass: Found ${#nested_zips[@]} nested ZIP(s) to extract"
 
-    log_verbose "Found ${#nested_zips[@]} nested WPvivid ZIPs to extract"
+        local extracted_this_pass=0
+        for nested_zip in "${nested_zips[@]}"; do
+            local basename_zip
+            basename_zip=$(basename "$nested_zip")
+            log_verbose "  Extracting: $basename_zip"
 
-    # Extract each nested ZIP
-    for nested_zip in "${nested_zips[@]}"; do
-        local basename_zip
-        basename_zip=$(basename "$nested_zip")
-        log_verbose "Extracting nested ZIP: $basename_zip"
+            # Extract to TEMP_DIR
+            if unzip -q -o "$nested_zip" -d "$TEMP_DIR" 2>/dev/null; then
+                ((extracted_this_pass++))
+                ((total_extracted++))
+                # Remove the nested ZIP after successful extraction
+                rm -f "$nested_zip"
+                log_verbose "    Extracted and removed: $basename_zip"
+            else
+                warn "Failed to extract nested ZIP: $basename_zip"
+            fi
+        done
 
-        # Extract to TEMP_DIR (same location as outer content)
-        if unzip -q -o "$nested_zip" -d "$TEMP_DIR" 2>/dev/null; then
-            ((nested_count++))
-            log_verbose "  Successfully extracted: $basename_zip"
-
-            # Remove the inner ZIP after successful extraction to avoid confusion
-            rm -f "$nested_zip"
-            log_verbose "  Removed nested ZIP after extraction"
-        else
-            warn "Failed to extract nested ZIP: $basename_zip"
+        if [[ $extracted_this_pass -eq 0 ]]; then
+            log_verbose "Pass $pass: No ZIPs could be extracted, stopping"
+            break
         fi
-    done
 
-    log_verbose "Extracted $nested_count nested WPvivid ZIPs"
-    return 0
-}
-
-extract_wpvivid() {
-    progress 3 "import" "start" "Extracting WPvivid backup"
-
-    mkdir -p "$TEMP_DIR"
-
-    # Parse WPvivid backup info if available
-    local backup_info=""
-    if [[ -n "$WPVIVID_INFO_FILE" ]] && [[ -f "$WPVIVID_INFO_FILE" ]]; then
-        log_verbose "Parsing WPvivid backup info: $WPVIVID_INFO_FILE"
-        backup_info=$(cat "$WPVIVID_INFO_FILE")
-    fi
-
-    # Find all part ZIP files in the source directory
-    local zip_parts=()
-    local db_zip=""
-    local files_zip=""
-
-    # WPvivid naming patterns:
-    # - wpvivid-<site>_<date>_<id>_<type>_part001.zip
-    # - Types: backup (files+db), files, database, uploads, themes, plugins, etc.
-
-    while IFS= read -r -d '' zipfile; do
-        local basename_zip
-        basename_zip=$(basename "$zipfile")
-
-        # Detect database backup parts
-        if [[ "$basename_zip" =~ _database_ ]] || [[ "$basename_zip" =~ _db_ ]]; then
-            log_verbose "Found database ZIP: $basename_zip"
-            db_zip="$zipfile"
-        elif [[ "$basename_zip" =~ _backup_ ]] || [[ "$basename_zip" =~ _files_ ]] || [[ "$basename_zip" =~ _themes_ ]] || [[ "$basename_zip" =~ _plugins_ ]] || [[ "$basename_zip" =~ _uploads_ ]] || [[ "$basename_zip" =~ _content_ ]]; then
-            log_verbose "Found content ZIP: $basename_zip"
-            zip_parts+=("$zipfile")
-        else
-            # Generic part - could be either
-            log_verbose "Found generic ZIP: $basename_zip"
-            zip_parts+=("$zipfile")
-        fi
-    done < <(find "$SOURCE" -maxdepth 1 -name "*.zip" -print0 2>/dev/null | sort -z)
-
-    if [[ ${#zip_parts[@]} -eq 0 ]] && [[ -z "$db_zip" ]]; then
-        error "No WPvivid ZIP files found in $SOURCE"
-        return 1
-    fi
-
-    log_verbose "Found ${#zip_parts[@]} content ZIPs and ${db_zip:+1 database ZIP}"
-
-    # Extract database ZIP first (if separate)
-    if [[ -n "$db_zip" ]]; then
-        log_verbose "Extracting database from: $(basename "$db_zip")"
-        if ! unzip -q -o "$db_zip" -d "$TEMP_DIR" 2>/dev/null; then
-            error "Failed to extract database ZIP"
-            return 1
-        fi
-    fi
-
-    # Extract all content ZIPs
-    for zipfile in "${zip_parts[@]}"; do
-        log_verbose "Extracting: $(basename "$zipfile")"
-        if ! unzip -q -o "$zipfile" -d "$TEMP_DIR" 2>/dev/null; then
-            warn "Failed to extract: $(basename "$zipfile")"
+        ((pass++))
+        # Safety limit to prevent infinite loops
+        if [[ $pass -gt 5 ]]; then
+            warn "Reached maximum extraction passes (5), stopping"
+            break
         fi
     done
 
-    # CRITICAL: Extract nested ZIPs from _backup_all type backups
-    # WPvivid _backup_all outer ZIPs contain inner ZIPs like _backup_db.zip
-    # that hold the actual SQL file and content directories
-    wpvivid_extract_nested_zips
-
-    # WPvivid typically extracts to a structure like:
-    # - wp-content/ (site files)
-    # - *.sql or wpvivid_*.sql (database dump)
-
-    # Find and normalize the database file - MANDATORY
-    if ! wpvivid_find_database; then
-        error_exit "FATAL: No database dump found in WPvivid backup. Migration cannot proceed without a database."
-    fi
-
-    # Verify database file has content
-    if [[ ! -f "$TEMP_DIR/database.sql" ]] || [[ ! -s "$TEMP_DIR/database.sql" ]]; then
-        error_exit "FATAL: Database file is empty or missing. WPvivid backup must contain a valid database dump."
-    fi
-
-    log_verbose "Database file size: $(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "unknown") bytes"
-
-    # Find and normalize wp-content
-    if ! wpvivid_find_content; then
-        warn "No wp-content found in WPvivid backup"
-    fi
-
-    progress 3 "import" "complete" "WPvivid backup extracted (database found)"
+    log_verbose "Total nested ZIPs extracted: $total_extracted"
     return 0
 }
 
-wpvivid_find_database() {
-    # WPvivid database naming patterns:
-    # - wpvivid_*.sql
-    # - *.sql in root
-    # - database.sql
+# Find database file at any depth in TEMP_DIR
+# Plugin-agnostic: searches for any *.sql file
+find_database_file() {
+    log_verbose "Searching for database file in $TEMP_DIR"
 
     local sql_file=""
 
-    # Check for wpvivid named SQL file
-    sql_file=$(find "$TEMP_DIR" -maxdepth 2 -name "wpvivid_*.sql" -type f -print -quit 2>/dev/null)
+    # Priority 1: Look for common database dump names
+    for pattern in "database.sql" "db.sql" "dump.sql" "*_db.sql" "*_database.sql" "wpvivid_*.sql"; do
+        sql_file=$(find "$TEMP_DIR" -maxdepth 5 -name "$pattern" -type f -print -quit 2>/dev/null)
+        if [[ -n "$sql_file" ]] && [[ -f "$sql_file" ]] && [[ -s "$sql_file" ]]; then
+            log_verbose "Found database file (pattern: $pattern): $sql_file"
+            break
+        fi
+        sql_file=""
+    done
 
+    # Priority 2: Any SQL file
     if [[ -z "$sql_file" ]]; then
-        # Check for any SQL file
-        sql_file=$(find "$TEMP_DIR" -maxdepth 2 -name "*.sql" -type f -print -quit 2>/dev/null)
+        sql_file=$(find "$TEMP_DIR" -maxdepth 5 -name "*.sql" -type f -print -quit 2>/dev/null)
+        if [[ -n "$sql_file" ]]; then
+            log_verbose "Found SQL file: $sql_file"
+        fi
     fi
 
     if [[ -n "$sql_file" ]] && [[ -f "$sql_file" ]]; then
-        log_verbose "Found SQL file: $sql_file"
         local sql_size
         sql_size=$(stat -c%s "$sql_file" 2>/dev/null || echo "0")
         log_verbose "SQL file size: $sql_size bytes"
 
+        # Move to standard location
         if [[ "$sql_file" != "$TEMP_DIR/database.sql" ]]; then
             mv "$sql_file" "$TEMP_DIR/database.sql"
+            log_verbose "Moved to: $TEMP_DIR/database.sql"
         fi
         return 0
     fi
 
+    log_verbose "No database file found"
     return 1
 }
 
-wpvivid_find_content() {
-    # Look for wp-content directory
-    # WPvivid may extract to various structures
+# Find wp-content directory at any depth in TEMP_DIR
+# Plugin-agnostic: searches for wp-content or reconstructs from parts
+find_wp_content() {
+    log_verbose "Searching for wp-content in $TEMP_DIR"
 
     # Already in place?
     if [[ -d "$TEMP_DIR/wp-content" ]]; then
@@ -940,37 +848,107 @@ wpvivid_find_content() {
 
     # Search for wp-content in subdirectories
     local found_dir
-    found_dir=$(find "$TEMP_DIR" -maxdepth 3 -type d -name "wp-content" -print -quit 2>/dev/null)
+    found_dir=$(find "$TEMP_DIR" -maxdepth 5 -type d -name "wp-content" -print -quit 2>/dev/null)
 
     if [[ -n "$found_dir" ]]; then
         log_verbose "Found wp-content at: $found_dir"
-        # Move to expected location
         if [[ "$found_dir" != "$TEMP_DIR/wp-content" ]]; then
             mv "$found_dir" "$TEMP_DIR/wp-content"
+            log_verbose "Moved to: $TEMP_DIR/wp-content"
         fi
         return 0
     fi
 
-    # Check if we have individual content directories (themes, plugins, uploads)
-    # This happens with split WPvivid backups
+    # Check for individual content directories (themes, plugins, uploads)
+    # Some backup plugins split these into separate archives
     local has_content=false
 
-    if [[ -d "$TEMP_DIR/themes" ]] || [[ -d "$TEMP_DIR/plugins" ]] || [[ -d "$TEMP_DIR/uploads" ]]; then
-        log_verbose "Found split content directories, reconstructing wp-content"
-        mkdir -p "$TEMP_DIR/wp-content"
-
-        [[ -d "$TEMP_DIR/themes" ]] && mv "$TEMP_DIR/themes" "$TEMP_DIR/wp-content/"
-        [[ -d "$TEMP_DIR/plugins" ]] && mv "$TEMP_DIR/plugins" "$TEMP_DIR/wp-content/"
-        [[ -d "$TEMP_DIR/uploads" ]] && mv "$TEMP_DIR/uploads" "$TEMP_DIR/wp-content/"
-
-        has_content=true
-    fi
+    for content_dir in themes plugins uploads mu-plugins languages; do
+        local found_content
+        found_content=$(find "$TEMP_DIR" -maxdepth 5 -type d -name "$content_dir" -print -quit 2>/dev/null)
+        if [[ -n "$found_content" ]] && [[ "$found_content" != "$TEMP_DIR/wp-content/$content_dir" ]]; then
+            log_verbose "Found split content: $content_dir at $found_content"
+            mkdir -p "$TEMP_DIR/wp-content"
+            mv "$found_content" "$TEMP_DIR/wp-content/"
+            has_content=true
+        fi
+    done
 
     if [[ "$has_content" == true ]]; then
+        log_verbose "Reconstructed wp-content from split directories"
         return 0
     fi
 
+    log_verbose "No wp-content directory found"
     return 1
+}
+
+# Main extraction function for ZIP backup directories
+# Plugin-agnostic: works with WPvivid, WPMU DEV, ManageWP, etc.
+extract_zip_backup() {
+    progress 3 "import" "start" "Extracting backup (plugin-agnostic mode)"
+
+    mkdir -p "$TEMP_DIR"
+
+    # Find all ZIP files in source directory
+    local zip_files=()
+    while IFS= read -r -d '' zipfile; do
+        zip_files+=("$zipfile")
+    done < <(find "$SOURCE" -maxdepth 1 -name "*.zip" -type f -print0 2>/dev/null | sort -z)
+
+    if [[ ${#zip_files[@]} -eq 0 ]]; then
+        error "No ZIP files found in $SOURCE"
+        return 1
+    fi
+
+    log_verbose "Found ${#zip_files[@]} ZIP file(s) in source directory"
+
+    # Extract all outer ZIP files
+    local extracted=0
+    for zipfile in "${zip_files[@]}"; do
+        local basename_zip
+        basename_zip=$(basename "$zipfile")
+        log_verbose "Extracting: $basename_zip"
+
+        if unzip -q -o "$zipfile" -d "$TEMP_DIR" 2>/dev/null; then
+            ((extracted++))
+            log_verbose "  Successfully extracted: $basename_zip"
+        else
+            warn "Failed to extract: $basename_zip"
+        fi
+    done
+
+    if [[ $extracted -eq 0 ]]; then
+        error "Failed to extract any ZIP files"
+        return 1
+    fi
+
+    log_verbose "Extracted $extracted outer ZIP file(s)"
+
+    # Extract any nested ZIPs (many backup plugins use nested archives)
+    extract_nested_zips
+
+    # Find database file - MANDATORY
+    if ! find_database_file; then
+        error_exit "FATAL: No database dump (.sql file) found in backup. Migration cannot proceed without a database."
+    fi
+
+    # Verify database file has content
+    if [[ ! -f "$TEMP_DIR/database.sql" ]] || [[ ! -s "$TEMP_DIR/database.sql" ]]; then
+        error_exit "FATAL: Database file is empty. Backup must contain a valid database dump."
+    fi
+
+    local db_size
+    db_size=$(stat -c%s "$TEMP_DIR/database.sql" 2>/dev/null || echo "0")
+    log_verbose "Database file size: $db_size bytes"
+
+    # Find wp-content directory
+    if ! find_wp_content; then
+        warn "No wp-content directory found in backup"
+    fi
+
+    progress 3 "import" "complete" "Backup extracted (database found, ${#zip_files[@]} archives processed)"
+    return 0
 }
 
 #===============================================================================
@@ -1793,9 +1771,9 @@ main() {
 
     # Import source based on type
     case "$SOURCE_TYPE" in
-        wpvivid)
-            if ! extract_wpvivid; then
-                log_lifecycle_event "failed" "Failed to extract WPvivid backup"
+        zip_backup)
+            if ! extract_zip_backup; then
+                log_lifecycle_event "failed" "Failed to extract ZIP backup"
                 exit 1
             fi
             ;;
