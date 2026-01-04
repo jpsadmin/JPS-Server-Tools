@@ -837,46 +837,114 @@ find_database_file() {
 
 # Find wp-content directory at any depth in TEMP_DIR
 # Plugin-agnostic: searches for wp-content or reconstructs from parts
+# IMPORTANT: Handles multi-part backups (like WPvivid) where plugins/themes/uploads
+# may be split across multiple archives and extract to separate directories
 find_wp_content() {
     log_verbose "Searching for wp-content in $TEMP_DIR"
 
-    # Already in place?
-    if [[ -d "$TEMP_DIR/wp-content" ]]; then
-        log_verbose "wp-content found at root"
-        return 0
-    fi
+    # Ensure target wp-content exists
+    mkdir -p "$TEMP_DIR/wp-content"
 
-    # Search for wp-content in subdirectories
-    local found_dir
-    found_dir=$(find "$TEMP_DIR" -maxdepth 5 -type d -name "wp-content" -print -quit 2>/dev/null)
-
-    if [[ -n "$found_dir" ]]; then
-        log_verbose "Found wp-content at: $found_dir"
-        if [[ "$found_dir" != "$TEMP_DIR/wp-content" ]]; then
-            mv "$found_dir" "$TEMP_DIR/wp-content"
-            log_verbose "Moved to: $TEMP_DIR/wp-content"
-        fi
-        return 0
-    fi
-
-    # Check for individual content directories (themes, plugins, uploads)
-    # Some backup plugins split these into separate archives
     local has_content=false
 
-    for content_dir in themes plugins uploads mu-plugins languages; do
-        local found_content
-        found_content=$(find "$TEMP_DIR" -maxdepth 5 -type d -name "$content_dir" -print -quit 2>/dev/null)
-        if [[ -n "$found_content" ]] && [[ "$found_content" != "$TEMP_DIR/wp-content/$content_dir" ]]; then
-            log_verbose "Found split content: $content_dir at $found_content"
-            mkdir -p "$TEMP_DIR/wp-content"
-            mv "$found_content" "$TEMP_DIR/wp-content/"
-            has_content=true
+    # First, find and merge ALL wp-content directories (there may be multiple)
+    local wp_content_dirs=()
+    while IFS= read -r -d '' dir; do
+        wp_content_dirs+=("$dir")
+    done < <(find "$TEMP_DIR" -maxdepth 5 -type d -name "wp-content" -print0 2>/dev/null)
+
+    for wp_dir in "${wp_content_dirs[@]}"; do
+        if [[ "$wp_dir" == "$TEMP_DIR/wp-content" ]]; then
+            continue  # Skip the target directory
         fi
+
+        log_verbose "Found wp-content at: $wp_dir"
+
+        # Merge contents using rsync or cp -rn (no clobber)
+        # rsync is preferred as it handles merging better
+        if command -v rsync &>/dev/null; then
+            rsync -a "$wp_dir/" "$TEMP_DIR/wp-content/" 2>/dev/null
+        else
+            cp -rn "$wp_dir/"* "$TEMP_DIR/wp-content/" 2>/dev/null || true
+        fi
+
+        # Remove the source directory after merging
+        rm -rf "$wp_dir"
+        has_content=true
+        log_verbose "Merged wp-content from: $wp_dir"
     done
 
+    # Check for individual content directories (themes, plugins, uploads)
+    # WPvivid and other backup plugins split these into separate archives
+    # CRITICAL: Find ALL instances, not just the first one (removed -print -quit)
+    for content_type in themes plugins uploads mu-plugins languages; do
+        local found_dirs=()
+
+        # Find ALL directories of this type (not just the first)
+        while IFS= read -r -d '' found_dir; do
+            found_dirs+=("$found_dir")
+        done < <(find "$TEMP_DIR" -maxdepth 5 -type d -name "$content_type" -print0 2>/dev/null)
+
+        for found_content in "${found_dirs[@]}"; do
+            # Skip if already in the correct location
+            if [[ "$found_content" == "$TEMP_DIR/wp-content/$content_type" ]]; then
+                continue
+            fi
+
+            # Skip if it's inside a wp-content we already processed
+            if [[ "$found_content" == "$TEMP_DIR/wp-content/"* ]]; then
+                continue
+            fi
+
+            log_verbose "Found split content: $content_type at $found_content"
+
+            # Ensure target directory exists
+            mkdir -p "$TEMP_DIR/wp-content/$content_type"
+
+            # MERGE contents instead of moving the directory (handles multi-part backups)
+            # Use rsync for proper merging, fallback to cp
+            if command -v rsync &>/dev/null; then
+                rsync -a "$found_content/" "$TEMP_DIR/wp-content/$content_type/" 2>/dev/null
+            else
+                # cp -rn = recursive, no clobber (don't overwrite existing files)
+                cp -rn "$found_content/"* "$TEMP_DIR/wp-content/$content_type/" 2>/dev/null || true
+            fi
+
+            # Remove the source directory after merging
+            rm -rf "$found_content"
+            has_content=true
+
+            log_verbose "Merged $content_type content from: $found_content"
+        done
+    done
+
+    # Verify we have content
     if [[ "$has_content" == true ]]; then
-        log_verbose "Reconstructed wp-content from split directories"
+        # Count what we found
+        local plugin_count=0
+        local theme_count=0
+        local upload_dirs=0
+
+        [[ -d "$TEMP_DIR/wp-content/plugins" ]] && plugin_count=$(find "$TEMP_DIR/wp-content/plugins" -maxdepth 1 -type d | wc -l)
+        [[ -d "$TEMP_DIR/wp-content/themes" ]] && theme_count=$(find "$TEMP_DIR/wp-content/themes" -maxdepth 1 -type d | wc -l)
+        [[ -d "$TEMP_DIR/wp-content/uploads" ]] && upload_dirs=$(find "$TEMP_DIR/wp-content/uploads" -maxdepth 2 -type d | wc -l)
+
+        # Subtract 1 for the parent directory itself
+        plugin_count=$((plugin_count > 0 ? plugin_count - 1 : 0))
+        theme_count=$((theme_count > 0 ? theme_count - 1 : 0))
+
+        log_verbose "Reconstructed wp-content: $plugin_count plugins, $theme_count themes, $upload_dirs upload dirs"
         return 0
+    fi
+
+    # Check if wp-content at root has any content
+    if [[ -d "$TEMP_DIR/wp-content" ]]; then
+        local item_count
+        item_count=$(find "$TEMP_DIR/wp-content" -mindepth 1 -maxdepth 1 | wc -l)
+        if [[ $item_count -gt 0 ]]; then
+            log_verbose "wp-content found at root with $item_count items"
+            return 0
+        fi
     fi
 
     log_verbose "No wp-content directory found"
@@ -1202,13 +1270,75 @@ detect_table_prefix() {
         return
     fi
 
-    # Look for CREATE TABLE statements to detect prefix
-    local prefix
-    prefix=$(grep -oP 'CREATE TABLE `?\K[a-zA-Z0-9_]+(?=options)' "$sql_file" 2>/dev/null | head -1)
+    # Look for the CORE WordPress options table specifically
+    # The core options table is prefix_options (e.g., wp_options, RH_options)
+    # NOT plugin tables like prefix_pluginname_options (e.g., RH_mainwp_wpvivid_global_options)
+    #
+    # Strategy: Find all *options tables, then identify the core one by:
+    # 1. Looking for the shortest prefix (core table has shortest name)
+    # 2. Validating by checking for other core tables with same prefix (posts, users, postmeta)
+
+    local prefix=""
+
+    # Method 1: Find all tables ending in 'options' and get the shortest prefix
+    # The core wp_options table prefix will be shorter than plugin option tables
+    local all_options_prefixes
+    all_options_prefixes=$(grep -oP 'CREATE TABLE `?\K[a-zA-Z0-9_]+(?=options`)' "$sql_file" 2>/dev/null | sort -u)
+
+    if [[ -n "$all_options_prefixes" ]]; then
+        # Find the shortest prefix - this is most likely the core table prefix
+        local shortest=""
+        local shortest_len=9999
+
+        while IFS= read -r candidate; do
+            local len=${#candidate}
+            if [[ $len -lt $shortest_len ]]; then
+                shortest="$candidate"
+                shortest_len=$len
+            fi
+        done <<< "$all_options_prefixes"
+
+        if [[ -n "$shortest" ]]; then
+            # Validate: Check if this prefix has other core WordPress tables
+            # Core tables include: posts, postmeta, users, usermeta, comments, terms
+            local core_tables_found=0
+
+            for core_table in "posts" "postmeta" "users" "usermeta" "comments" "terms"; do
+                if grep -q "CREATE TABLE \`\?${shortest}${core_table}\`\?" "$sql_file" 2>/dev/null; then
+                    ((core_tables_found++))
+                fi
+            done
+
+            # If we found at least 3 core tables with this prefix, it's valid
+            if [[ $core_tables_found -ge 3 ]]; then
+                prefix="$shortest"
+                log_verbose "Detected table prefix '$prefix' (validated with $core_tables_found core tables)"
+            else
+                log_verbose "Prefix '$shortest' only matched $core_tables_found core tables, trying alternative detection"
+            fi
+        fi
+    fi
+
+    # Method 2 (fallback): Look for CREATE TABLE prefix_posts which is always present
+    if [[ -z "$prefix" ]]; then
+        prefix=$(grep -oP 'CREATE TABLE `?\K[a-zA-Z0-9_]+(?=posts`)' "$sql_file" 2>/dev/null | head -1)
+        if [[ -n "$prefix" ]]; then
+            log_verbose "Detected table prefix '$prefix' from posts table"
+        fi
+    fi
+
+    # Method 3 (final fallback): Look for prefix_users table
+    if [[ -z "$prefix" ]]; then
+        prefix=$(grep -oP 'CREATE TABLE `?\K[a-zA-Z0-9_]+(?=users`)' "$sql_file" 2>/dev/null | head -1)
+        if [[ -n "$prefix" ]]; then
+            log_verbose "Detected table prefix '$prefix' from users table"
+        fi
+    fi
 
     if [[ -n "$prefix" ]]; then
         echo "$prefix"
     else
+        log_verbose "Could not detect table prefix, using default 'wp_'"
         echo "wp_"
     fi
 }

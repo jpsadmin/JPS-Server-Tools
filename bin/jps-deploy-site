@@ -394,20 +394,29 @@ step_create_database() {
     DB_PASS=$(random_string 24)
 
     # Create database and user
-    mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null || {
+    # Note: Using heredoc syntax to avoid shell quoting issues with @ symbol
+    # The @ in 'user'@'localhost' can be misinterpreted in some shell contexts
+
+    mysql <<EOF 2>/dev/null || {
         progress 3 "database" "error" "Failed to create database"
         return 1
     }
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+EOF
 
-    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || {
+    mysql <<EOF 2>/dev/null || {
         progress 3 "database" "error" "Failed to create database user"
         return 1
     }
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+EOF
 
-    mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';" 2>/dev/null || {
+    mysql <<EOF 2>/dev/null || {
         progress 3 "database" "error" "Failed to grant privileges"
         return 1
     }
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
+EOF
 
     mysql -e "FLUSH PRIVILEGES;" 2>/dev/null
 
