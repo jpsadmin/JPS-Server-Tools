@@ -742,6 +742,68 @@ extract_wpress_ai1wm() {
 # WPVIVID EXTRACTION
 #===============================================================================
 
+# Extract nested ZIPs from WPvivid _backup_all type backups
+# WPvivid _backup_all contains inner ZIPs like:
+#   - wpvivid-..._backup_db.zip (contains the .sql file)
+#   - wpvivid-..._backup_themes.zip
+#   - wpvivid-..._backup_plugins.zip
+#   - wpvivid-..._backup_uploads.zip
+#   - wpvivid-..._backup_content.zip
+wpvivid_extract_nested_zips() {
+    log_verbose "Checking for nested WPvivid ZIPs in $TEMP_DIR"
+
+    local nested_count=0
+    local nested_zips=()
+
+    # Find all nested ZIPs that match WPvivid patterns
+    # These are the inner content/db ZIPs inside _backup_all outer ZIPs
+    while IFS= read -r -d '' nested_zip; do
+        local basename_zip
+        basename_zip=$(basename "$nested_zip")
+
+        # Match WPvivid inner ZIP patterns
+        if [[ "$basename_zip" =~ _backup_db\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_themes\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_plugins\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_uploads\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_content\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_core\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_mu-plugins\.zip$ ]] || \
+           [[ "$basename_zip" =~ _backup_others\.zip$ ]]; then
+            nested_zips+=("$nested_zip")
+        fi
+    done < <(find "$TEMP_DIR" -maxdepth 2 -name "*.zip" -type f -print0 2>/dev/null)
+
+    if [[ ${#nested_zips[@]} -eq 0 ]]; then
+        log_verbose "No nested WPvivid ZIPs found"
+        return 0
+    fi
+
+    log_verbose "Found ${#nested_zips[@]} nested WPvivid ZIPs to extract"
+
+    # Extract each nested ZIP
+    for nested_zip in "${nested_zips[@]}"; do
+        local basename_zip
+        basename_zip=$(basename "$nested_zip")
+        log_verbose "Extracting nested ZIP: $basename_zip"
+
+        # Extract to TEMP_DIR (same location as outer content)
+        if unzip -q -o "$nested_zip" -d "$TEMP_DIR" 2>/dev/null; then
+            ((nested_count++))
+            log_verbose "  Successfully extracted: $basename_zip"
+
+            # Remove the inner ZIP after successful extraction to avoid confusion
+            rm -f "$nested_zip"
+            log_verbose "  Removed nested ZIP after extraction"
+        else
+            warn "Failed to extract nested ZIP: $basename_zip"
+        fi
+    done
+
+    log_verbose "Extracted $nested_count nested WPvivid ZIPs"
+    return 0
+}
+
 extract_wpvivid() {
     progress 3 "import" "start" "Extracting WPvivid backup"
 
@@ -804,6 +866,11 @@ extract_wpvivid() {
             warn "Failed to extract: $(basename "$zipfile")"
         fi
     done
+
+    # CRITICAL: Extract nested ZIPs from _backup_all type backups
+    # WPvivid _backup_all outer ZIPs contain inner ZIPs like _backup_db.zip
+    # that hold the actual SQL file and content directories
+    wpvivid_extract_nested_zips
 
     # WPvivid typically extracts to a structure like:
     # - wp-content/ (site files)
